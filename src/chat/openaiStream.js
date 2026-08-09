@@ -55,6 +55,9 @@ export async function streamOpenAIOnce({
       stream_options: { include_usage: true },
       tools: OPENAI_TOOLS,
       tool_choice: "auto",
+      ...(Number.isInteger(maxTokens) && maxTokens > 0
+        ? { max_completion_tokens: maxTokens }
+        : {}),
     }),
     signal: controller.signal,
   });
@@ -64,12 +67,18 @@ export async function streamOpenAIOnce({
   if (!resp.ok || !resp.body) {
     const text = await resp.text();
 
-    send(ws, {
-      type: "error",
-      requestId,
-      message: text || `Upstream error ${resp.status}`,
+    console.error("[OpenAI chat stream] upstream request failed", {
+      status: resp.status,
+      body: text,
     });
-    return { ok: false };
+
+    return {
+      ok: false,
+      error: {
+        code: "UPSTREAM_ERROR",
+        message: `The AI service returned an error (${resp.status}).`,
+      },
+    };
   }
 
   const reader = resp.body.getReader();

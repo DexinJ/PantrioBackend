@@ -1,10 +1,13 @@
 // src/ws/chatGateway.js
 import {
-  ALLOWED_MODELS_AUTHED,
-  ALLOWED_MODELS_TRIAL,
+  // ALLOWED_MODELS_AUTHED,
+  // ALLOWED_MODELS_TRIAL,
+  MAX_CHAT_MESSAGES,
+  MAX_CHAT_PAYLOAD_DEPTH,
+  MAX_CHAT_PAYLOAD_NODES,
+  MAX_TOOL_ROUNDS,
   START_LIMIT_AUTHED,
-  START_LIMIT_TRIAL,
-  TRIAL_TOKENS_PER_DAY,
+  // TRIAL_TOKENS_PER_DAY, // Superseded by the shared non-subscriber quota.
 } from "../config/policy.js";
 
 import { rateLimitStart } from "../utils/rateLimit.js";
@@ -13,14 +16,133 @@ import { safeJsonParse } from "../utils/json.js";
 
 import { verifyFirebaseToken } from "../auth/firebase.js";
 import { getDb } from "../db/db.js";
-import { parseOwner, getUsageRow, addUsage } from "../usage/usageStore.js";
-import { computeTrialMaxTokens, remainingTrialTokens } from "../usage/trialBudget.js";
+// import { parseOwner, getUsageRow, addUsage } from "../usage/usageStore.js";
+import {
+  getUsageRow,
+  parseOwner,
+  reconcileUsageReservation,
+  reserveUsage,
+} from "../usage/usageStore.js";
+// import { computeTrialMaxTokens, remainingTrialTokens } from "../usage/trialBudget.js";
+// The trial-only helper above is retained as a comment for migration history.
+import {
+  computeTokenBudget,
+  estimateTokensFromMessages,
+} from "../usage/tokenBudget.js";
+import { getUserSubscription } from "../subscriptions/subscriptionStore.js";
+import { resolveSubscriptionAccess } from "../subscriptions/entitlementPolicy.js";
+import {
+  createQuotaSnapshot,
+  getQuotaSnapshot,
+  quotaLegacyFields,
+} from "../usage/quotaSnapshot.js";
 
 import { streamOpenAIOnce } from "../chat/openaiStream.js";
+import { resolveChatModel } from "../chat/modelPolicy.js";
+import { OPENAI_TOOLS } from "../chat/tools.js";
 import { runToolCalls } from "../chat/toolRunner.js"; // ✅ HYBRID: enable server-side tools
 
 function send(ws, obj) {
   if (ws.readyState === ws.OPEN) ws.send(JSON.stringify(obj));
+}
+
+function quotaFromRemaining(remainingTokens, dailyLimit) {
+  return createQuotaSnapshot({
+    applies: true,
+    tokensUsed: Math.max(
+      0,
+      dailyLimit - remainingTokens
+    ),
+    dailyLimit,
+  });
+}
+
+function sendQuotaError(
+  ws,
+  { requestId, code, message, quota = null, retryAfterMs }
+) {
+  send(ws, {
+    type: "error",
+    requestId,
+    code,
+    message,
+    ...(quota ? { quota, ...quotaLegacyFields(quota) } : {}),
+    ...(Number.isFinite(retryAfterMs) ? { retryAfterMs } : {}),
+  });
+}
+
+const CLIENT_MESSAGE_ROLES = new Set([
+  "system",
+  "developer",
+  "user",
+  "assistant",
+]);
+
+function validatePayloadComplexity(value) {
+  const stack = [{ value, depth: 0 }];
+  let nodes = 0;
+
+  while (stack.length) {
+    const current = stack.pop();
+    nodes += 1;
+    if (
+      nodes > MAX_CHAT_PAYLOAD_NODES ||
+      current.depth > MAX_CHAT_PAYLOAD_DEPTH
+    ) {
+      return false;
+    }
+
+    if (!current.value || typeof current.value !== "object") continue;
+    const children = Array.isArray(current.value)
+      ? current.value
+      : Object.values(current.value);
+    for (const child of children) {
+      stack.push({ value: child, depth: current.depth + 1 });
+    }
+  }
+
+  return true;
+}
+
+function validateStartMessages(messages) {
+  if (!Array.isArray(messages)) return "messages must be an array";
+  if (messages.length === 0) return "messages must not be empty";
+  if (messages.length > MAX_CHAT_MESSAGES) {
+    return `messages must contain at most ${MAX_CHAT_MESSAGES} items`;
+  }
+  if (
+    messages.some(
+      (message) =>
+        !message ||
+        typeof message !== "object" ||
+        Array.isArray(message) ||
+        !CLIENT_MESSAGE_ROLES.has(message.role) ||
+        !(typeof message.content === "string" || Array.isArray(message.content))
+    )
+  ) {
+    return "each message must contain a valid role and content";
+  }
+  if (!validatePayloadComplexity(messages)) {
+    return "messages are too deeply nested or complex";
+  }
+  return null;
+}
+
+function validateToolResults(results) {
+  if (!Array.isArray(results)) return false;
+  if (results.length > MAX_CHAT_MESSAGES) return false;
+  if (
+    results.some(
+      (result) =>
+        !result ||
+        typeof result !== "object" ||
+        Array.isArray(result) ||
+        typeof (result.tool_call_id || result.id) !== "string"
+    )
+  ) {
+    return false;
+  }
+  return validatePayloadComplexity(results);
 }
 
 /**
@@ -84,8 +206,6 @@ function withTimeout(promise, ms, msg = "Timed out") {
 export function attachChatGateway(wss) {
   wss.on("connection", (ws) => {
     const active = new Map();
-    const connectionTrialId = newId();
-
     ws.isAlive = true;
     ws.on("pong", () => (ws.isAlive = true));
 
@@ -140,13 +260,106 @@ export function attachChatGateway(wss) {
         controller,
         model,
         workingMessages,
-        maxTokensForThisRequest,
+        // maxTokensForThisRequest, // Replaced by a fresh per-round quota check.
         db,
         ownerType,
         ownerKey,
         isAuthed,
+        quotaApplies,
+        plan,
+        dailyLimit,
       } = state;
 
+      let maxTokensForThisRound = plan.maxCompletionTokens;
+      let quotaReservation = null;
+      const budgetMessages = [
+        ...workingMessages,
+        { role: "system", content: { tools: OPENAI_TOOLS } },
+      ];
+
+      if (estimateTokensFromMessages(budgetMessages) > plan.maxPromptTokens) {
+        send(ws, {
+          type: "error",
+          requestId,
+          code: "REQUEST_TOO_LARGE",
+          message: "This conversation is too large to send.",
+        });
+        active.delete(requestId);
+        return;
+      }
+
+      if (quotaApplies) {
+        const usage = await getUsageRow(db, ownerType, ownerKey);
+        const budget = computeTokenBudget({
+          tokensUsed: usage.tokens_used,
+          dailyLimit,
+          maxCompletionTokens: plan.maxCompletionTokens,
+          messages: budgetMessages,
+        });
+
+        if (!budget.ok) {
+          const quota = quotaFromRemaining(budget.remainingTokens, dailyLimit);
+          sendQuotaError(ws, {
+            requestId,
+            code:
+              budget.remainingTokens <= 0
+                ? "QUOTA_EXHAUSTED"
+                : "REQUEST_TOO_LARGE",
+            message: budget.reason,
+            quota,
+          });
+          active.delete(requestId);
+          return;
+        }
+
+        maxTokensForThisRound = budget.maxCompletionTokens;
+        const reserveTokens =
+          budget.estPromptTokens + budget.maxCompletionTokens;
+        quotaReservation = await reserveUsage(
+          db,
+          ownerType,
+          ownerKey,
+          reserveTokens,
+          dailyLimit
+        );
+
+        if (!quotaReservation) {
+          const latestUsage = await getUsageRow(db, ownerType, ownerKey);
+          const quota = createQuotaSnapshot({
+            applies: true,
+            tokensUsed: latestUsage.tokens_used,
+            dailyLimit,
+          });
+          sendQuotaError(ws, {
+            requestId,
+            code: "QUOTA_EXHAUSTED",
+            message:
+              "Not enough daily token budget remains for this request.",
+            quota,
+          });
+          active.delete(requestId);
+          return;
+        }
+
+        const quota = await getQuotaSnapshot(
+          db,
+          ownerType,
+          ownerKey,
+          true,
+          { dailyLimit }
+        );
+        send(ws, {
+          type: isAuthed ? "quota_budget" : "trial_budget",
+          requestId,
+          quota,
+          ...quotaLegacyFields(quota),
+          estPromptTokens: budget.estPromptTokens,
+          maxCompletionTokens: maxTokensForThisRound,
+        });
+      }
+
+      /* Previous direct stream call. Quota-limited calls now reserve their
+         estimated upper bound first and reconcile after provider usage arrives.
       const one = await streamOpenAIOnce({
         ws,
         send,
@@ -154,36 +367,141 @@ export function attachChatGateway(wss) {
         model,
         messages: workingMessages,
         controller,
-        maxTokens: maxTokensForThisRequest,
+        maxTokens: maxTokensForThisRound,
       });
+      */
+      let one;
+
+      try {
+        one = await streamOpenAIOnce({
+          ws,
+          send,
+          requestId,
+          model,
+          messages: workingMessages,
+          controller,
+          // maxTokens: maxTokensForThisRequest,
+          maxTokens: maxTokensForThisRound,
+        });
+      } catch (error) {
+        if (quotaReservation) {
+          await reconcileUsageReservation(
+            db,
+            ownerType,
+            ownerKey,
+            quotaReservation,
+            null,
+            1
+          );
+        }
+        throw error;
+      }
 
       if (!one.ok) {
+        let quota = null;
+        if (quotaReservation) {
+          await reconcileUsageReservation(
+            db,
+            ownerType,
+            ownerKey,
+            quotaReservation,
+            0,
+            0
+          );
+          quota = await getQuotaSnapshot(
+            db,
+            ownerType,
+            ownerKey,
+            true,
+            { dailyLimit }
+          );
+        }
+        sendQuotaError(ws, {
+          requestId,
+          code: one?.error?.code || "UPSTREAM_ERROR",
+          message:
+            one?.error?.message || "The AI service could not complete the request.",
+          quota,
+        });
         active.delete(requestId);
         return;
       }
 
+      /* Previous post-hoc guest accounting. This allowed concurrent requests
+         and interrupted streams to consume tokens before anything was charged.
       // Usage accounting (trial)
-      if (!isAuthed) {
+      // Usage accounting (all users without a stored active subscription)
+      // if (!isAuthed) {
+      if (quotaApplies) {
         await addUsage(db, ownerType, ownerKey, 0, 1);
 
         if (one?.usage?.total_tokens) {
           await addUsage(db, ownerType, ownerKey, one.usage.total_tokens, 0);
 
           const u2 = await getUsageRow(db, ownerType, ownerKey);
-          const remainingNow = Math.max(0, TRIAL_TOKENS_PER_DAY - u2.tokens_used);
+          // const remainingNow = Math.max(0, TRIAL_TOKENS_PER_DAY - u2.tokens_used);
+          const remainingNow = computeRemainingTokens(
+            u2.tokens_used,
+            NON_SUBSCRIBER_TOKENS_PER_DAY
+          );
 
           send(ws, {
-            type: "trial_budget_update",
+            // type: "trial_budget_update",
+            type: isAuthed ? "quota_budget_update" : "trial_budget_update",
             requestId,
             usedTokens: u2.tokens_used,
             remainingTokens: remainingNow,
+            dailyLimit: NON_SUBSCRIBER_TOKENS_PER_DAY,
           });
         }
+      }
+      */
+
+      if (quotaReservation) {
+        const actualTokens = Number.isFinite(one?.usage?.total_tokens)
+          ? Math.max(0, Math.trunc(one.usage.total_tokens))
+          : null;
+        await reconcileUsageReservation(
+          db,
+          ownerType,
+          ownerKey,
+          quotaReservation,
+          actualTokens,
+          1
+        );
+
+        const quota = await getQuotaSnapshot(
+          db,
+          ownerType,
+          ownerKey,
+          true,
+          { dailyLimit }
+        );
+
+        send(ws, {
+          // type: "trial_budget_update",
+          type: isAuthed ? "quota_budget_update" : "trial_budget_update",
+          requestId,
+          quota,
+          ...quotaLegacyFields(quota),
+          usageEstimated: actualTokens === null,
+        });
       }
 
       // Normal completion
       if (!one.needsTools) {
         send(ws, { type: "done", requestId });
+        active.delete(requestId);
+        return;
+      }
+
+      if ((state.round || 0) >= MAX_TOOL_ROUNDS) {
+        send(ws, {
+          type: "error",
+          requestId,
+          code: "TOOL_ROUND_LIMIT",
+          message: "The request used too many consecutive tool rounds.",
+        });
         active.delete(requestId);
         return;
       }
@@ -297,6 +615,18 @@ export function attachChatGateway(wss) {
           });
         }
 
+        if (!validateToolResults(msg.results)) {
+          state.controller?.abort?.();
+          if (state.toolResultsTimeout) clearTimeout(state.toolResultsTimeout);
+          active.delete(requestId);
+          return send(ws, {
+            type: "error",
+            requestId,
+            code: "INVALID_REQUEST",
+            message: "tool_results is invalid or too complex.",
+          });
+        }
+
         // EARLY tool_results race: buffer it
         if (!state.awaitingTools) {
           state.pendingToolResults = msg.results || [];
@@ -328,45 +658,91 @@ export function attachChatGateway(wss) {
         return send(ws, { type: "error", message: "Unknown message type" });
       }
 
+      if (
+        msg.requestId !== undefined &&
+        (typeof msg.requestId !== "string" ||
+          msg.requestId.length === 0 ||
+          msg.requestId.length > 128)
+      ) {
+        send(ws, {
+          type: "error",
+          code: "INVALID_REQUEST",
+          message: "requestId must be a non-empty string of at most 128 characters.",
+        });
+        return;
+      }
       const requestId = msg.requestId || newId();
 
-      // Auth or Trial mode
-      let userId;
-      let isAuthed = false;
-
-      if (msg.token) {
-        try {
-          const decoded = await verifyFirebaseToken(msg.token);
-          userId = decoded.uid;
-          isAuthed = true;
-        } catch {
-          send(ws, { type: "error", requestId, message: "Invalid token" });
-          return;
-        }
-      } else {
-        const trialId =
-          typeof msg.trialId === "string" && msg.trialId.length > 0
-            ? msg.trialId
-            : connectionTrialId;
-
-        userId = `trial:${trialId}`;
-        isAuthed = false;
-      }
-
-      // Rate limit per mode
-      const rlKey = isAuthed ? `user:${userId}` : userId;
-      const rl = rateLimitStart(rlKey, isAuthed ? START_LIMIT_AUTHED : START_LIMIT_TRIAL);
-
-      if (!rl.ok) {
+      if (!msg.token) {
         send(ws, {
-          type: "event",
-          event: "quota",
+          type: "error",
           requestId,
-          message: `Rate limited. Try again in ${Math.ceil(rl.retryAfterMs / 1000)}s`,
+          code: "AUTH_REQUIRED",
+          message: "Sign in is required to use chat.",
         });
         return;
       }
 
+      let userId;
+      try {
+        const decoded = await verifyFirebaseToken(msg.token);
+        userId = decoded.uid;
+      } catch {
+        send(ws, {
+          type: "error",
+          requestId,
+          code: "AUTH_INVALID",
+          message: "Invalid token",
+        });
+        return;
+      }
+
+      const messageValidationError = validateStartMessages(msg.messages);
+      if (messageValidationError) {
+        send(ws, {
+          type: "error",
+          requestId,
+          code: "INVALID_REQUEST",
+          message: messageValidationError,
+        });
+        return;
+      }
+
+      const isAuthed = true;
+      const messages = msg.messages;
+
+      const db = await getDb();
+      const { ownerType, ownerKey } = parseOwner(userId, true);
+      const subscription = await getUserSubscription(db, userId);
+      const { active: isSubscribed, plan } = resolveSubscriptionAccess(
+        subscription
+      );
+      const dailyLimit = plan.dailyTokenLimit;
+      const quotaApplies = dailyLimit !== null;
+
+      const rl = rateLimitStart(`user:${userId}`, START_LIMIT_AUTHED);
+      if (!rl.ok) {
+        const quota = await getQuotaSnapshot(
+          db,
+          ownerType,
+          ownerKey,
+          quotaApplies,
+          { dailyLimit: dailyLimit ?? undefined }
+        );
+        sendQuotaError(ws, {
+          requestId,
+          code: "RATE_LIMITED",
+          message: `Rate limited. Try again in ${Math.ceil(
+            rl.retryAfterMs / 1000
+          )}s`,
+          quota,
+          retryAfterMs: rl.retryAfterMs,
+        });
+        return;
+      }
+
+      /* Previous authentication-based model policy. Subscription status now
+         controls model access, and non-subscribers are forced to GPT-5 mini.
       // Model policy per mode
       const model = msg.model || (isAuthed ? "gpt-5" : "gpt-4o-mini");
       const allowedModels = isAuthed ? ALLOWED_MODELS_AUTHED : ALLOWED_MODELS_TRIAL;
@@ -379,18 +755,52 @@ export function attachChatGateway(wss) {
         });
         return;
       }
+      */
 
-      const language = msg.language || "en";
-      const messages = Array.isArray(msg.messages) ? msg.messages : null;
+      const modelResolution = resolveChatModel({
+        requestedModel: msg.model,
+        isSubscribed,
+        plan,
+      });
 
-      if (!messages) {
-        return send(ws, { type: "error", requestId, message: "messages must be an array" });
+      if (!modelResolution.ok) {
+        send(ws, {
+          type: "error",
+          requestId,
+          code: "MODEL_NOT_ALLOWED",
+          message: modelResolution.reason,
+        });
+        return;
       }
 
-      // SQLite-backed token budget enforcement (trial)
-      const db = await getDb();
-      const { ownerType, ownerKey } = parseOwner(userId, isAuthed);
+      const model = modelResolution.model;
 
+      if (
+        msg.language !== undefined &&
+        (typeof msg.language !== "string" || msg.language.length > 32)
+      ) {
+        send(ws, {
+          type: "error",
+          requestId,
+          code: "INVALID_REQUEST",
+          message: "language must be a string of at most 32 characters.",
+        });
+        return;
+      }
+      const language = msg.language?.trim() || "en";
+
+      // SQLite-backed token budget enforcement (trial)
+      // const db = await getDb();
+      // const { ownerType, ownerKey } = parseOwner(userId, isAuthed);
+
+      // const subscription = isAuthed
+      //   ? await getUserSubscription(db, userId)
+      //   : null;
+      // const isSubscribed = subscription?.isSubscribed === true;
+      // const quotaApplies = !isSubscribed;
+
+      /* Previous guest-only preflight. The per-round check in runOneRound now
+         covers guests and authenticated non-subscribers, including tool rounds.
       let maxTokensForThisRequest = undefined;
 
       if (!isAuthed) {
@@ -423,6 +833,7 @@ export function attachChatGateway(wss) {
           maxCompletionTokens: maxTokensForThisRequest,
         });
       }
+      */
 
       const controller = new AbortController();
 
@@ -440,7 +851,11 @@ export function attachChatGateway(wss) {
         db,
         ownerType,
         ownerKey,
-        maxTokensForThisRequest,
+        // maxTokensForThisRequest,
+        isSubscribed,
+        quotaApplies,
+        plan,
+        dailyLimit,
         round: 0,
 
         awaitingTools: false,
@@ -450,7 +865,18 @@ export function attachChatGateway(wss) {
         pendingToolResults: null,
       });
 
-      send(ws, { type: "started", requestId, isAuthed });
+      // send(ws, { type: "started", requestId, isAuthed });
+      send(ws, {
+        type: "started",
+        requestId,
+        isAuthed,
+        isSubscribed,
+        quotaApplies,
+        model,
+        requestedModel: modelResolution.requestedModel,
+        modelRestricted: plan.id === "free",
+        requestWasRestricted: modelResolution.wasRestricted,
+      });
 
       runOneRound(requestId).catch((err) => {
         const isAbort = err && err.name === "AbortError";
@@ -458,7 +884,12 @@ export function attachChatGateway(wss) {
           ws,
           isAbort
             ? { type: "done", requestId, cancelled: true }
-            : { type: "error", requestId, message: err?.message || "Stream error" }
+            : {
+                type: "error",
+                requestId,
+                code: "UPSTREAM_ERROR",
+                message: err?.message || "Stream error",
+              }
         );
         const st = active.get(requestId);
         if (st?.toolResultsTimeout) clearTimeout(st.toolResultsTimeout);

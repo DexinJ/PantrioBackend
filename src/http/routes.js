@@ -9,8 +9,63 @@ import {
 } from "../auth/firebase.js";
 import { OPENAI_API_KEY } from "../config/env.js";
 import { getDb } from "../db/db.js";
+import {
+  MAX_CHAT_MESSAGES,
+  MAX_CHAT_PAYLOAD_DEPTH,
+  MAX_CHAT_PAYLOAD_NODES,
+} from "../config/policy.js";
+import {
+  SubscriptionStatusValidationError,
+  normalizeSubscriptionSnapshot,
+} from "../subscriptions/subscriptionStatus.js";
+import {
+  getUserSubscription,
+  saveUserSubscription,
+} from "../subscriptions/subscriptionStore.js";
+import { resolveSubscriptionAccess } from "../subscriptions/entitlementPolicy.js";
+import {
+  buildSession,
+  ensureUserProfile,
+} from "../session/sessionService.js";
+import {
+  AppleSubscriptionError,
+  processAppleNotification,
+  refreshAppleSubscriptionForUser,
+  verifyAppleEvidenceForUser,
+} from "../subscriptions/appleSubscriptionService.js";
+import { AppleSubscriptionOwnershipError } from "../subscriptions/appleSubscriptionStore.js";
+import {
+  // addUsage, // Replaced by reservation reconciliation for quota-limited calls.
+  getUsageRow,
+  reconcileUsageReservation,
+  reserveUsage,
+} from "../usage/usageStore.js";
+import {
+  computeRemainingTokens,
+  computeTokenBudget,
+  estimateAudioTokensFromBytes,
+  estimateTokensFromMessages,
+} from "../usage/tokenBudget.js";
+import {
+  createQuotaSnapshot,
+  getQuotaSnapshot,
+  quotaLegacyFields,
+} from "../usage/quotaSnapshot.js";
+import { rateLimitStart } from "../utils/rateLimit.js";
+import { createConcurrencyGuard } from "../utils/concurrencyGuard.js";
 
-const MAX_AUDIO_FILE_SIZE = 25 * 1024 * 1024;
+const MAX_AUDIO_FILE_SIZE = 2 * 1024 * 1024;
+const TRANSCRIPTION_RATE_LIMIT = { windowMs: 60_000, max: 6 };
+const SUMMARY_RATE_LIMIT = { windowMs: 60_000, max: 10 };
+const APPLE_VERIFICATION_RATE_LIMIT = { windowMs: 60_000, max: 10 };
+const MAX_CONCURRENT_APPLE_WEBHOOKS = 8;
+const OPENAI_REST_TIMEOUT_MS = 90_000;
+const limitConcurrentAppleWebhooks = createConcurrencyGuard({
+  maxConcurrent: MAX_CONCURRENT_APPLE_WEBHOOKS,
+  retryAfterSeconds: 5,
+  code: "APPLE_WEBHOOK_BUSY",
+  message: "Apple notification processing is temporarily busy.",
+});
 
 const ALLOWED_AUDIO_TYPES = new Set([
   "audio/m4a",
@@ -60,6 +115,7 @@ async function requireAuthenticatedUser(req, res) {
 
   if (!token) {
     res.status(401).json({
+      code: "AUTH_REQUIRED",
       error: "Missing Bearer token",
     });
 
@@ -72,11 +128,57 @@ async function requireAuthenticatedUser(req, res) {
     console.error("[requireAuthenticatedUser]", error);
 
     res.status(401).json({
+      code: "AUTH_INVALID",
       error: "Invalid or expired token",
     });
 
     return null;
   }
+}
+
+async function authenticateRequest(req, res, next) {
+  const decoded = await requireAuthenticatedUser(req, res);
+  if (!decoded) return;
+  req.authenticatedUser = decoded;
+  next();
+}
+
+function rateLimitAuthenticatedRequest(scope, limit) {
+  return async (req, res, next) => {
+    const decoded = req.authenticatedUser;
+    const result = rateLimitStart(`${scope}:${decoded.uid}`, limit);
+    if (result.ok) {
+      next();
+      return;
+    }
+
+    try {
+      const db = await getDb();
+      const subscription = await getUserSubscription(db, decoded.uid);
+      const { plan } = resolveSubscriptionAccess(subscription);
+      const quota = await getQuotaSnapshot(
+        db,
+        "user",
+        decoded.uid,
+        plan.dailyTokenLimit !== null,
+        { dailyLimit: plan.dailyTokenLimit ?? undefined }
+      );
+      res.status(429).json({
+        code: "RATE_LIMITED",
+        error: `Too many requests. Try again in ${Math.ceil(
+          result.retryAfterMs / 1_000
+        )}s.`,
+        retryAfterMs: result.retryAfterMs,
+        quota: quotaResponse(quota),
+      });
+    } catch (error) {
+      console.error(`[${scope} rate limit]`, error);
+      res.status(500).json({
+        code: "QUOTA_LOAD_FAILED",
+        error: "Could not check the current request allowance.",
+      });
+    }
+  };
 }
 
 function handleAudioUpload(req, res, next) {
@@ -89,7 +191,7 @@ function handleAudioUpload(req, res, next) {
     if (error instanceof multer.MulterError) {
       if (error.code === "LIMIT_FILE_SIZE") {
         res.status(413).json({
-          error: "Audio recording is too large. Maximum size is 25 MB.",
+          error: "Audio recording is too large. Maximum size is 2 MB.",
         });
         return;
       }
@@ -141,6 +243,113 @@ export function attachRoutes(app) {
   });
 
   // --------------------
+  // Authenticated app bootstrap. Provisioning is idempotent so a completed
+  // Firebase sign-in always has matching local server state.
+  // --------------------
+  app.get("/api/session", async (req, res) => {
+    try {
+      const decoded = await requireAuthenticatedUser(req, res);
+      if (!decoded) return;
+
+      const db = await getDb();
+      return res.json(await buildSession(db, decoded));
+    } catch (error) {
+      console.error("[GET /api/session]", error);
+      return res.status(500).json({
+        code: "SESSION_LOAD_FAILED",
+        error: "Failed to load session",
+      });
+    }
+  });
+
+  // --------------------
+  // Verify StoreKit 2 JWS evidence for the authenticated Firebase account.
+  // New purchases must contain this user's server-generated appAccountToken.
+  // --------------------
+  app.post(
+    "/api/subscriptions/apple/verify",
+    authenticateRequest,
+    rateLimitAuthenticatedRequest(
+      "apple-subscription-verification",
+      APPLE_VERIFICATION_RATE_LIMIT
+    ),
+    async (req, res) => {
+      try {
+        const decoded = req.authenticatedUser;
+        const db = await getDb();
+        const profile = await ensureUserProfile(db, decoded);
+        const result = await verifyAppleEvidenceForUser(db, {
+          uid: decoded.uid,
+          appAccountToken: profile.apple_app_account_token,
+          body: req.body,
+        });
+        return res.json({
+          acceptedTransactionIds: result.acceptedTransactionIds,
+          rejected: result.rejected,
+          rejectedCount: result.rejectedCount,
+          session: await buildSession(db, decoded),
+        });
+      } catch (error) {
+        return sendAppleSubscriptionError(
+          res,
+          error,
+          "[POST /api/subscriptions/apple/verify]"
+        );
+      }
+    }
+  );
+
+  app.post(
+    "/api/subscriptions/apple/refresh",
+    authenticateRequest,
+    rateLimitAuthenticatedRequest(
+      "apple-subscription-refresh",
+      APPLE_VERIFICATION_RATE_LIMIT
+    ),
+    async (req, res) => {
+      try {
+        const decoded = req.authenticatedUser;
+        const db = await getDb();
+        const profile = await ensureUserProfile(db, decoded);
+        await refreshAppleSubscriptionForUser(db, {
+          uid: decoded.uid,
+          appAccountToken: profile.apple_app_account_token,
+        });
+        return res.json({ session: await buildSession(db, decoded) });
+      } catch (error) {
+        return sendAppleSubscriptionError(
+          res,
+          error,
+          "[POST /api/subscriptions/apple/refresh]"
+        );
+      }
+    }
+  );
+
+  // App Store Server Notifications V2 authenticates through Apple's signed
+  // JWS payload, not a Firebase token.
+  app.post(
+    "/api/webhooks/apple/app-store-server-notifications-v2",
+    limitConcurrentAppleWebhooks,
+    async (req, res) => {
+      try {
+        const db = await getDb();
+        const result = await processAppleNotification(
+          db,
+          req.body?.signedPayload
+        );
+        return res.json({ ok: true, duplicate: result.duplicate });
+      } catch (error) {
+        return sendAppleSubscriptionError(
+          res,
+          error,
+          "[POST Apple Notifications V2]"
+        );
+      }
+    }
+  );
+
+  // --------------------
   // Create or update user profile
   // POST /api/users
   // Body: { username: string }
@@ -172,6 +381,11 @@ export function attachRoutes(app) {
         });
       }
 
+      const hasSubscription = hasOwn(req.body || {}, "subscription");
+      const normalizedSubscription = hasSubscription
+        ? normalizeSubscriptionSnapshot(req.body.subscription)
+        : null;
+
       const db = await getDb();
 
       await db.run(
@@ -193,16 +407,134 @@ export function attachRoutes(app) {
         [uid, username]
       );
 
+      if (normalizedSubscription) {
+        await saveUserSubscription(db, uid, normalizedSubscription);
+      }
+
+      const subscription = await getUserSubscription(db, uid);
+
       return res.json({
         ok: true,
         uid,
         username,
+        subscription,
       });
     } catch (error) {
       console.error("[POST /api/users]", error);
 
+      if (error instanceof SubscriptionStatusValidationError) {
+        return res.status(400).json({
+          error: error.message,
+          field: error.field,
+        });
+      }
+
       return res.status(500).json({
         error: error?.message || "Failed to save user",
+      });
+    }
+  });
+
+  // --------------------
+  // Update authenticated user's profile and/or client-reported StoreKit status
+  // PATCH /api/users/me
+  // Body: { name?: string, username?: string, subscription?: StoreKitSnapshot }
+  // --------------------
+  app.patch("/api/users/me", async (req, res) => {
+    let db;
+    // let transactionStarted = false;
+
+    try {
+      const decoded = await requireAuthenticatedUser(req, res);
+
+      if (!decoded) {
+        return;
+      }
+
+      const usernameUpdate = getOptionalUsername(req.body);
+      const hasSubscription = hasOwn(req.body || {}, "subscription");
+
+      if (!usernameUpdate.provided && !hasSubscription) {
+        return res.status(400).json({
+          error: "name, username, or subscription is required",
+        });
+      }
+
+      const normalizedSubscription = hasSubscription
+        ? normalizeSubscriptionSnapshot(req.body.subscription)
+        : null;
+
+      db = await getDb();
+
+      const existingUser = await db.get(
+        `SELECT uid, username
+           FROM users
+          WHERE uid = ?`,
+        [decoded.uid]
+      );
+
+      if (!existingUser) {
+        return res.status(404).json({
+          error: "User not found",
+        });
+      }
+
+      // await db.exec("BEGIN TRANSACTION");
+      // transactionStarted = true;
+
+      if (usernameUpdate.provided) {
+        await db.run(
+          `UPDATE users
+              SET username = ?,
+                  updated_at = strftime('%s', 'now')
+            WHERE uid = ?`,
+          [usernameUpdate.username, decoded.uid]
+        );
+      }
+
+      if (normalizedSubscription) {
+        await saveUserSubscription(
+          db,
+          decoded.uid,
+          normalizedSubscription
+        );
+      }
+
+      // await db.exec("COMMIT");
+      // transactionStarted = false;
+
+      const subscription = await getUserSubscription(db, decoded.uid);
+
+      return res.json({
+        ok: true,
+        uid: decoded.uid,
+        username: usernameUpdate.provided
+          ? usernameUpdate.username
+          : existingUser.username,
+        subscription,
+      });
+    } catch (error) {
+      // if (transactionStarted && db) {
+      //   await db.exec("ROLLBACK").catch(() => {});
+      // }
+
+      console.error("[PATCH /api/users/me]", error);
+
+      if (error instanceof SubscriptionStatusValidationError) {
+        return res.status(400).json({
+          error: error.message,
+          field: error.field,
+        });
+      }
+
+      if (error instanceof TypeError || error instanceof RangeError) {
+        return res.status(400).json({
+          error: error.message,
+        });
+      }
+
+      return res.status(500).json({
+        error: error?.message || "Failed to update user",
       });
     }
   });
@@ -248,10 +580,13 @@ export function attachRoutes(app) {
         });
       }
 
+      const subscription = await getUserSubscription(db, requestedUid);
+
       return res.json({
         ok: true,
         uid: row.uid,
         username: row.username,
+        subscription,
       });
     } catch (error) {
       console.error("[GET /api/users/:uid]", error);
@@ -296,6 +631,13 @@ export function attachRoutes(app) {
       await db.exec("BEGIN TRANSACTION");
 
       try {
+        await db.run(
+          `DELETE FROM usage_daily
+           WHERE owner_type = 'user'
+             AND owner_key = ?`,
+          [authenticatedUid]
+        );
+
         await db.run(
           `DELETE FROM users
            WHERE uid = ?`,
@@ -368,14 +710,17 @@ export function attachRoutes(app) {
   // --------------------
   app.post(
     "/api/transcriptions",
+    authenticateRequest,
+    rateLimitAuthenticatedRequest(
+      "transcription",
+      TRANSCRIPTION_RATE_LIMIT
+    ),
     handleAudioUpload,
     async (req, res) => {
-      try {
-        const decoded = await requireAuthenticatedUser(req, res);
+      let quotaReservationContext = null;
 
-        if (!decoded) {
-          return;
-        }
+      try {
+        const decoded = req.authenticatedUser;
 
         const uploadedFile = req.file;
 
@@ -389,6 +734,90 @@ export function attachRoutes(app) {
           return res.status(400).json({
             error: "Uploaded audio file is empty.",
           });
+        }
+
+        const db = await getDb();
+        const subscription = await getUserSubscription(db, decoded.uid);
+        const { plan } = resolveSubscriptionAccess(subscription);
+        const dailyLimit = plan.dailyTokenLimit;
+        const quotaApplies = dailyLimit !== null;
+        let quotaReservation = null;
+
+        if (quotaApplies) {
+          const usage = await getUsageRow(db, "user", decoded.uid);
+          const remainingTokens = computeRemainingTokens(
+            usage.tokens_used,
+            dailyLimit
+          );
+          const quota = createQuotaSnapshot({
+            applies: true,
+            tokensUsed: usage.tokens_used,
+            dailyLimit,
+          });
+          const estimatedAudioTokens = estimateAudioTokensFromBytes(
+            uploadedFile.buffer.length
+          );
+
+          if (remainingTokens <= 0) {
+            return res.status(429).json({
+              code: "QUOTA_EXHAUSTED",
+              error:
+                "Daily token limit reached. Please try again after the quota resets.",
+              quota: quotaResponse(quota),
+            });
+          }
+
+          if (estimatedAudioTokens > remainingTokens) {
+            return res.status(429).json({
+              code: "REQUEST_TOO_LARGE",
+              error:
+                "This recording is too large for the remaining daily token budget.",
+              quota: {
+                ...quotaResponse(quota),
+                estimatedTokens: estimatedAudioTokens,
+              },
+            });
+          }
+
+          // Audio Transcriptions has no request parameter that can cap total
+          // tokens, so reserve a conservative file-size bound before calling it.
+          /* Previous full-remaining-budget reservation:
+          quotaReservation = await reserveUsage(
+            db,
+            "user",
+            decoded.uid,
+            remainingTokens,
+            NON_SUBSCRIBER_TOKENS_PER_DAY
+          );
+          */
+          quotaReservation = await reserveUsage(
+            db,
+            "user",
+            decoded.uid,
+            estimatedAudioTokens,
+            dailyLimit
+          );
+
+          if (!quotaReservation) {
+            const latestUsage = await getUsageRow(db, "user", decoded.uid);
+            const latestQuota = createQuotaSnapshot({
+              applies: true,
+              tokensUsed: latestUsage.tokens_used,
+              dailyLimit,
+            });
+            return res.status(429).json({
+              code: "QUOTA_EXHAUSTED",
+              error: "The daily token allowance is currently in use.",
+              quota: quotaResponse(latestQuota),
+            });
+          }
+
+          quotaReservationContext = {
+            db,
+            uid: decoded.uid,
+            reservation: quotaReservation,
+            dailyLimit,
+          };
         }
 
         const formData = new FormData();
@@ -414,19 +843,39 @@ export function attachRoutes(app) {
           "gpt-4o-mini-transcribe"
         );
 
-        const openAIResponse = await fetch(
-          "https://api.openai.com/v1/audio/transcriptions",
-          {
-            method: "POST",
-            headers: {
-              Authorization: `Bearer ${OPENAI_API_KEY}`,
-            },
-            body: formData,
-          }
+        const upstreamController = new AbortController();
+        const upstreamTimeout = setTimeout(
+          () => upstreamController.abort(),
+          OPENAI_REST_TIMEOUT_MS
         );
+        let openAIResponse;
+        let responseText;
 
-        const responseText =
-          await openAIResponse.text();
+        try {
+          openAIResponse = await fetch(
+            "https://api.openai.com/v1/audio/transcriptions",
+            {
+              method: "POST",
+              headers: {
+                Authorization: `Bearer ${OPENAI_API_KEY}`,
+              },
+              body: formData,
+              signal: upstreamController.signal,
+            }
+          );
+          responseText = await openAIResponse.text();
+        } catch (error) {
+          if (upstreamController.signal.aborted) {
+            const timeoutError = new Error(
+              "The transcription service timed out."
+            );
+            timeoutError.code = "UPSTREAM_TIMEOUT";
+            throw timeoutError;
+          }
+          throw error;
+        } finally {
+          clearTimeout(upstreamTimeout);
+        }
 
         let data;
 
@@ -452,6 +901,18 @@ export function attachRoutes(app) {
             }
           );
 
+          if (quotaReservation) {
+            await reconcileUsageReservation(
+              db,
+              "user",
+              decoded.uid,
+              quotaReservation,
+              0,
+              0
+            );
+            quotaReservationContext = null;
+          }
+
           return res
             .status(openAIResponse.status)
             .json({
@@ -459,6 +920,30 @@ export function attachRoutes(app) {
                 data?.error?.message ||
                 "The transcription service failed.",
             });
+        }
+
+        /* Previous post-hoc transcription usage write. A full remaining-budget
+           reservation now prevents parallel requests from bypassing the limit.
+        if (quotaApplies) {
+          const usedTokens = Number.isFinite(data?.usage?.total_tokens)
+            ? Math.max(0, Math.trunc(data.usage.total_tokens))
+            : 0;
+          await addUsage(db, "user", decoded.uid, usedTokens, 1);
+        }
+        */
+        if (quotaReservation) {
+          const usedTokens = Number.isFinite(data?.usage?.total_tokens)
+            ? Math.max(0, Math.trunc(data.usage.total_tokens))
+            : null;
+          await reconcileUsageReservation(
+            db,
+            "user",
+            decoded.uid,
+            quotaReservation,
+            usedTokens,
+            1
+          );
+          quotaReservationContext = null;
         }
 
         const transcript =
@@ -473,20 +958,49 @@ export function attachRoutes(app) {
           });
         }
 
+        const quota = await getQuotaSnapshot(
+          db,
+          "user",
+          decoded.uid,
+          quotaApplies,
+          { dailyLimit: dailyLimit ?? undefined }
+        );
+
         return res.json({
           ok: true,
           text: transcript,
+          quota: quotaResponse(quota),
         });
       } catch (error) {
+        let quota = null;
+        if (quotaReservationContext) {
+          const { db, uid, reservation, dailyLimit } = quotaReservationContext;
+          await reconcileUsageReservation(
+            db,
+            "user",
+            uid,
+            reservation,
+            null,
+            1
+          ).catch(() => {});
+          quota = await getQuotaSnapshot(db, "user", uid, true, {
+            dailyLimit,
+          }).catch(() => null);
+        }
+
         console.error(
           "[POST /api/transcriptions]",
           error
         );
 
-        return res.status(500).json({
+        return res
+          .status(error?.code === "UPSTREAM_TIMEOUT" ? 504 : 500)
+          .json({
+          ...(error?.code ? { code: error.code } : {}),
           error:
             error?.message ||
             "Unable to transcribe the recording.",
+          ...(quota ? { quota: quotaResponse(quota) } : {}),
         });
       }
     }
@@ -495,59 +1009,171 @@ export function attachRoutes(app) {
   // --------------------
   // Summarize chat history
   // --------------------
-  app.post("/summarize", async (req, res) => {
-    try {
-      const decoded = await requireAuthenticatedUser(
-        req,
-        res
-      );
+  app.post(
+    "/summarize",
+    authenticateRequest,
+    rateLimitAuthenticatedRequest("summary", SUMMARY_RATE_LIMIT),
+    async (req, res) => {
+    let quotaReservationContext = null;
 
-      if (!decoded) {
-        return;
-      }
+    try {
+      const decoded = req.authenticatedUser;
 
       const {
         messages,
         language = "en",
-      } = req.body;
+      } = req.body || {};
 
-      if (
-        !Array.isArray(messages) ||
-        messages.length === 0
-      ) {
+      if (typeof language !== "string" || language.length > 32) {
         return res.status(400).json({
-          error:
-            "messages must be a non-empty array",
+          code: "INVALID_REQUEST",
+          error: "language must be a string of at most 32 characters",
         });
       }
 
-      const openAIResponse = await fetch(
-        "https://api.openai.com/v1/chat/completions",
-        {
-          method: "POST",
-          headers: {
-            Authorization: `Bearer ${OPENAI_API_KEY}`,
-            "Content-Type": "application/json",
-          },
-          body: JSON.stringify({
-            model: "gpt-4o-mini",
-            messages: [
-              {
-                role: "system",
-                content:
-                  "Summarize the following chat for memory retention. " +
-                  "Focus only on fridge and shopping-list state. " +
-                  `Reply in ${language}.`,
-              },
-              ...messages,
-            ],
-            temperature: 0.2,
-          }),
-        }
-      );
+      if (
+        !Array.isArray(messages) ||
+        messages.length === 0 ||
+        messages.length > MAX_CHAT_MESSAGES ||
+        !payloadComplexityIsValid(messages)
+      ) {
+        return res.status(400).json({
+          code: "INVALID_REQUEST",
+          error: `messages must be a non-empty array of at most ${MAX_CHAT_MESSAGES} reasonably sized items`,
+        });
+      }
 
-      const responseText =
-        await openAIResponse.text();
+      const summaryQuotaMessages = [
+        {
+          role: "system",
+          content:
+            "Summarize the following chat for memory retention. " +
+            "Focus only on fridge and shopping-list state. " +
+            `Reply in ${language}.`,
+        },
+        ...messages,
+      ];
+      const db = await getDb();
+      const subscription = await getUserSubscription(db, decoded.uid);
+      const { plan } = resolveSubscriptionAccess(subscription);
+      const dailyLimit = plan.dailyTokenLimit;
+      const quotaApplies = dailyLimit !== null;
+      let quotaBudget = null;
+      let quotaReservation = null;
+
+      if (
+        estimateTokensFromMessages(summaryQuotaMessages) >
+        plan.maxPromptTokens
+      ) {
+        return res.status(413).json({
+          code: "REQUEST_TOO_LARGE",
+          error: "This conversation is too large to summarize.",
+        });
+      }
+
+      if (quotaApplies) {
+        const usage = await getUsageRow(db, "user", decoded.uid);
+        const quota = createQuotaSnapshot({
+          applies: true,
+          tokensUsed: usage.tokens_used,
+          dailyLimit,
+        });
+        quotaBudget = computeTokenBudget({
+          tokensUsed: usage.tokens_used,
+          dailyLimit,
+          maxCompletionTokens: plan.maxCompletionTokens,
+          messages: summaryQuotaMessages,
+        });
+
+        if (!quotaBudget.ok) {
+          return res.status(429).json({
+            code:
+              quotaBudget.remainingTokens === 0
+                ? "QUOTA_EXHAUSTED"
+                : "REQUEST_TOO_LARGE",
+            error: quotaBudget.reason,
+            quota: quotaResponse(quota),
+          });
+        }
+
+        quotaReservation = await reserveUsage(
+          db,
+          "user",
+          decoded.uid,
+          quotaBudget.estPromptTokens + quotaBudget.maxCompletionTokens,
+          dailyLimit
+        );
+
+        if (!quotaReservation) {
+          const latestUsage = await getUsageRow(db, "user", decoded.uid);
+          const latestQuota = createQuotaSnapshot({
+            applies: true,
+            tokensUsed: latestUsage.tokens_used,
+            dailyLimit,
+          });
+          return res.status(429).json({
+            code: "QUOTA_EXHAUSTED",
+            error: "Not enough daily token budget remains for this request.",
+            quota: quotaResponse(latestQuota),
+          });
+        }
+
+        quotaReservationContext = {
+          db,
+          uid: decoded.uid,
+          reservation: quotaReservation,
+          dailyLimit,
+        };
+      }
+
+      const upstreamController = new AbortController();
+      const upstreamTimeout = setTimeout(
+        () => upstreamController.abort(),
+        OPENAI_REST_TIMEOUT_MS
+      );
+      let openAIResponse;
+      let responseText;
+
+      try {
+        openAIResponse = await fetch(
+          "https://api.openai.com/v1/chat/completions",
+          {
+            method: "POST",
+            headers: {
+              Authorization: `Bearer ${OPENAI_API_KEY}`,
+              "Content-Type": "application/json",
+            },
+            body: JSON.stringify({
+              model: "gpt-4o-mini",
+              messages: [
+                {
+                  role: "system",
+                  content:
+                    "Summarize the following chat for memory retention. " +
+                    "Focus only on fridge and shopping-list state. " +
+                    `Reply in ${language}.`,
+                },
+                ...messages,
+              ],
+              temperature: 0.2,
+              max_completion_tokens:
+                quotaBudget?.maxCompletionTokens ||
+                plan.maxCompletionTokens,
+            }),
+            signal: upstreamController.signal,
+          }
+        );
+        responseText = await openAIResponse.text();
+      } catch (error) {
+        if (upstreamController.signal.aborted) {
+          const timeoutError = new Error("The summary service timed out.");
+          timeoutError.code = "UPSTREAM_TIMEOUT";
+          throw timeoutError;
+        }
+        throw error;
+      } finally {
+        clearTimeout(upstreamTimeout);
+      }
 
       let data;
 
@@ -567,6 +1193,18 @@ export function attachRoutes(app) {
           }
         );
 
+        if (quotaReservation) {
+          await reconcileUsageReservation(
+            db,
+            "user",
+            decoded.uid,
+            quotaReservation,
+            0,
+            0
+          );
+          quotaReservationContext = null;
+        }
+
         return res
           .status(openAIResponse.status)
           .json({
@@ -577,18 +1215,161 @@ export function attachRoutes(app) {
           });
       }
 
+      /* Previous post-hoc usage write. Quota-limited calls now reserve before
+         making the provider request so parallel calls cannot bypass the check.
+      if (quotaApplies) {
+        const usedTokens = Number.isFinite(data?.usage?.total_tokens)
+          ? Math.max(0, Math.trunc(data.usage.total_tokens))
+          : 0;
+        await addUsage(db, "user", decoded.uid, usedTokens, 1);
+      }
+      */
+      if (quotaReservation) {
+        const usedTokens = Number.isFinite(data?.usage?.total_tokens)
+          ? Math.max(0, Math.trunc(data.usage.total_tokens))
+          : null;
+        await reconcileUsageReservation(
+          db,
+          "user",
+          decoded.uid,
+          quotaReservation,
+          usedTokens,
+          1
+        );
+        quotaReservationContext = null;
+      }
+
       const summary =
         data?.choices?.[0]?.message?.content ?? "";
+      const quota = await getQuotaSnapshot(
+        db,
+        "user",
+        decoded.uid,
+        quotaApplies,
+        { dailyLimit: dailyLimit ?? undefined }
+      );
 
       return res.json({
         summary,
+        quota: quotaResponse(quota),
       });
     } catch (error) {
+      let quota = null;
+      if (quotaReservationContext) {
+        const { db, uid, reservation, dailyLimit } = quotaReservationContext;
+        await reconcileUsageReservation(
+          db,
+          "user",
+          uid,
+          reservation,
+          null,
+          1
+        ).catch(() => {});
+        quota = await getQuotaSnapshot(db, "user", uid, true, {
+          dailyLimit,
+        }).catch(() => null);
+      }
+
       console.error("[POST /summarize]", error);
 
-      return res.status(500).json({
-        error: "Failed to summarize",
-      });
+      return res
+        .status(error?.code === "UPSTREAM_TIMEOUT" ? 504 : 500)
+        .json({
+          ...(error?.code ? { code: error.code } : {}),
+          error:
+            error?.code === "UPSTREAM_TIMEOUT"
+              ? error.message
+              : "Failed to summarize",
+          ...(quota ? { quota: quotaResponse(quota) } : {}),
+        });
     }
+    }
+  );
+}
+
+function sendAppleSubscriptionError(res, error, logContext) {
+  console.error(logContext, error);
+  if (error instanceof AppleSubscriptionOwnershipError) {
+    return res.status(409).json({ code: error.code, error: error.message });
+  }
+  if (error instanceof AppleSubscriptionError) {
+    return res.status(error.status).json({
+      code: error.code,
+      error: error.message,
+      ...(error.details?.rejected
+        ? {
+            rejected: error.details.rejected,
+            rejectedCount: error.details.rejectedCount,
+          }
+        : {}),
+    });
+  }
+  if (error?.code === "APPLE_NOT_CONFIGURED") {
+    return res.status(503).json({
+      code: error.code,
+      error: "Apple subscription verification is not configured.",
+    });
+  }
+  return res.status(500).json({
+    code: "APPLE_SUBSCRIPTION_ERROR",
+    error: "Apple subscription verification failed.",
   });
+}
+
+function payloadComplexityIsValid(value) {
+  const stack = [{ value, depth: 0 }];
+  let nodes = 0;
+
+  while (stack.length) {
+    const current = stack.pop();
+    nodes += 1;
+    if (
+      nodes > MAX_CHAT_PAYLOAD_NODES ||
+      current.depth > MAX_CHAT_PAYLOAD_DEPTH
+    ) {
+      return false;
+    }
+    if (!current.value || typeof current.value !== "object") continue;
+    const children = Array.isArray(current.value)
+      ? current.value
+      : Object.values(current.value);
+    for (const child of children) {
+      stack.push({ value: child, depth: current.depth + 1 });
+    }
+  }
+
+  return true;
+}
+
+function quotaResponse(quota) {
+  return { ...quota, ...quotaLegacyFields(quota) };
+}
+
+function hasOwn(object, key) {
+  return Object.prototype.hasOwnProperty.call(object, key);
+}
+
+function getOptionalUsername(body) {
+  const source = body && typeof body === "object" ? body : {};
+  const provided = hasOwn(source, "username") || hasOwn(source, "name");
+
+  if (!provided) {
+    return { provided: false, username: null };
+  }
+
+  const rawUsername = hasOwn(source, "username")
+    ? source.username
+    : source.name;
+  const username =
+    typeof rawUsername === "string" ? rawUsername.trim() : "";
+
+  if (!username) {
+    throw new TypeError("username is required");
+  }
+
+  if (username.length < 2 || username.length > 20) {
+    throw new RangeError("username must be 2-20 chars");
+  }
+
+  return { provided: true, username };
 }
