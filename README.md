@@ -78,12 +78,21 @@ APPLE_IAP_ISSUER_ID=<issuer uuid>
 APPLE_IAP_PRIVATE_KEY_BASE64=<base64 p8 contents>
 APPLE_ROOT_CERTIFICATES_BASE64_JSON=["<base64 DER Apple root>"]
 APPLE_ALLOWED_ENVIRONMENTS=Production
+APPLE_ALLOW_SANDBOX_IN_PRODUCTION=false
 ```
 
 The default allowed environment is `Sandbox` outside production and
-`Production` when `NODE_ENV=production`. Accepting a different environment
-requires explicit configuration, and production categorically rejects Sandbox
-even if it is listed. Keep the `.p8` key and certificates in
+`Production` when `NODE_ENV=production`. Production rejects Sandbox even if it
+is listed unless `APPLE_ALLOW_SANDBOX_IN_PRODUCTION` is set to the literal value
+`true`. Enabling that switch makes production accept both Production and
+Sandbox transactions, regardless of `APPLE_ALLOWED_ENVIRONMENTS`; this is
+intended only for a tightly controlled TestFlight/App Review window. Sandbox
+transactions do not represent real payment, so leaving the switch enabled can
+grant paid entitlements without revenue. Keep it `false` during normal public
+operation, restrict access to the backend while it is enabled, and disable it
+after testing. Restart or redeploy the backend after changing the switch because
+the Apple verifier clients are initialized once per process. Keep the `.p8` key
+and certificates in
 deployment secrets, never in the repository or mobile bundle.
 `APPLE_IAP_PRIVATE_KEY` and comma-separated
 `APPLE_ROOT_CERTIFICATE_PATHS` are also supported for local development.

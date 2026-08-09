@@ -65,6 +65,62 @@ test("never allows Sandbox verification in production", () => {
   );
 });
 
+test("keeps production restricted to Production by default", () => {
+  const summary = getAppleConfigurationSummary({
+    ...validEnvironment(),
+    NODE_ENV: "production",
+    APPLE_APP_ID: "1234567890",
+    APPLE_ALLOWED_ENVIRONMENTS: "Production",
+  });
+
+  assert.deepEqual(summary.environments, ["Production"]);
+});
+
+test("does not enable production Sandbox verification for malformed truthy values", () => {
+  assert.throws(
+    () =>
+      getAppleConfigurationSummary({
+        ...validEnvironment(),
+        NODE_ENV: "production",
+        APPLE_APP_ID: "1234567890",
+        APPLE_ALLOWED_ENVIRONMENTS: "Sandbox",
+        APPLE_ALLOW_SANDBOX_IN_PRODUCTION: "1",
+      }),
+    /Production may only accept/
+  );
+});
+
+test("explicitly enables both Production and Sandbox verification in production", () => {
+  const verifierCalls = [];
+  const apiCalls = [];
+  class FakeVerifier {
+    constructor(...args) {
+      verifierCalls.push(args);
+    }
+  }
+  class FakeApiClient {
+    constructor(...args) {
+      apiCalls.push(args);
+    }
+  }
+
+  const runtime = createAppleRuntime({
+    env: {
+      ...validEnvironment(),
+      NODE_ENV: "production",
+      APPLE_APP_ID: "1234567890",
+      APPLE_ALLOWED_ENVIRONMENTS: "Production",
+      APPLE_ALLOW_SANDBOX_IN_PRODUCTION: "true",
+    },
+    Verifier: FakeVerifier,
+    ApiClient: FakeApiClient,
+  });
+
+  assert.deepEqual(runtime.environments, ["Production", "Sandbox"]);
+  assert.equal(verifierCalls.length, 2);
+  assert.equal(apiCalls.length, 2);
+});
+
 test("rejects a malformed App Store API signing key before enabling purchases", () => {
   assert.throws(
     () =>
@@ -79,4 +135,3 @@ test("rejects a malformed App Store API signing key before enabling purchases", 
     /not a valid private key/
   );
 });
-

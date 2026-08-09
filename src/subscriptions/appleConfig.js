@@ -21,6 +21,12 @@ function splitCsv(value) {
     .filter(Boolean);
 }
 
+function allowSandboxInProduction(env) {
+  return /^true$/i.test(
+    String(env.APPLE_ALLOW_SANDBOX_IN_PRODUCTION || "").trim()
+  );
+}
+
 function allowedEnvironments(env) {
   const fallback =
     env.NODE_ENV === "production"
@@ -35,13 +41,16 @@ function allowedEnvironments(env) {
       );
     }
   }
-  if (
-    env.NODE_ENV === "production" &&
-    configured.some((value) => value !== Environment.PRODUCTION)
-  ) {
-    throw new Error(
-      "Production may only accept the Apple Production environment"
-    );
+  if (env.NODE_ENV === "production") {
+    if (allowSandboxInProduction(env)) {
+      return [Environment.PRODUCTION, Environment.SANDBOX];
+    }
+    if (configured.some((value) => value !== Environment.PRODUCTION)) {
+      throw new Error(
+        "Production may only accept the Apple Production environment unless " +
+          "APPLE_ALLOW_SANDBOX_IN_PRODUCTION=true"
+      );
+    }
   }
   return [...new Set(configured)];
 }
