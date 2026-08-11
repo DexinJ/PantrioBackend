@@ -5,6 +5,10 @@ import {
   MAX_CHAT_MESSAGES,
   MAX_CHAT_PAYLOAD_DEPTH,
   MAX_CHAT_PAYLOAD_NODES,
+  MAX_CONCURRENT_CHAT_REQUESTS,
+  MAX_CONCURRENT_CHAT_REQUESTS_PER_USER,
+  MAX_PENDING_CHAT_STARTS,
+  MAX_PENDING_CHAT_STARTS_PER_CONNECTION,
   MAX_TOOL_ROUNDS,
   START_LIMIT_AUTHED,
   // TRIAL_TOKENS_PER_DAY, // Superseded by the shared non-subscriber quota.
@@ -14,8 +18,15 @@ import { rateLimitStart } from "../utils/rateLimit.js";
 import { newId } from "../utils/ids.js";
 import { safeJsonParse } from "../utils/json.js";
 
-import { verifyFirebaseToken } from "../auth/firebase.js";
+import {
+  verifyFirebaseToken,
+  verifyFirebaseTokenSignature,
+} from "../auth/firebase.js";
 import { getDb } from "../db/db.js";
+import {
+  getAccountDeletion,
+  publicAccountDeletion,
+} from "../accountDeletion/accountDeletionStore.js";
 // import { parseOwner, getUsageRow, addUsage } from "../usage/usageStore.js";
 import {
   getUsageRow,
@@ -42,8 +53,66 @@ import { resolveChatModel } from "../chat/modelPolicy.js";
 import { OPENAI_TOOLS } from "../chat/tools.js";
 import { runToolCalls } from "../chat/toolRunner.js"; // ✅ HYBRID: enable server-side tools
 
+let activeChatRequests = 0;
+const activeChatRequestsByUser = new Map();
+let pendingChatStarts = 0;
+
+function acquireChatRequestSlot(uid) {
+  const activeForUser = activeChatRequestsByUser.get(uid) || 0;
+  if (
+    activeChatRequests >= MAX_CONCURRENT_CHAT_REQUESTS ||
+    activeForUser >= MAX_CONCURRENT_CHAT_REQUESTS_PER_USER
+  ) {
+    return null;
+  }
+
+  activeChatRequests += 1;
+  activeChatRequestsByUser.set(uid, activeForUser + 1);
+  let released = false;
+
+  return () => {
+    if (released) return;
+    released = true;
+    activeChatRequests = Math.max(0, activeChatRequests - 1);
+    const remainingForUser = (activeChatRequestsByUser.get(uid) || 1) - 1;
+    if (remainingForUser > 0) {
+      activeChatRequestsByUser.set(uid, remainingForUser);
+    } else {
+      activeChatRequestsByUser.delete(uid);
+    }
+  };
+}
+
+function acquirePendingChatStartSlot(pendingForConnection) {
+  if (
+    pendingChatStarts >= MAX_PENDING_CHAT_STARTS ||
+    pendingForConnection >= MAX_PENDING_CHAT_STARTS_PER_CONNECTION
+  ) {
+    return null;
+  }
+
+  pendingChatStarts += 1;
+  let released = false;
+
+  return () => {
+    if (released) return;
+    released = true;
+    pendingChatStarts = Math.max(0, pendingChatStarts - 1);
+  };
+}
+
 function send(ws, obj) {
-  if (ws.readyState === ws.OPEN) ws.send(JSON.stringify(obj));
+  if (ws.readyState !== ws.OPEN) return false;
+  try {
+    ws.send(JSON.stringify(obj));
+    return true;
+  } catch (error) {
+    console.error("[WebSocket send]", {
+      name: String(error?.name || "Error"),
+      code: error?.code ? String(error.code) : null,
+    });
+    return false;
+  }
 }
 
 function quotaFromRemaining(remainingTokens, dailyLimit) {
@@ -195,23 +264,200 @@ function splitToolCalls(toolCalls) {
   return { serverCalls, clientCalls };
 }
 
-function withTimeout(promise, ms, msg = "Timed out") {
-  let t;
-  const timeout = new Promise((_, reject) => {
-    t = setTimeout(() => reject(new Error(msg)), ms);
-  });
-  return Promise.race([promise, timeout]).finally(() => clearTimeout(t));
+async function withAbortDeadline({
+  parentSignal,
+  timeoutMs,
+  message,
+  operation,
+}) {
+  const controller = new AbortController();
+  let timedOut = false;
+  const forwardAbort = () => controller.abort(parentSignal?.reason);
+  if (parentSignal?.aborted) {
+    forwardAbort();
+  } else {
+    parentSignal?.addEventListener("abort", forwardAbort, { once: true });
+  }
+  const timeout = setTimeout(() => {
+    timedOut = true;
+    controller.abort(new Error(message));
+  }, timeoutMs);
+  timeout.unref?.();
+
+  try {
+    const result = await operation(controller.signal);
+    if (timedOut) {
+      const error = new Error(message);
+      error.name = "TimeoutError";
+      error.code = "SERVER_TOOL_TIMEOUT";
+      throw error;
+    }
+    return result;
+  } catch (error) {
+    if (timedOut) {
+      const timeoutError = new Error(message, { cause: error });
+      timeoutError.name = "TimeoutError";
+      timeoutError.code = "SERVER_TOOL_TIMEOUT";
+      throw timeoutError;
+    }
+    throw error;
+  } finally {
+    clearTimeout(timeout);
+    parentSignal?.removeEventListener("abort", forwardAbort);
+  }
 }
 
-export function attachChatGateway(wss) {
+export function attachChatGateway(
+  wss,
+  {
+    verifySignedTokenFn = verifyFirebaseTokenSignature,
+    verifyActiveTokenFn = verifyFirebaseToken,
+    getDbFn = getDb,
+    streamOpenAIOnceFn = streamOpenAIOnce,
+    runToolCallsFn = runToolCalls,
+    serverToolTimeoutMs = 25_000,
+    toolResultsTimeoutMs = 30_000,
+  } = {}
+) {
+  let draining = false;
+  const inFlightOperations = new Set();
+
+  function trackOperation(operation) {
+    const tracked = Promise.resolve(operation);
+    inFlightOperations.add(tracked);
+    tracked.then(
+      () => inFlightOperations.delete(tracked),
+      () => inFlightOperations.delete(tracked)
+    );
+    return tracked;
+  }
+
+  async function waitForIdle() {
+    while (inFlightOperations.size > 0) {
+      await Promise.allSettled([...inFlightOperations]);
+    }
+  }
+
   wss.on("connection", (ws) => {
+    if (draining) {
+      ws.close?.(1012, "Server restarting");
+      return;
+    }
+
     const active = new Map();
+    const starting = new Map();
+    let pendingStartsForConnection = 0;
+    let connectionClosed = false;
+
+    function deleteActiveRequest(requestId, { abort = false } = {}) {
+      const state = active.get(requestId);
+      if (!state) return false;
+      if (abort) state.controller?.abort?.();
+      if (state.toolResultsTimeout) clearTimeout(state.toolResultsTimeout);
+      state.releaseConcurrency?.();
+      active.delete(requestId);
+      return true;
+    }
+
+    async function handleRoundFailure(requestId, error) {
+      const state = active.get(requestId);
+      if (!state) return;
+
+      try {
+        const deletion = await getAccountDeletion(state.db, state.userId);
+        if (deletion) {
+          send(ws, {
+            type: "error",
+            requestId,
+            code:
+              deletion.status === "complete"
+                ? "ACCOUNT_DELETED"
+                : "ACCOUNT_DELETION_IN_PROGRESS",
+            message:
+              deletion.status === "complete"
+                ? "This account has been deleted."
+                : "Account deletion is in progress.",
+            ...publicAccountDeletion(deletion),
+          });
+          deleteActiveRequest(requestId);
+          return;
+        }
+      } catch (lookupError) {
+        console.error("[WebSocket deletion-race lookup]", {
+          name: String(lookupError?.name || "Error"),
+          code: lookupError?.code ? String(lookupError.code) : null,
+        });
+      }
+
+      console.error("[WebSocket chat round]", {
+        name: String(error?.name || "Error"),
+        code: error?.code ? String(error.code) : null,
+      });
+      if (error?.name === "AbortError") {
+        send(ws, { type: "done", requestId, cancelled: true });
+      } else if (error?.code === "UPSTREAM_TIMEOUT") {
+        send(ws, {
+          type: "error",
+          requestId,
+          code: "UPSTREAM_TIMEOUT",
+          message: "The AI service timed out.",
+        });
+      } else {
+        send(ws, {
+          type: "error",
+          requestId,
+          code: "UPSTREAM_ERROR",
+          message: "The AI service could not complete the request.",
+        });
+      }
+      deleteActiveRequest(requestId);
+    }
+
+    function launchRound(requestId) {
+      trackOperation(
+        runOneRound(requestId).catch((error) =>
+          handleRoundFailure(requestId, error)
+        )
+      );
+    }
     ws.isAlive = true;
     ws.on("pong", () => (ws.isAlive = true));
 
     send(ws, { type: "hello", serverTime: Date.now() });
 
     // ✅ HYBRID: resume when we have ALL tool_call_id results (server + client)
+    function acceptClientToolResults(requestId, state, results) {
+      const allowedIds = state.clientToolCallIds;
+      if (!(allowedIds instanceof Set)) return false;
+      const receivedIds = state.receivedClientToolCallIds || new Set();
+      state.receivedClientToolCallIds = receivedIds;
+      const accepted = [];
+
+      for (const result of results || []) {
+        const id = result?.tool_call_id || result?.id;
+        if (!allowedIds.has(id)) {
+          send(ws, {
+            type: "error",
+            requestId,
+            code: "INVALID_TOOL_RESULT",
+            message: "tool_results contains an ID not assigned to this client.",
+          });
+          deleteActiveRequest(requestId, { abort: true });
+          return false;
+        }
+        if (receivedIds.has(id)) continue;
+        receivedIds.add(id);
+        accepted.push(result);
+      }
+
+      state.collectedToolMsgs = state.collectedToolMsgs || [];
+      state.collectedToolMsgs.push(...toolResultsToToolMessages(accepted));
+      maybeResumeAfterTools(requestId);
+      return true;
+    }
+
+    // Resume only after server-owned results exist and the client has returned
+    // every ID the gateway explicitly assigned to it.
     function maybeResumeAfterTools(requestId) {
       const state = active.get(requestId);
       if (!state) return;
@@ -238,18 +484,13 @@ export function attachChatGateway(wss) {
 
       // clear tool state
       state.awaitingTools = false;
+      state.acceptingClientToolResults = false;
       state.toolCalls = [];
       state.collectedToolMsgs = [];
+      state.clientToolCallIds = new Set();
       state.pendingToolResults = null;
 
-      runOneRound(requestId).catch((e) => {
-        send(ws, {
-          type: "error",
-          requestId,
-          message: e?.message || "Failed to continue after tools.",
-        });
-        active.delete(requestId);
-      });
+      launchRound(requestId);
     }
 
     async function runOneRound(requestId) {
@@ -276,15 +517,16 @@ export function attachChatGateway(wss) {
         ...workingMessages,
         { role: "system", content: { tools: OPENAI_TOOLS } },
       ];
+      const estPromptTokens = estimateTokensFromMessages(budgetMessages);
 
-      if (estimateTokensFromMessages(budgetMessages) > plan.maxPromptTokens) {
+      if (estPromptTokens > plan.maxPromptTokens) {
         send(ws, {
           type: "error",
           requestId,
           code: "REQUEST_TOO_LARGE",
           message: "This conversation is too large to send.",
         });
-        active.delete(requestId);
+        deleteActiveRequest(requestId);
         return;
       }
 
@@ -295,6 +537,7 @@ export function attachChatGateway(wss) {
           dailyLimit,
           maxCompletionTokens: plan.maxCompletionTokens,
           messages: budgetMessages,
+          estPromptTokens,
         });
 
         if (!budget.ok) {
@@ -308,7 +551,7 @@ export function attachChatGateway(wss) {
             message: budget.reason,
             quota,
           });
-          active.delete(requestId);
+          deleteActiveRequest(requestId);
           return;
         }
 
@@ -337,7 +580,7 @@ export function attachChatGateway(wss) {
               "Not enough daily token budget remains for this request.",
             quota,
           });
-          active.delete(requestId);
+          deleteActiveRequest(requestId);
           return;
         }
 
@@ -373,7 +616,7 @@ export function attachChatGateway(wss) {
       let one;
 
       try {
-        one = await streamOpenAIOnce({
+        one = await streamOpenAIOnceFn({
           ws,
           send,
           requestId,
@@ -423,7 +666,7 @@ export function attachChatGateway(wss) {
             one?.error?.message || "The AI service could not complete the request.",
           quota,
         });
-        active.delete(requestId);
+        deleteActiveRequest(requestId);
         return;
       }
 
@@ -491,7 +734,7 @@ export function attachChatGateway(wss) {
       // Normal completion
       if (!one.needsTools) {
         send(ws, { type: "done", requestId });
-        active.delete(requestId);
+        deleteActiveRequest(requestId);
         return;
       }
 
@@ -502,68 +745,104 @@ export function attachChatGateway(wss) {
           code: "TOOL_ROUND_LIMIT",
           message: "The request used too many consecutive tool rounds.",
         });
-        active.delete(requestId);
+        deleteActiveRequest(requestId);
         return;
       }
 
       // Tool calls required
       state.awaitingTools = true;
+      state.acceptingClientToolResults = false;
       state.toolCalls = one.toolCalls || [];
       state.collectedToolMsgs = [];
+      state.clientToolCallIds = new Set();
       state.round = (state.round || 0) + 1;
 
       const { serverCalls, clientCalls } = splitToolCalls(state.toolCalls);
 
       // ✅ HYBRID: run server tools immediately (e.g., webSearch)
       if (serverCalls.length) {
-        const ctx = {
-          requestId,
-          isAuthed: state.isAuthed,
-          wsSend: (obj) => send(ws, obj),
-          userId: state.userId,
-          db: state.db,
-          ownerType: state.ownerType,
-          ownerKey: state.ownerKey,
-        };
-
         try {
-          // keep a timeout so Serper fetch doesn't hang
-          const serverToolMsgs = await withTimeout(
-            runToolCalls(serverCalls, ctx),
-            25_000,
-            "Server tool execution timed out."
+          const serverToolMsgs = await withAbortDeadline({
+            parentSignal: state.controller.signal,
+            timeoutMs: serverToolTimeoutMs,
+            message: "Server tool execution timed out.",
+            operation: (toolSignal) =>
+              runToolCallsFn(serverCalls, {
+                requestId,
+                isAuthed: state.isAuthed,
+                signal: toolSignal,
+                wsSend: (obj) => {
+                  if (
+                    toolSignal.aborted ||
+                    active.get(requestId) !== state
+                  ) {
+                    return false;
+                  }
+                  return send(ws, obj);
+                },
+                userId: state.userId,
+                db: state.db,
+                ownerType: state.ownerType,
+                ownerKey: state.ownerKey,
+              }),
+          });
+          if (active.get(requestId) !== state) return;
+          state.collectedToolMsgs.push(
+            ...(Array.isArray(serverToolMsgs) ? serverToolMsgs : [])
           );
-          state.collectedToolMsgs.push(...(Array.isArray(serverToolMsgs) ? serverToolMsgs : []));
         } catch (e) {
+          if (active.get(requestId) !== state) throw e;
           send(ws, {
             type: "error",
             requestId,
+            code:
+              e?.code === "SERVER_TOOL_TIMEOUT"
+                ? "SERVER_TOOL_TIMEOUT"
+                : "SERVER_TOOL_ERROR",
             message: e?.message || "Server tool execution failed.",
           });
-          active.delete(requestId);
+          deleteActiveRequest(requestId, { abort: true });
           return;
         }
       }
 
       // ✅ HYBRID: if there are client tools, request tool_results for ONLY those
       if (clientCalls.length) {
-        send(ws, {
-          type: "awaiting_tool_results",
-          requestId,
-          round: state.round,
-          toolCalls: clientCalls, // IMPORTANT: client executes ONLY these
-        });
+        state.clientToolCallIds = new Set(
+          clientCalls.map((call) => call?.id).filter(Boolean)
+        );
+        state.acceptingClientToolResults = true;
 
-        // If tool_results arrived early, consume immediately
         if (state.pendingToolResults) {
-          const toolMsgs = toolResultsToToolMessages(state.pendingToolResults);
-          state.collectedToolMsgs.push(...toolMsgs);
+          const pendingToolResults = state.pendingToolResults;
           state.pendingToolResults = null;
+          acceptClientToolResults(requestId, state, pendingToolResults);
+          if (
+            active.get(requestId) !== state ||
+            !state.awaitingTools
+          ) {
+            return;
+          }
+        }
+
+        const remainingClientCalls = clientCalls.filter(
+          (call) => !state.receivedClientToolCallIds.has(call?.id)
+        );
+        if (remainingClientCalls.length === 0) {
           maybeResumeAfterTools(requestId);
           return;
         }
+        send(ws, {
+          type: "tool_calls",
+          requestId,
+          round: state.round,
+          toolOwner: "client",
+          toolCalls: remainingClientCalls,
+        });
 
-        // Timeout waiting for client
+        // Start the timeout before consuming buffered results. A buffered or
+        // later response may contain only some tool IDs; only the complete path
+        // in maybeResumeAfterTools is allowed to clear this timer.
         if (state.toolResultsTimeout) clearTimeout(state.toolResultsTimeout);
         state.toolResultsTimeout = setTimeout(() => {
           const s2 = active.get(requestId);
@@ -572,11 +851,12 @@ export function attachChatGateway(wss) {
             send(ws, {
               type: "error",
               requestId,
+              code: "TOOL_RESULTS_TIMEOUT",
               message: "Timed out waiting for tool results from client.",
             });
-            active.delete(requestId);
+            deleteActiveRequest(requestId);
           }
-        }, 30_000);
+        }, toolResultsTimeoutMs);
 
         return; // wait for client tool_results
       }
@@ -585,19 +865,28 @@ export function attachChatGateway(wss) {
       maybeResumeAfterTools(requestId);
     }
 
-    ws.on("message", async (raw) => {
+    async function handleMessage(raw) {
       const parsed = safeJsonParse(raw.toString());
       if (!parsed.ok) return send(ws, { type: "error", message: "Invalid JSON" });
 
       const msg = parsed.value;
+      if (!msg || typeof msg !== "object" || Array.isArray(msg)) {
+        return send(ws, {
+          type: "error",
+          code: "INVALID_REQUEST",
+          message: "WebSocket messages must be JSON objects.",
+        });
+      }
 
       // Cancel
       if (msg.type === "cancel") {
         const requestId = msg.requestId;
-        const state = active.get(requestId);
-        if (state?.controller) state.controller.abort();
-        if (state?.toolResultsTimeout) clearTimeout(state.toolResultsTimeout);
-        active.delete(requestId);
+        const pendingStart = starting.get(requestId);
+        deleteActiveRequest(requestId, { abort: true });
+        if (pendingStart) {
+          pendingStart.cancelled = true;
+          pendingStart.controller.abort();
+        }
         send(ws, { type: "done", requestId, cancelled: true });
         return;
       }
@@ -616,9 +905,7 @@ export function attachChatGateway(wss) {
         }
 
         if (!validateToolResults(msg.results)) {
-          state.controller?.abort?.();
-          if (state.toolResultsTimeout) clearTimeout(state.toolResultsTimeout);
-          active.delete(requestId);
+          deleteActiveRequest(requestId, { abort: true });
           return send(ws, {
             type: "error",
             requestId,
@@ -627,9 +914,33 @@ export function attachChatGateway(wss) {
           });
         }
 
-        // EARLY tool_results race: buffer it
-        if (!state.awaitingTools) {
-          state.pendingToolResults = msg.results || [];
+        const novelResults = (msg.results || []).filter((result) => {
+          const id = result?.tool_call_id || result?.id;
+          return !state.receivedClientToolCallIds.has(id);
+        });
+        if (novelResults.length === 0) return;
+
+        // A result can arrive before ownership is published only from an older
+        // client/gateway pairing. Buffer it, then validate its IDs against the
+        // client-owned set once server tools have settled.
+        if (!state.acceptingClientToolResults) {
+          const pending = [
+            ...(state.pendingToolResults || []),
+            ...novelResults,
+          ];
+          if (
+            pending.length > MAX_CHAT_MESSAGES ||
+            !validatePayloadComplexity(pending)
+          ) {
+            deleteActiveRequest(requestId, { abort: true });
+            return send(ws, {
+              type: "error",
+              requestId,
+              code: "INVALID_REQUEST",
+              message: "Too many early tool results were received.",
+            });
+          }
+          state.pendingToolResults = pending;
           send(ws, {
             type: "queued_tool_results",
             requestId,
@@ -638,18 +949,7 @@ export function attachChatGateway(wss) {
           return;
         }
 
-        // stop timeout
-        if (state.toolResultsTimeout) {
-          clearTimeout(state.toolResultsTimeout);
-          state.toolResultsTimeout = null;
-        }
-
-        const toolMsgs = toolResultsToToolMessages(msg.results || []);
-        state.collectedToolMsgs = state.collectedToolMsgs || [];
-        state.collectedToolMsgs.push(...toolMsgs);
-
-        // Resume ONLY when we have all tool_call_id outputs (server + client)
-        maybeResumeAfterTools(requestId);
+        acceptClientToolResults(requestId, state, novelResults);
         return;
       }
 
@@ -673,6 +973,39 @@ export function attachChatGateway(wss) {
       }
       const requestId = msg.requestId || newId();
 
+      if (active.has(requestId) || starting.has(requestId)) {
+        send(ws, {
+          type: "error",
+          requestId,
+          code: "DUPLICATE_REQUEST_ID",
+          message: "A request with this requestId is already active.",
+        });
+        return;
+      }
+
+      const releasePendingStart = acquirePendingChatStartSlot(
+        pendingStartsForConnection
+      );
+      if (!releasePendingStart) {
+        send(ws, {
+          type: "error",
+          requestId,
+          code: "CHAT_BUSY",
+          message: "Too many chat requests are starting. Try again shortly.",
+          retryAfterMs: 1_000,
+        });
+        return;
+      }
+      pendingStartsForConnection += 1;
+
+      const pendingStart = {
+        cancelled: false,
+        controller: new AbortController(),
+      };
+      starting.set(requestId, pendingStart);
+
+      try {
+
       if (!msg.token) {
         send(ws, {
           type: "error",
@@ -683,10 +1016,46 @@ export function attachChatGateway(wss) {
         return;
       }
 
+      let signedDecoded;
+      try {
+        signedDecoded = await verifySignedTokenFn(msg.token);
+        if (!signedDecoded?.uid) throw new Error("Token is missing a UID");
+      } catch {
+        send(ws, {
+          type: "error",
+          requestId,
+          code: "AUTH_INVALID",
+          message: "Invalid token",
+        });
+        return;
+      }
+
+      const db = await getDbFn();
+      const deletion = await getAccountDeletion(db, signedDecoded.uid);
+      if (deletion) {
+        send(ws, {
+          type: "error",
+          requestId,
+          code:
+            deletion.status === "complete"
+              ? "ACCOUNT_DELETED"
+              : "ACCOUNT_DELETION_IN_PROGRESS",
+          message:
+            deletion.status === "complete"
+              ? "This account has been deleted."
+              : "Account deletion is in progress.",
+          ...publicAccountDeletion(deletion),
+        });
+        return;
+      }
+
       let userId;
       try {
-        const decoded = await verifyFirebaseToken(msg.token);
-        userId = decoded.uid;
+        const activeDecoded = await verifyActiveTokenFn(msg.token);
+        if (!activeDecoded?.uid || activeDecoded.uid !== signedDecoded.uid) {
+          throw new Error("Firebase token verification returned a different UID");
+        }
+        userId = activeDecoded.uid;
       } catch {
         send(ws, {
           type: "error",
@@ -711,7 +1080,6 @@ export function attachChatGateway(wss) {
       const isAuthed = true;
       const messages = msg.messages;
 
-      const db = await getDb();
       const { ownerType, ownerKey } = parseOwner(userId, true);
       const subscription = await getUserSubscription(db, userId);
       const { active: isSubscribed, plan } = resolveSubscriptionAccess(
@@ -835,11 +1203,24 @@ export function attachChatGateway(wss) {
       }
       */
 
-      const controller = new AbortController();
+      if (pendingStart.cancelled) return;
+      const controller = pendingStart.controller;
+      const releaseConcurrency = acquireChatRequestSlot(userId);
+      if (!releaseConcurrency) {
+        send(ws, {
+          type: "error",
+          requestId,
+          code: "CHAT_BUSY",
+          message: "Too many chat requests are already running. Try again shortly.",
+          retryAfterMs: 1_000,
+        });
+        return;
+      }
 
       // Store full state for hybrid tool execution
       active.set(requestId, {
         controller,
+        releaseConcurrency,
         workingMessages: [
           { role: "system", content: `Reply in ${language}.` },
           ...messages,
@@ -859,8 +1240,11 @@ export function attachChatGateway(wss) {
         round: 0,
 
         awaitingTools: false,
+        acceptingClientToolResults: false,
         toolCalls: [],
         collectedToolMsgs: [],
+        clientToolCallIds: new Set(),
+        receivedClientToolCallIds: new Set(),
         toolResultsTimeout: null,
         pendingToolResults: null,
       });
@@ -878,31 +1262,52 @@ export function attachChatGateway(wss) {
         requestWasRestricted: modelResolution.wasRestricted,
       });
 
-      runOneRound(requestId).catch((err) => {
-        const isAbort = err && err.name === "AbortError";
-        send(
-          ws,
-          isAbort
-            ? { type: "done", requestId, cancelled: true }
-            : {
-                type: "error",
-                requestId,
-                code: "UPSTREAM_ERROR",
-                message: err?.message || "Stream error",
-              }
+      launchRound(requestId);
+      } finally {
+        starting.delete(requestId);
+        pendingStartsForConnection = Math.max(
+          0,
+          pendingStartsForConnection - 1
         );
-        const st = active.get(requestId);
-        if (st?.toolResultsTimeout) clearTimeout(st.toolResultsTimeout);
-        active.delete(requestId);
-      });
+        releasePendingStart();
+      }
+    }
+
+    ws.on("message", (raw) => {
+      if (draining || connectionClosed) {
+        send(ws, {
+          type: "error",
+          code: "SERVER_DRAINING",
+          message: "The server is restarting. Reconnect shortly.",
+        });
+        return;
+      }
+
+      trackOperation(
+        handleMessage(raw).catch((error) => {
+          console.error("[WebSocket message handler]", {
+            name: String(error?.name || "Error"),
+            code: error?.code ? String(error.code) : null,
+          });
+          send(ws, {
+            type: "error",
+            code: "INTERNAL_ERROR",
+            message: "The WebSocket request could not be processed.",
+          });
+        })
+      );
     });
 
     ws.on("close", () => {
-      for (const state of active.values()) {
-        state.controller?.abort?.();
-        if (state.toolResultsTimeout) clearTimeout(state.toolResultsTimeout);
+      connectionClosed = true;
+      for (const pendingStart of starting.values()) {
+        pendingStart.cancelled = true;
+        pendingStart.controller.abort();
       }
-      active.clear();
+      starting.clear();
+      for (const requestId of [...active.keys()]) {
+        deleteActiveRequest(requestId, { abort: true });
+      }
     });
   });
 
@@ -916,4 +1321,11 @@ export function attachChatGateway(wss) {
   }, 30_000);
 
   wss.on("close", () => clearInterval(interval));
+
+  return {
+    beginDrain() {
+      draining = true;
+    },
+    waitForIdle,
+  };
 }

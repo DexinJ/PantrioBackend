@@ -97,6 +97,89 @@ deployment secrets, never in the repository or mobile bundle.
 `APPLE_IAP_PRIVATE_KEY` and comma-separated
 `APPLE_ROOT_CERTIFICATE_PATHS` are also supported for local development.
 
+## Sign in with Apple account-deletion revocation
+
+This is separate from StoreKit subscription verification. Immediately after a
+native Apple login, the authenticated client sends Apple's single-use
+authorization code to:
+
+```http
+POST /api/auth/apple/link
+Authorization: Bearer <fresh Firebase ID token>
+Content-Type: application/json
+
+{ "authorizationCode": "<Apple authorization code>" }
+```
+
+The endpoint accepts only a recent Firebase session whose current provider is
+`apple.com`. It exchanges the code with Apple, verifies Apple's signed identity
+token, checks that its subject equals the Firebase user's linked Apple provider
+UID, and stores the refresh token encrypted with AES-256-GCM.
+
+Account deletion is a durable, idempotent workflow:
+
+```http
+DELETE /api/users/<firebase-uid>
+Authorization: Bearer <Firebase ID token>
+
+GET /api/users/<firebase-uid>/deletion-status
+Authorization: Bearer <same still-unexpired Firebase ID token>
+```
+
+Starting a deletion requires an active Firebase session with `auth_time` no
+more than 600 seconds old, regardless of sign-in provider. A stale session gets
+`403 RECENT_AUTH_REQUIRED`. Once the deletion tombstone exists, repeated
+`DELETE` calls and `GET .../deletion-status` are UID-scoped and use the signed,
+unexpired token for response-loss reconciliation even after Firebase removes
+the user. Other authenticated HTTP and WebSocket operations return `410
+ACCOUNT_DELETION_IN_PROGRESS` or `410 ACCOUNT_DELETED` for that tombstone and
+cannot provision new local data.
+
+A completed deletion returns HTTP 200. A durably accepted workflow with remote
+cleanup still pending returns HTTP 202; in that response `ok: false` means "not
+complete yet," not that the deletion request was rejected. Both routes use the
+same status shape:
+
+```json
+{
+  "ok": false,
+  "uid": "firebase-uid",
+  "deletionStatus": "processing",
+  "firebaseStatus": "deleted",
+  "localDataStatus": "deleted",
+  "appleSignInRevocation": "pending",
+  "appleRetryAt": "2026-08-10T20:00:00.000Z",
+  "retryable": true,
+  "requestedAt": "2026-08-10T19:59:00.000Z",
+  "updatedAt": "2026-08-10T19:59:00.000Z",
+  "completedAt": null
+}
+```
+
+Transient Apple failures keep the encrypted credential only in the durable
+deletion record and retry with bounded backoff while Firebase and local-data
+cleanup continue. A successful revocation records `revoked` and clears the
+credential. If an older Apple account has no captured token, configuration is
+unusable, or bounded retries are exhausted, deletion completes with
+`appleSignInRevocation: "manual_required"` so the client can direct the person
+to stop using Pantrio in their Apple Account settings. Revocation does not
+cancel an App Store subscription.
+
+Configure a Sign in with Apple key associated with the native App ID. Do not
+reuse the App Store Connect issuer/key settings above:
+
+```text
+APPLE_SIGN_IN_CLIENT_ID=com.chilltech.pantrio
+APPLE_SIGN_IN_TEAM_ID=<10-character Apple Developer Team ID>
+APPLE_SIGN_IN_KEY_ID=<Sign in with Apple key ID>
+APPLE_SIGN_IN_PRIVATE_KEY_BASE64=<base64 p8 contents>
+APPLE_SIGN_IN_TOKEN_ENCRYPTION_KEY_BASE64=<base64 random 32-byte key>
+APPLE_SIGN_IN_TOKEN_ENCRYPTION_KEY_ID=v1
+```
+
+Keep both keys in deployment secrets. Changing the encryption key without a
+key-rotation migration makes existing refresh tokens unreadable.
+
 ## Flexible subscription plan catalog
 
 Products and server-side capabilities are controlled by validated
@@ -258,8 +341,23 @@ seconds at 32 kbps.
 
 Set `SQLITE_PATH` to a persistent mounted volume in production. Daily usage,
 profiles, Apple account bindings, verified transactions, notification
-deduplication, and subscription reports live in that database; an ephemeral
-app filesystem will reset them on redeploy. This implementation also assumes one
-backend replica because WebSocket/REST burst limits are held in memory. Move
-rate limits and quota reservations to a shared datastore before scaling to
-multiple replicas.
+deduplication, subscription reports, and the account-deletion retry outbox live
+in that database; an ephemeral app filesystem can lose pending cleanup work on
+redeploy. This implementation also assumes one backend replica because
+per-account deletion/link locks and WebSocket/REST burst limits are held in
+memory. Move the locks, rate limits, quota reservations, and deletion worker to
+a shared datastore before scaling to multiple replicas.
+
+Server startup requires `NODE_ENV` to be explicitly set to `development`,
+`test`, or `production`. Production additionally requires an absolute
+`SQLITE_PATH` and `BACKEND_REPLICA_COUNT=1`; if the host sets
+`WEB_CONCURRENCY`, it must also be `1`. This makes the single-replica assumption
+visible in deployment configuration and fails startup before unsafe production
+traffic is accepted. Use `/live` for process liveness and `/ready` (or the
+backward-compatible `/health`) for traffic readiness; readiness returns 503
+while draining or when SQLite cannot answer.
+
+This service uses Firebase Admin Authentication only, so production installs
+may use `npm ci --omit=dev --omit=optional` to exclude Firebase's unused
+optional Firestore and Storage dependency trees. Revisit that install command
+before adding either service.

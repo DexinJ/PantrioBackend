@@ -8,6 +8,7 @@ import {
 } from "@apple/app-store-server-library";
 
 import { getPublicAppleProducts } from "./planCatalog.js";
+import { parseNodeEnvironment } from "../config/runtimeConfig.js";
 
 const SUPPORTED_ENVIRONMENTS = new Set([
   Environment.PRODUCTION,
@@ -28,8 +29,9 @@ function allowSandboxInProduction(env) {
 }
 
 function allowedEnvironments(env) {
+  const isProduction = parseNodeEnvironment(env.NODE_ENV) === "production";
   const fallback =
-    env.NODE_ENV === "production"
+    isProduction
       ? [Environment.PRODUCTION]
       : [Environment.SANDBOX];
   const values = splitCsv(env.APPLE_ALLOWED_ENVIRONMENTS);
@@ -41,7 +43,7 @@ function allowedEnvironments(env) {
       );
     }
   }
-  if (env.NODE_ENV === "production") {
+  if (isProduction) {
     if (allowSandboxInProduction(env)) {
       return [Environment.PRODUCTION, Environment.SANDBOX];
     }
@@ -224,13 +226,17 @@ export function createAppleRuntime({
 }
 
 let runtime;
+let initializedSummary;
 export function getAppleRuntime() {
   if (!runtime) runtime = createAppleRuntime();
   return runtime;
 }
 
 export function getAppleSessionConfiguration(env = process.env) {
-  const summary = getAppleConfigurationSummary(env);
+  const summary =
+    env === process.env && initializedSummary
+      ? initializedSummary
+      : getAppleConfigurationSummary(env);
   if (summary.enabled) getAppleRuntime();
   return {
     enabled: summary.enabled,
@@ -240,10 +246,19 @@ export function getAppleSessionConfiguration(env = process.env) {
 
 export function initializeAppleSubscriptions(env = process.env) {
   const summary = getAppleConfigurationSummary(env);
+  if (env === process.env) initializedSummary = summary;
   if (summary.enabled) getAppleRuntime();
   return summary;
 }
 
+export function getAllowedAppleEnvironments(env = process.env) {
+  if (env === process.env) {
+    if (runtime?.environments) return runtime.environments;
+    if (initializedSummary?.environments) return initializedSummary.environments;
+  }
+  return allowedEnvironments(env);
+}
+
 export function isAppleEnvironmentAllowed(environment, env = process.env) {
-  return allowedEnvironments(env).includes(environment);
+  return getAllowedAppleEnvironments(env).includes(environment);
 }

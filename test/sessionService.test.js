@@ -5,7 +5,10 @@ import test from "node:test";
 import sqlite3 from "sqlite3";
 import { open } from "sqlite";
 
-import { buildSession } from "../src/session/sessionService.js";
+import {
+  buildSession,
+  ensureUserProfile,
+} from "../src/session/sessionService.js";
 import { saveVerifiedAppleState } from "../src/subscriptions/appleSubscriptionStore.js";
 
 async function openSessionDb(t) {
@@ -108,4 +111,81 @@ test("applies the verified product's plan capabilities to the session", async (t
   assert.equal(session.quota.applies, false);
   assert.equal(session.model.effective, "gpt-5");
   assert.equal(session.model.restricted, false);
+});
+
+test("an existing complete profile avoids provisioning writes and token generation", async (t) => {
+  const db = await openSessionDb(t);
+  const decoded = { uid: "existing-profile", email: "existing@example.com" };
+  const initial = await ensureUserProfile(db, decoded);
+  const originalRun = db.run.bind(db);
+  let writeCount = 0;
+  db.run = (...args) => {
+    writeCount += 1;
+    return originalRun(...args);
+  };
+
+  const repeated = await ensureUserProfile(db, decoded, {
+    accountTokenFactory() {
+      throw new Error("existing profiles must not generate a new token");
+    },
+  });
+
+  assert.deepEqual(repeated, initial);
+  assert.equal(writeCount, 0);
+});
+
+test("a supplied profile still performs the final deletion guard", async (t) => {
+  const db = await openSessionDb(t);
+  const decoded = { uid: "deleted-session", email: "deleted@example.com" };
+  const profile = await ensureUserProfile(db, decoded);
+  await db.run(
+    `INSERT INTO account_deletions (
+       firebase_uid, status, firebase_status, local_data_status,
+       apple_identity_linked, apple_revocation_status, requested_at, updated_at
+     ) VALUES (?, 'processing', 'pending', 'pending', 0, 'not_linked', 1, 1)`,
+    [decoded.uid]
+  );
+
+  await assert.rejects(
+    buildSession(db, decoded, { profile }),
+    (error) => error.code === "ACCOUNT_DELETION_IN_PROGRESS" && error.status === 410
+  );
+});
+
+test("session construction fails closed when deletion starts during quota reads", async (t) => {
+  const db = await openSessionDb(t);
+  const decoded = { uid: "racing-session", email: "race@example.com" };
+  const profile = await ensureUserProfile(db, decoded);
+  let deletionChecks = 0;
+  const racingDb = new Proxy(db, {
+    get(target, property) {
+      if (property === "get") {
+        return async (sql, ...args) => {
+          if (String(sql).includes("FROM account_deletions")) {
+            deletionChecks += 1;
+            if (deletionChecks === 2) {
+              await target.run(
+                `INSERT INTO account_deletions (
+                   firebase_uid, status, firebase_status, local_data_status,
+                   apple_identity_linked, apple_revocation_status,
+                   requested_at, updated_at
+                 ) VALUES (?, 'processing', 'pending', 'pending', 0,
+                           'not_linked', 1, 1)`,
+                [decoded.uid]
+              );
+            }
+          }
+          return target.get(sql, ...args);
+        };
+      }
+      const value = Reflect.get(target, property, target);
+      return typeof value === "function" ? value.bind(target) : value;
+    },
+  });
+
+  await assert.rejects(
+    buildSession(racingDb, decoded, { profile }),
+    (error) => error.code === "ACCOUNT_DELETION_IN_PROGRESS" && error.status === 410
+  );
+  assert.equal(deletionChecks, 2);
 });

@@ -180,6 +180,23 @@ const PLAN_BY_PRODUCT_ID = new Map(
     plan.productIds.map((productId) => [productId, plan])
   )
 );
+const PLAN_PRIORITY_BY_ID = new Map(
+  SUBSCRIPTION_PLANS.map((plan, index) => [
+    plan.id,
+    SUBSCRIPTION_PLANS.length - 1 - index,
+  ])
+);
+const PUBLIC_APPLE_PRODUCTS = Object.freeze(
+  SUBSCRIPTION_PLANS.flatMap((plan) =>
+    plan.productIds.map((productId) =>
+      Object.freeze({
+        productId,
+        planId: plan.id,
+        displayName: plan.name,
+      })
+    )
+  )
+);
 
 export function getPlanById(planId) {
   return planId === FREE_PLAN.id ? FREE_PLAN : PLAN_BY_ID.get(planId) || null;
@@ -190,18 +207,9 @@ export function getPlanByProductId(productId) {
 }
 
 export function getPlanCatalogPriority(planId) {
-  const index = SUBSCRIPTION_PLANS.findIndex((plan) => plan.id === planId);
-  return index < 0
-    ? Number.MAX_SAFE_INTEGER
-    : SUBSCRIPTION_PLANS.length - 1 - index;
+  return PLAN_PRIORITY_BY_ID.get(planId) ?? Number.MAX_SAFE_INTEGER;
 }
 
 export function getPublicAppleProducts() {
-  return SUBSCRIPTION_PLANS.flatMap((plan) =>
-    plan.productIds.map((productId) => ({
-      productId,
-      planId: plan.id,
-      displayName: plan.name,
-    }))
-  );
+  return PUBLIC_APPLE_PRODUCTS;
 }

@@ -33,7 +33,7 @@ export async function saveUserSubscription(db, uid, snapshot) {
   const subscription = normalizeSubscriptionSnapshot(snapshot);
   const now = Date.now();
 
-  const result = await db.run(
+  const storedRow = await db.get(
     `UPDATE users
         SET subscription_status = ?,
             subscription_is_entitled = ?,
@@ -48,7 +48,8 @@ export async function saveUserSubscription(db, uid, snapshot) {
         AND (
           subscription_checked_at IS NULL OR
           subscription_checked_at < ?
-        )`,
+        )
+      RETURNING ${SUBSCRIPTION_COLUMNS}`,
     [
       subscription.status,
       subscription.isEntitled ? 1 : 0,
@@ -63,16 +64,18 @@ export async function saveUserSubscription(db, uid, snapshot) {
     ]
   );
 
-  if (!result?.changes) {
-    const existingRow = await db.get(
-      `SELECT ${SUBSCRIPTION_COLUMNS}
-         FROM users
-        WHERE uid = ?`,
-      [uid]
-    );
+  // Server-verified Apple state remains authoritative over client telemetry.
+  // The UPDATE row is reused when no such state exists, avoiding the previous
+  // second users-table read on every accepted snapshot.
+  const verifiedAppleSubscription = await getVerifiedAppleSubscription(db, uid);
+  if (verifiedAppleSubscription) return verifiedAppleSubscription;
+  if (storedRow) return subscriptionRowToPublic(storedRow);
 
-    return existingRow ? subscriptionRowToPublic(existingRow) : null;
-  }
-
-  return getUserSubscription(db, uid);
+  const existingRow = await db.get(
+    `SELECT ${SUBSCRIPTION_COLUMNS}
+       FROM users
+      WHERE uid = ?`,
+    [uid]
+  );
+  return existingRow ? subscriptionRowToPublic(existingRow) : null;
 }

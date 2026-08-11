@@ -15,6 +15,7 @@ import {
   saveVerifiedAppleState,
 } from "./appleSubscriptionStore.js";
 import { getPlanByProductId } from "./planCatalog.js";
+import { acquireKeyedLock } from "../utils/keyedLock.js";
 
 const VERIFY_SOURCES = new Set([
   "purchase",
@@ -607,69 +608,78 @@ export async function processAppleNotification(
       422
     );
   }
-  if (
-    await hasProcessedAppleNotification(
-      db,
-      result.environment,
-      notificationUUID
-    )
-  ) {
-    return { duplicate: true, notificationUUID };
-  }
-
-  let uid = null;
-  const signedTransactionInfo = notification.data?.signedTransactionInfo;
-  if (signedTransactionInfo) {
-    let transaction;
-    let renewal = null;
-    try {
-      transaction = await result.verifier.verifyAndDecodeTransaction(
-        signedTransactionInfo
-      );
-      renewal = await decodeRenewal(
-        result.verifier,
-        notification.data?.signedRenewalInfo,
-        transaction
-      );
-    } catch (error) {
-      if (error instanceof AppleSubscriptionError) throw error;
-      fail(
-        "APPLE_VERIFICATION_FAILED",
-        "Apple notification transaction could not be verified.",
-        422,
-        error
-      );
-    }
-    requireTransactionFields(transaction, result.environment);
-    const user = await findUserByAppleAccountToken(
-      db,
-      transaction.appAccountToken
-    );
-    if (user) {
-      uid = user.uid;
-      await saveVerifiedAppleState(
+  const notificationKey = `apple-notification:${result.environment}:${notificationUUID}`;
+  const release = await acquireKeyedLock(notificationKey);
+  try {
+    // The durable INSERT remains the cross-process authority. The keyed lock
+    // prevents duplicate deliveries on the enforced single replica from both
+    // performing verification and entitlement writes before either inserts.
+    if (
+      await hasProcessedAppleNotification(
         db,
-        recordFromApple({
-          uid,
-          environment: result.environment,
-          status: statusFromNotification(notification, transaction),
-          transaction,
-          renewal,
-          observedSignedDate: notification.signedDate,
-        })
-      );
+        result.environment,
+        notificationUUID
+      )
+    ) {
+      return { duplicate: true, notificationUUID };
     }
-  }
 
-  await recordProcessedAppleNotification(db, {
-    environment: result.environment,
-    notificationUUID,
-    notificationType: notification.notificationType,
-    subtype: notification.subtype,
-    uid,
-    signedDate: notification.signedDate,
-  });
-  return { duplicate: false, notificationUUID, matchedUser: Boolean(uid) };
+    let uid = null;
+    const signedTransactionInfo = notification.data?.signedTransactionInfo;
+    if (signedTransactionInfo) {
+      let transaction;
+      let renewal = null;
+      try {
+        transaction = await result.verifier.verifyAndDecodeTransaction(
+          signedTransactionInfo
+        );
+        renewal = await decodeRenewal(
+          result.verifier,
+          notification.data?.signedRenewalInfo,
+          transaction
+        );
+      } catch (error) {
+        if (error instanceof AppleSubscriptionError) throw error;
+        fail(
+          "APPLE_VERIFICATION_FAILED",
+          "Apple notification transaction could not be verified.",
+          422,
+          error
+        );
+      }
+      requireTransactionFields(transaction, result.environment);
+      const user = await findUserByAppleAccountToken(
+        db,
+        transaction.appAccountToken
+      );
+      if (user) {
+        uid = user.uid;
+        await saveVerifiedAppleState(
+          db,
+          recordFromApple({
+            uid,
+            environment: result.environment,
+            status: statusFromNotification(notification, transaction),
+            transaction,
+            renewal,
+            observedSignedDate: notification.signedDate,
+          })
+        );
+      }
+    }
+
+    await recordProcessedAppleNotification(db, {
+      environment: result.environment,
+      notificationUUID,
+      notificationType: notification.notificationType,
+      subtype: notification.subtype,
+      uid,
+      signedDate: notification.signedDate,
+    });
+    return { duplicate: false, notificationUUID, matchedUser: Boolean(uid) };
+  } finally {
+    release();
+  }
 }
 
 export { Environment };

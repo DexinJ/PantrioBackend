@@ -55,6 +55,13 @@ test("migrates populated legacy user tables once and fails closed", async (t) =>
   );
 
   assert.equal(subscriptionColumns.length, 8);
+  const normalizedTokenIndex = await db.get(
+    `SELECT sql
+       FROM sqlite_master
+      WHERE type = 'index'
+        AND name = 'idx_users_apple_app_account_token_normalized'`
+  );
+  assert.match(normalizedTokenIndex.sql, /lower\(apple_app_account_token\)/i);
   assert.deepEqual(row, {
     subscription_status: "unknown",
     subscription_is_entitled: 0,

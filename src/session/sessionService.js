@@ -8,6 +8,10 @@ import {
 } from "../subscriptions/entitlementPolicy.js";
 import { getQuotaSnapshot } from "../usage/quotaSnapshot.js";
 import { getAppleSessionConfiguration } from "../subscriptions/appleConfig.js";
+import {
+  AccountDeletionBlockedError,
+  getAccountDeletion,
+} from "../accountDeletion/accountDeletionStore.js";
 
 function usableUsername(value) {
   if (typeof value !== "string") return null;
@@ -36,41 +40,60 @@ export async function ensureUserProfile(
 ) {
   if (!decoded?.uid) throw new TypeError("decoded.uid is required");
 
+  const deletion = await getAccountDeletion(db, decoded.uid);
+  if (deletion) throw new AccountDeletionBlockedError(deletion);
+
+  const existingProfile = await db.get(
+    `SELECT uid, username, apple_app_account_token
+       FROM users
+      WHERE uid = ?`,
+    [decoded.uid]
+  );
+  if (existingProfile?.apple_app_account_token) return existingProfile;
+
   for (let attempt = 0; attempt < 3; attempt += 1) {
-    const accountToken = accountTokenFactory();
+    const accountToken = String(accountTokenFactory()).toLowerCase();
     try {
-      await db.run(
+      return await db.get(
         `INSERT INTO users (
            uid, username, apple_app_account_token, created_at, updated_at
          )
          VALUES (?, ?, ?, strftime('%s', 'now'), strftime('%s', 'now'))
-         ON CONFLICT(uid) DO NOTHING`,
+         ON CONFLICT(uid) DO UPDATE SET
+           apple_app_account_token = COALESCE(
+             users.apple_app_account_token,
+             excluded.apple_app_account_token
+           )
+         RETURNING uid, username, apple_app_account_token`,
         [decoded.uid, fallbackUsername(decoded), accountToken]
       );
-      await db.run(
-        `UPDATE users
-            SET apple_app_account_token = ?
-          WHERE uid = ? AND apple_app_account_token IS NULL`,
-        [accountToken, decoded.uid]
-      );
-      break;
     } catch (error) {
       if (attempt === 2 || !String(error?.code || "").includes("CONSTRAINT")) {
         throw error;
       }
     }
   }
-
-  return db.get(
-    `SELECT uid, username, apple_app_account_token
-       FROM users
-      WHERE uid = ?`,
-    [decoded.uid]
-  );
 }
 
-export async function buildSession(db, decoded, { now = new Date() } = {}) {
-  const profile = await ensureUserProfile(db, decoded);
+export async function buildSession(
+  db,
+  decoded,
+  { now = new Date(), profile: suppliedProfile = null } = {}
+) {
+  if (suppliedProfile && suppliedProfile.uid !== decoded?.uid) {
+    throw new TypeError("profile.uid must match decoded.uid");
+  }
+
+  let profile = suppliedProfile;
+  if (profile) {
+    // A route may reuse a profile it loaded before a remote Apple request, but
+    // the final session response must still fail closed if deletion began in
+    // the meantime.
+    const deletion = await getAccountDeletion(db, decoded.uid);
+    if (deletion) throw new AccountDeletionBlockedError(deletion);
+  } else {
+    profile = await ensureUserProfile(db, decoded);
+  }
   const user = { uid: profile.uid, username: profile.username };
   const subscription = await getUserSubscription(db, decoded.uid);
   const { active: isSubscribed, plan } = resolveSubscriptionAccess(subscription);
@@ -87,6 +110,8 @@ export async function buildSession(db, decoded, { now = new Date() } = {}) {
     plan,
   });
   const appleConfiguration = getAppleSessionConfiguration();
+  const finalDeletion = await getAccountDeletion(db, decoded.uid);
+  if (finalDeletion) throw new AccountDeletionBlockedError(finalDeletion);
 
   return {
     user,

@@ -294,3 +294,34 @@ test("processes and deduplicates Notifications V2", async (t) => {
   assert.equal(first.duplicate, false);
   assert.equal(second.duplicate, true);
 });
+
+test("concurrent duplicate notifications perform entitlement work once", async (t) => {
+  const db = await openDb(t);
+  const token = "1b574614-4789-4a3a-b8d4-bd16b6814b30";
+  await db.run(
+    `INSERT INTO users (
+       uid, username, apple_app_account_token, created_at, updated_at
+     ) VALUES (?, 'notify-user', ?, 1, 1)`,
+    ["notify-user", token]
+  );
+  const runtime = makeRuntime(token);
+  const verifier = runtime.verifiers.get("Sandbox");
+  const decodeTransaction = verifier.verifyAndDecodeTransaction.bind(verifier);
+  let transactionDecodes = 0;
+  verifier.verifyAndDecodeTransaction = async (...args) => {
+    transactionDecodes += 1;
+    await new Promise((resolve) => setTimeout(resolve, 10));
+    return decodeTransaction(...args);
+  };
+
+  const results = await Promise.all([
+    processAppleNotification(db, "signed-notification", { runtime }),
+    processAppleNotification(db, "signed-notification", { runtime }),
+  ]);
+
+  assert.deepEqual(
+    results.map(({ duplicate }) => duplicate).sort(),
+    [false, true]
+  );
+  assert.equal(transactionDecodes, 1);
+});

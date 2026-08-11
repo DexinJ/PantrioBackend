@@ -156,6 +156,7 @@ export function computeTokenBudget({
   dailyLimit,
   maxCompletionTokens,
   messages,
+  estPromptTokens,
 }) {
   const normalizedMaxCompletionTokens = requirePositiveInteger(
     maxCompletionTokens,
@@ -171,24 +172,27 @@ export function computeTokenBudget({
     };
   }
 
-  const estPromptTokens = estimateTokensFromMessages(messages);
+  const normalizedPromptTokens =
+    estPromptTokens === undefined
+      ? estimateTokensFromMessages(messages)
+      : requireNonNegativeInteger(estPromptTokens, "estPromptTokens");
 
-  if (estPromptTokens >= remainingTokens) {
+  if (normalizedPromptTokens >= remainingTokens) {
     return {
       ok: false,
       reason: REQUEST_EXCEEDS_TOKEN_BUDGET_MESSAGE,
       remainingTokens,
-      estPromptTokens,
+      estPromptTokens: normalizedPromptTokens,
     };
   }
 
   return {
     ok: true,
     remainingTokens,
-    estPromptTokens,
+    estPromptTokens: normalizedPromptTokens,
     maxCompletionTokens: Math.min(
       normalizedMaxCompletionTokens,
-      remainingTokens - estPromptTokens
+      remainingTokens - normalizedPromptTokens
     ),
   };
 }

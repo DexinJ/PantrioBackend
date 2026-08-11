@@ -1,4 +1,4 @@
-import { isAppleEnvironmentAllowed } from "./appleConfig.js";
+import { getAllowedAppleEnvironments } from "./appleConfig.js";
 import {
   getPlanByProductId,
   getPlanCatalogPriority,
@@ -60,18 +60,20 @@ export function appleSubscriptionRowToPublic(row, { nowMs = Date.now() } = {}) {
 }
 
 export async function getVerifiedAppleSubscription(db, uid) {
+  const environments = getAllowedAppleEnvironments();
+  const placeholders = environments.map(() => "?").join(", ");
   const rows = await db.all(
     `SELECT *
        FROM apple_subscriptions
       WHERE firebase_uid = ?
+        AND environment IN (${placeholders})
       ORDER BY
         CASE WHEN status IN (1, 4) THEN 0 ELSE 1 END,
         verified_at DESC`,
-    [uid]
+    [uid, ...environments]
   );
   const nowMs = Date.now();
   const candidates = rows
-    .filter((candidate) => isAppleEnvironmentAllowed(candidate.environment))
     .map((row) => appleSubscriptionRowToPublic(row, { nowMs }));
   const active = candidates
     .filter((candidate) => candidate.isSubscribed)
@@ -89,80 +91,82 @@ export async function getVerifiedAppleSubscription(db, uid) {
 }
 
 export async function getAppleSubscriptionRefreshTarget(db, uid) {
-  const rows = await db.all(
+  const environments = getAllowedAppleEnvironments();
+  const placeholders = environments.map(() => "?").join(", ");
+  return db.get(
     `SELECT environment, latest_transaction_id, original_transaction_id
        FROM apple_subscriptions
       WHERE firebase_uid = ?
-      ORDER BY verified_at DESC`,
-    [uid]
-  );
-  return (
-    rows.find((candidate) => isAppleEnvironmentAllowed(candidate.environment)) ||
-    null
+        AND environment IN (${placeholders})
+      ORDER BY verified_at DESC
+      LIMIT 1`,
+    [uid, ...environments]
   );
 }
 
 export async function findUserByAppleAccountToken(db, appAccountToken) {
-  if (!appAccountToken) return null;
+  const normalizedToken = String(appAccountToken || "").trim().toLowerCase();
+  if (!normalizedToken) return null;
   return db.get(
     `SELECT uid, apple_app_account_token
        FROM users
-      WHERE lower(apple_app_account_token) = lower(?)`,
-    [appAccountToken]
+      WHERE lower(apple_app_account_token) = ?`,
+    [normalizedToken]
   );
 }
 
-async function assertSubscriptionOwner(db, record) {
-  const existing = await db.get(
-    `SELECT firebase_uid
-       FROM apple_subscriptions
-      WHERE environment = ? AND original_transaction_id = ?`,
-    [record.environment, record.originalTransactionId]
+async function readAppleOwnershipState(db, record) {
+  return db.get(
+    `SELECT
+       (SELECT firebase_uid
+          FROM apple_subscriptions
+         WHERE environment = ? AND original_transaction_id = ?)
+         AS subscription_uid,
+       (SELECT app_account_token
+          FROM apple_subscription_ownership
+         WHERE environment = ? AND original_transaction_id = ?)
+         AS ownership_token,
+       (SELECT firebase_uid
+          FROM apple_transactions
+         WHERE environment = ? AND transaction_id = ?)
+         AS transaction_uid`,
+    [
+      record.environment,
+      record.originalTransactionId,
+      record.environment,
+      record.originalTransactionId,
+      record.environment,
+      record.transactionId,
+    ]
   );
-  if (existing && existing.firebase_uid !== record.uid) {
-    throw new AppleSubscriptionOwnershipError();
-  }
 }
 
-async function assertOwnershipToken(db, record) {
-  const existing = await db.get(
-    `SELECT app_account_token
-       FROM apple_subscription_ownership
-      WHERE environment = ? AND original_transaction_id = ?`,
-    [record.environment, record.originalTransactionId]
-  );
+function assertAppleOwnershipState(existing, record) {
+  const expectedToken = String(record.appAccountToken || "").toLowerCase();
   if (
-    existing &&
-    existing.app_account_token.toLowerCase() !==
-      String(record.appAccountToken || "").toLowerCase()
+    (existing?.subscription_uid && existing.subscription_uid !== record.uid) ||
+    (existing?.transaction_uid && existing.transaction_uid !== record.uid) ||
+    (existing?.ownership_token &&
+      String(existing.ownership_token).toLowerCase() !== expectedToken)
   ) {
     throw new AppleSubscriptionOwnershipError();
   }
 }
 
-async function assertTransactionOwner(db, record) {
-  const existing = await db.get(
-    `SELECT firebase_uid
-       FROM apple_transactions
-      WHERE environment = ? AND transaction_id = ?`,
-    [record.environment, record.transactionId]
-  );
-  if (existing && existing.firebase_uid !== record.uid) {
-    throw new AppleSubscriptionOwnershipError();
-  }
-}
-
 export async function saveVerifiedAppleState(db, record) {
-  await assertOwnershipToken(db, record);
-  await assertSubscriptionOwner(db, record);
-  await assertTransactionOwner(db, record);
+  assertAppleOwnershipState(await readAppleOwnershipState(db, record), record);
   const now = Date.now();
 
-  await db.run(
-    `INSERT OR IGNORE INTO apple_subscription_ownership (
+  const ownership = await db.get(
+    `INSERT INTO apple_subscription_ownership (
        environment, original_transaction_id, app_account_token,
        first_verified_at
-     ) VALUES (?, ?, ?, ?)`,
+     ) VALUES (?, ?, ?, ?)
+     ON CONFLICT(environment, original_transaction_id) DO UPDATE SET
+       app_account_token = apple_subscription_ownership.app_account_token
+     WHERE lower(apple_subscription_ownership.app_account_token) =
+           lower(excluded.app_account_token)
+     RETURNING app_account_token`,
     [
       record.environment,
       record.originalTransactionId,
@@ -170,7 +174,7 @@ export async function saveVerifiedAppleState(db, record) {
       now,
     ]
   );
-  await assertOwnershipToken(db, record);
+  if (!ownership) throw new AppleSubscriptionOwnershipError();
 
   // The entitlement row is authoritative and is written before the audit row.
   // If the process stops between writes, an idempotent retry repairs the audit
@@ -246,9 +250,7 @@ export async function saveVerifiedAppleState(db, record) {
   // Re-read after the conditional upserts. This closes the race where two
   // Firebase users submit the same Apple transaction chain concurrently:
   // only the stored owner succeeds; the other receives a conflict.
-  await assertTransactionOwner(db, record);
-  await assertSubscriptionOwner(db, record);
-  await assertOwnershipToken(db, record);
+  assertAppleOwnershipState(await readAppleOwnershipState(db, record), record);
 }
 
 export async function hasProcessedAppleNotification(

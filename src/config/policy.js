@@ -1,4 +1,5 @@
 // src/config/policy.js
+import { parseNodeEnvironment } from "./runtimeConfig.js";
 
 // Full access models (signed-in users)
 // Non-subscribers are narrowed to NON_SUBSCRIBER_CHAT_MODEL below.
@@ -62,7 +63,7 @@ export const ALLOWED_MODELS_AUTHED = new Set([
   // purchase. Development environments may opt in temporarily while the Apple
   // server-verification flow is built. Production always fails closed.
   export const ALLOW_UNVERIFIED_SUBSCRIPTIONS =
-    process.env.NODE_ENV !== "production" &&
+    parseNodeEnvironment(process.env.NODE_ENV) !== "production" &&
     /^(1|true|yes)$/i.test(
       String(process.env.ALLOW_UNVERIFIED_SUBSCRIPTIONS || "")
     );
@@ -70,3 +71,10 @@ export const ALLOWED_MODELS_AUTHED = new Set([
   // WS rate limits (per minute)
   export const START_LIMIT_AUTHED = { windowMs: 60_000, max: 12 };
   export const START_LIMIT_TRIAL = { windowMs: 60_000, max: 5 };
+  export const MAX_CONCURRENT_CHAT_REQUESTS = 32;
+  export const MAX_CONCURRENT_CHAT_REQUESTS_PER_USER = 2;
+  // Bound work that is still authenticating or loading account state. These
+  // slots are acquired before the first asynchronous preflight so unauthenticated
+  // sockets cannot fan out unbounded Firebase/SQLite work.
+  export const MAX_PENDING_CHAT_STARTS = 64;
+  export const MAX_PENDING_CHAT_STARTS_PER_CONNECTION = 4;

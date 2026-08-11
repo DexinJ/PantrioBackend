@@ -5,8 +5,18 @@ import multer from "multer";
 
 import {
   verifyFirebaseToken,
-  deleteFirebaseUser,
+  verifyFirebaseTokenSignature,
+  getFirebaseUser,
 } from "../auth/firebase.js";
+import {
+  AppleSignInError,
+  linkAppleAuthorizationForUser,
+} from "../auth/appleSignInService.js";
+import { attachAccountDeletionRoutes } from "../accountDeletion/accountDeletionRoutes.js";
+import {
+  getAccountDeletion,
+  publicAccountDeletion,
+} from "../accountDeletion/accountDeletionStore.js";
 import { OPENAI_API_KEY } from "../config/env.js";
 import { getDb } from "../db/db.js";
 import {
@@ -53,18 +63,42 @@ import {
 } from "../usage/quotaSnapshot.js";
 import { rateLimitStart } from "../utils/rateLimit.js";
 import { createConcurrencyGuard } from "../utils/concurrencyGuard.js";
+import { acquireKeyedLock } from "../utils/keyedLock.js";
+import { inspectReadiness } from "../operations/readiness.js";
 
 const MAX_AUDIO_FILE_SIZE = 2 * 1024 * 1024;
 const TRANSCRIPTION_RATE_LIMIT = { windowMs: 60_000, max: 6 };
 const SUMMARY_RATE_LIMIT = { windowMs: 60_000, max: 10 };
 const APPLE_VERIFICATION_RATE_LIMIT = { windowMs: 60_000, max: 10 };
+const APPLE_AUTH_LINK_RATE_LIMIT = { windowMs: 60_000, max: 5 };
 const MAX_CONCURRENT_APPLE_WEBHOOKS = 8;
+const MAX_CONCURRENT_APPLE_VERIFICATIONS = 4;
+const MAX_CONCURRENT_TRANSCRIPTIONS = 4;
+const MAX_CONCURRENT_SUMMARIES = 8;
 const OPENAI_REST_TIMEOUT_MS = 90_000;
 const limitConcurrentAppleWebhooks = createConcurrencyGuard({
   maxConcurrent: MAX_CONCURRENT_APPLE_WEBHOOKS,
   retryAfterSeconds: 5,
   code: "APPLE_WEBHOOK_BUSY",
   message: "Apple notification processing is temporarily busy.",
+});
+const limitConcurrentAppleVerifications = createConcurrencyGuard({
+  maxConcurrent: MAX_CONCURRENT_APPLE_VERIFICATIONS,
+  retryAfterSeconds: 5,
+  code: "APPLE_VERIFICATION_BUSY",
+  message: "Apple subscription verification is temporarily busy.",
+});
+const limitConcurrentTranscriptions = createConcurrencyGuard({
+  maxConcurrent: MAX_CONCURRENT_TRANSCRIPTIONS,
+  retryAfterSeconds: 5,
+  code: "TRANSCRIPTION_BUSY",
+  message: "The transcription service is temporarily busy.",
+});
+const limitConcurrentSummaries = createConcurrencyGuard({
+  maxConcurrent: MAX_CONCURRENT_SUMMARIES,
+  retryAfterSeconds: 5,
+  code: "SUMMARY_BUSY",
+  message: "The summary service is temporarily busy.",
 });
 
 const ALLOWED_AUDIO_TYPES = new Set([
@@ -110,7 +144,63 @@ function getBearerToken(req) {
     : null;
 }
 
-async function requireAuthenticatedUser(req, res) {
+function logErrorMetadata(context, error, logFn = console.error) {
+  logFn(context, {
+    name: String(error?.name || "Error"),
+    code: error?.code ? String(error.code) : null,
+    status: Number.isFinite(error?.status) ? error.status : null,
+  });
+}
+
+function sendAccountDeletionState(res, deletion) {
+  return res.status(410).json({
+    code:
+      deletion.status === "complete"
+        ? "ACCOUNT_DELETED"
+        : "ACCOUNT_DELETION_IN_PROGRESS",
+    error:
+      deletion.status === "complete"
+        ? "This account has been deleted."
+        : "Account deletion is in progress.",
+    ...publicAccountDeletion(deletion),
+  });
+}
+
+export async function sendAccountDeletionRaceResponse(
+  res,
+  {
+    uid,
+    db = null,
+    error,
+    context = "[account deletion race]",
+    getDbFn = getDb,
+    logFn = console.error,
+  } = {}
+) {
+  if (!uid) return false;
+
+  try {
+    const activeDb = db || (await getDbFn());
+    const deletion = await getAccountDeletion(activeDb, uid);
+    if (!deletion) return false;
+    logErrorMetadata(context, error, logFn);
+    sendAccountDeletionState(res, deletion);
+    return true;
+  } catch (lookupError) {
+    logErrorMetadata(`${context} state lookup`, lookupError, logFn);
+    return false;
+  }
+}
+
+export async function requireAuthenticatedUser(
+  req,
+  res,
+  {
+    verifySignedTokenFn = verifyFirebaseTokenSignature,
+    verifyActiveTokenFn = verifyFirebaseToken,
+    getDbFn = getDb,
+  } = {}
+) {
   const token = getBearerToken(req);
 
   if (!token) {
@@ -122,16 +212,58 @@ async function requireAuthenticatedUser(req, res) {
     return null;
   }
 
+  let signedDecoded;
   try {
-    return await verifyFirebaseToken(token);
+    signedDecoded = await verifySignedTokenFn(token);
+    if (!signedDecoded?.uid) throw new Error("Token is missing a UID");
   } catch (error) {
-    console.error("[requireAuthenticatedUser]", error);
+    console.error("[requireAuthenticatedUser signature]", {
+      name: String(error?.name || "Error"),
+      code: error?.code ? String(error.code) : null,
+    });
 
     res.status(401).json({
       code: "AUTH_INVALID",
       error: "Invalid or expired token",
     });
 
+    return null;
+  }
+
+  try {
+    const db = await getDbFn();
+    const deletion = await getAccountDeletion(db, signedDecoded?.uid);
+    if (deletion) {
+      sendAccountDeletionState(res, deletion);
+      return null;
+    }
+  } catch (error) {
+    console.error("[requireAuthenticatedUser deletion guard]", {
+      name: String(error?.name || "Error"),
+      code: error?.code ? String(error.code) : null,
+    });
+    res.status(500).json({
+      code: "AUTH_STATE_UNAVAILABLE",
+      error: "Could not verify the account state.",
+    });
+    return null;
+  }
+
+  try {
+    const activeDecoded = await verifyActiveTokenFn(token);
+    if (!activeDecoded?.uid || activeDecoded.uid !== signedDecoded.uid) {
+      throw new Error("Firebase token verification returned a different UID");
+    }
+    return activeDecoded;
+  } catch (error) {
+    console.error("[requireAuthenticatedUser active]", {
+      name: String(error?.name || "Error"),
+      code: error?.code ? String(error.code) : null,
+    });
+    res.status(401).json({
+      code: "AUTH_INVALID",
+      error: "Invalid or expired token",
+    });
     return null;
   }
 }
@@ -215,16 +347,25 @@ export function attachRoutes(app) {
     })
   );
 
-  // --------------------
-  // Health
-  // --------------------
-  app.get("/health", (_req, res) => {
+  app.get("/live", (_req, res) => {
     res.json({
       ok: true,
       service: "mobilesearcherbackend",
       ts: Date.now(),
     });
   });
+
+  const readinessHandler = async (_req, res) => {
+    const readiness = await inspectReadiness();
+    return res.status(readiness.status).json({
+      ...readiness,
+      service: "mobilesearcherbackend",
+      ts: Date.now(),
+    });
+  };
+  app.get("/ready", readinessHandler);
+  // Preserve the deployment's existing probe URL, but make it truthful.
+  app.get("/health", readinessHandler);
 
   // --------------------
   // Auth test
@@ -247,20 +388,79 @@ export function attachRoutes(app) {
   // Firebase sign-in always has matching local server state.
   // --------------------
   app.get("/api/session", async (req, res) => {
+    let decoded = null;
+    let db = null;
     try {
-      const decoded = await requireAuthenticatedUser(req, res);
+      decoded = await requireAuthenticatedUser(req, res);
       if (!decoded) return;
 
-      const db = await getDb();
+      db = await getDb();
       return res.json(await buildSession(db, decoded));
     } catch (error) {
-      console.error("[GET /api/session]", error);
+      if (
+        await sendAccountDeletionRaceResponse(res, {
+          uid: decoded?.uid,
+          db,
+          error,
+          context: "[GET /api/session deletion race]",
+        })
+      ) {
+        return;
+      }
+      logErrorMetadata("[GET /api/session]", error);
       return res.status(500).json({
         code: "SESSION_LOAD_FAILED",
         error: "Failed to load session",
       });
     }
   });
+
+  // Capture Apple's single-use authorization code while it is fresh. The
+  // backend exchanges it, verifies that it belongs to the authenticated
+  // Firebase Apple provider, and stores only an encrypted refresh token.
+  app.post(
+    "/api/auth/apple/link",
+    authenticateRequest,
+    rateLimitAuthenticatedRequest(
+      "apple-auth-link",
+      APPLE_AUTH_LINK_RATE_LIMIT
+    ),
+    async (req, res) => {
+      let releaseAccountLock = null;
+      let db = null;
+      try {
+        const decoded = req.authenticatedUser;
+        releaseAccountLock = await acquireKeyedLock(decoded.uid);
+        const firebaseUser = await getFirebaseUser(decoded.uid);
+        db = await getDb();
+        await ensureUserProfile(db, decoded);
+        await linkAppleAuthorizationForUser(db, {
+          decoded,
+          authorizationCode: req.body?.authorizationCode,
+          getFirebaseUserFn: async () => firebaseUser,
+        });
+        return res.json({ ok: true, linked: true });
+      } catch (error) {
+        if (
+          await sendAccountDeletionRaceResponse(res, {
+            uid: req.authenticatedUser?.uid,
+            db,
+            error,
+            context: "[POST /api/auth/apple/link deletion race]",
+          })
+        ) {
+          return;
+        }
+        return sendAppleSignInError(
+          res,
+          error,
+          "[POST /api/auth/apple/link]"
+        );
+      } finally {
+        releaseAccountLock?.();
+      }
+    }
+  );
 
   // --------------------
   // Verify StoreKit 2 JWS evidence for the authenticated Firebase account.
@@ -273,10 +473,12 @@ export function attachRoutes(app) {
       "apple-subscription-verification",
       APPLE_VERIFICATION_RATE_LIMIT
     ),
+    limitConcurrentAppleVerifications,
     async (req, res) => {
+      let db = null;
       try {
         const decoded = req.authenticatedUser;
-        const db = await getDb();
+        db = await getDb();
         const profile = await ensureUserProfile(db, decoded);
         const result = await verifyAppleEvidenceForUser(db, {
           uid: decoded.uid,
@@ -287,9 +489,19 @@ export function attachRoutes(app) {
           acceptedTransactionIds: result.acceptedTransactionIds,
           rejected: result.rejected,
           rejectedCount: result.rejectedCount,
-          session: await buildSession(db, decoded),
+          session: await buildSession(db, decoded, { profile }),
         });
       } catch (error) {
+        if (
+          await sendAccountDeletionRaceResponse(res, {
+            uid: req.authenticatedUser?.uid,
+            db,
+            error,
+            context: "[POST /api/subscriptions/apple/verify deletion race]",
+          })
+        ) {
+          return;
+        }
         return sendAppleSubscriptionError(
           res,
           error,
@@ -306,17 +518,29 @@ export function attachRoutes(app) {
       "apple-subscription-refresh",
       APPLE_VERIFICATION_RATE_LIMIT
     ),
+    limitConcurrentAppleVerifications,
     async (req, res) => {
+      let db = null;
       try {
         const decoded = req.authenticatedUser;
-        const db = await getDb();
+        db = await getDb();
         const profile = await ensureUserProfile(db, decoded);
         await refreshAppleSubscriptionForUser(db, {
           uid: decoded.uid,
           appAccountToken: profile.apple_app_account_token,
         });
-        return res.json({ session: await buildSession(db, decoded) });
+        return res.json({ session: await buildSession(db, decoded, { profile }) });
       } catch (error) {
+        if (
+          await sendAccountDeletionRaceResponse(res, {
+            uid: req.authenticatedUser?.uid,
+            db,
+            error,
+            context: "[POST /api/subscriptions/apple/refresh deletion race]",
+          })
+        ) {
+          return;
+        }
         return sendAppleSubscriptionError(
           res,
           error,
@@ -355,8 +579,10 @@ export function attachRoutes(app) {
   // Body: { username: string }
   // --------------------
   app.post("/api/users", async (req, res) => {
+    let decoded = null;
+    let db = null;
     try {
-      const decoded = await requireAuthenticatedUser(req, res);
+      decoded = await requireAuthenticatedUser(req, res);
 
       if (!decoded) {
         return;
@@ -386,7 +612,7 @@ export function attachRoutes(app) {
         ? normalizeSubscriptionSnapshot(req.body.subscription)
         : null;
 
-      const db = await getDb();
+      db = await getDb();
 
       await db.run(
         `INSERT INTO users (
@@ -407,11 +633,11 @@ export function attachRoutes(app) {
         [uid, username]
       );
 
-      if (normalizedSubscription) {
-        await saveUserSubscription(db, uid, normalizedSubscription);
-      }
-
-      const subscription = await getUserSubscription(db, uid);
+      const subscription = normalizedSubscription
+        ? await saveUserSubscription(db, uid, normalizedSubscription)
+        : await getUserSubscription(db, uid);
+      const deletion = await getAccountDeletion(db, uid);
+      if (deletion) return sendAccountDeletionState(res, deletion);
 
       return res.json({
         ok: true,
@@ -420,7 +646,17 @@ export function attachRoutes(app) {
         subscription,
       });
     } catch (error) {
-      console.error("[POST /api/users]", error);
+      if (
+        await sendAccountDeletionRaceResponse(res, {
+          uid: decoded?.uid,
+          db,
+          error,
+          context: "[POST /api/users deletion race]",
+        })
+      ) {
+        return;
+      }
+      logErrorMetadata("[POST /api/users]", error);
 
       if (error instanceof SubscriptionStatusValidationError) {
         return res.status(400).json({
@@ -429,9 +665,7 @@ export function attachRoutes(app) {
         });
       }
 
-      return res.status(500).json({
-        error: error?.message || "Failed to save user",
-      });
+      return res.status(500).json({ error: "Failed to save user" });
     }
   });
 
@@ -441,11 +675,12 @@ export function attachRoutes(app) {
   // Body: { name?: string, username?: string, subscription?: StoreKitSnapshot }
   // --------------------
   app.patch("/api/users/me", async (req, res) => {
-    let db;
+    let db = null;
+    let decoded = null;
     // let transactionStarted = false;
 
     try {
-      const decoded = await requireAuthenticatedUser(req, res);
+      decoded = await requireAuthenticatedUser(req, res);
 
       if (!decoded) {
         return;
@@ -474,6 +709,8 @@ export function attachRoutes(app) {
       );
 
       if (!existingUser) {
+        const deletion = await getAccountDeletion(db, decoded.uid);
+        if (deletion) return sendAccountDeletionState(res, deletion);
         return res.status(404).json({
           error: "User not found",
         });
@@ -492,18 +729,19 @@ export function attachRoutes(app) {
         );
       }
 
-      if (normalizedSubscription) {
-        await saveUserSubscription(
+      const subscription = normalizedSubscription
+        ? await saveUserSubscription(
           db,
           decoded.uid,
           normalizedSubscription
-        );
-      }
+        )
+        : await getUserSubscription(db, decoded.uid);
 
       // await db.exec("COMMIT");
       // transactionStarted = false;
 
-      const subscription = await getUserSubscription(db, decoded.uid);
+      const deletion = await getAccountDeletion(db, decoded.uid);
+      if (deletion) return sendAccountDeletionState(res, deletion);
 
       return res.json({
         ok: true,
@@ -518,7 +756,17 @@ export function attachRoutes(app) {
       //   await db.exec("ROLLBACK").catch(() => {});
       // }
 
-      console.error("[PATCH /api/users/me]", error);
+      if (
+        await sendAccountDeletionRaceResponse(res, {
+          uid: decoded?.uid,
+          db,
+          error,
+          context: "[PATCH /api/users/me deletion race]",
+        })
+      ) {
+        return;
+      }
+      logErrorMetadata("[PATCH /api/users/me]", error);
 
       if (error instanceof SubscriptionStatusValidationError) {
         return res.status(400).json({
@@ -533,9 +781,7 @@ export function attachRoutes(app) {
         });
       }
 
-      return res.status(500).json({
-        error: error?.message || "Failed to update user",
-      });
+      return res.status(500).json({ error: "Failed to update user" });
     }
   });
 
@@ -544,8 +790,10 @@ export function attachRoutes(app) {
   // GET /api/users/:uid
   // --------------------
   app.get("/api/users/:uid", async (req, res) => {
+    let decoded = null;
+    let db = null;
     try {
-      const decoded = await requireAuthenticatedUser(req, res);
+      decoded = await requireAuthenticatedUser(req, res);
 
       if (!decoded) {
         return;
@@ -575,12 +823,16 @@ export function attachRoutes(app) {
       );
 
       if (!row) {
+        const deletion = await getAccountDeletion(db, requestedUid);
+        if (deletion) return sendAccountDeletionState(res, deletion);
         return res.status(404).json({
           error: "User not found",
         });
       }
 
       const subscription = await getUserSubscription(db, requestedUid);
+      const deletion = await getAccountDeletion(db, requestedUid);
+      if (deletion) return sendAccountDeletionState(res, deletion);
 
       return res.json({
         ok: true,
@@ -589,114 +841,28 @@ export function attachRoutes(app) {
         subscription,
       });
     } catch (error) {
-      console.error("[GET /api/users/:uid]", error);
-
-      return res.status(500).json({
-        error: error?.message || "Failed to load user",
-      });
-    }
-  });
-
-  // --------------------
-  // Permanently delete authenticated user's account
-  // DELETE /api/users/:uid
-  // --------------------
-  app.delete("/api/users/:uid", async (req, res) => {
-    let db;
-
-    try {
-      const decoded = await requireAuthenticatedUser(req, res);
-
-      if (!decoded) {
+      if (
+        await sendAccountDeletionRaceResponse(res, {
+          uid: decoded?.uid,
+          db,
+          error,
+          context: "[GET /api/users/:uid deletion race]",
+        })
+      ) {
         return;
       }
-
-      const authenticatedUid = decoded.uid;
-      const requestedUid = String(req.params.uid || "").trim();
-
-      if (!requestedUid) {
-        return res.status(400).json({
-          error: "uid is required",
-        });
-      }
-
-      if (requestedUid !== authenticatedUid) {
-        return res.status(403).json({
-          error: "Forbidden",
-        });
-      }
-
-      db = await getDb();
-
-      await db.exec("BEGIN TRANSACTION");
-
-      try {
-        await db.run(
-          `DELETE FROM usage_daily
-           WHERE owner_type = 'user'
-             AND owner_key = ?`,
-          [authenticatedUid]
-        );
-
-        await db.run(
-          `DELETE FROM users
-           WHERE uid = ?`,
-          [authenticatedUid]
-        );
-
-        // Add future server-side user data deletions here:
-        //
-        // await db.run(
-        //   `DELETE FROM fridge_items WHERE uid = ?`,
-        //   [authenticatedUid]
-        // );
-        //
-        // await db.run(
-        //   `DELETE FROM shopping_items WHERE uid = ?`,
-        //   [authenticatedUid]
-        // );
-        //
-        // await db.run(
-        //   `DELETE FROM chat_messages WHERE uid = ?`,
-        //   [authenticatedUid]
-        // );
-
-        await deleteFirebaseUser(authenticatedUid);
-
-        await db.exec("COMMIT");
-      } catch (deleteError) {
-        await db.exec("ROLLBACK");
-        throw deleteError;
-      }
-
-      return res.json({
-        ok: true,
-        uid: authenticatedUid,
-        message: "Account permanently deleted",
-      });
-    } catch (error) {
-      console.error("[DELETE /api/users/:uid]", error);
-
-      if (error?.code === "auth/user-not-found") {
-        return res.status(404).json({
-          error: "Firebase user not found",
-        });
-      }
-
-      if (
-        typeof error?.code === "string" &&
-        error.code.startsWith("auth/id-token")
-      ) {
-        return res.status(401).json({
-          error: "Invalid or expired token",
-        });
-      }
+      logErrorMetadata("[GET /api/users/:uid]", error);
 
       return res.status(500).json({
-        error: error?.message || "Failed to delete account",
+        error: "Failed to load user",
       });
     }
   });
+
+  // Durable, idempotent deletion and response-loss reconciliation deliberately
+  // use a signature-valid token after Firebase removal. These routes enforce
+  // their own UID scoping and never provision account data.
+  attachAccountDeletionRoutes(app);
 
   // --------------------
   // Transcribe recorded audio
@@ -715,6 +881,7 @@ export function attachRoutes(app) {
       "transcription",
       TRANSCRIPTION_RATE_LIMIT
     ),
+    limitConcurrentTranscriptions,
     handleAudioUpload,
     async (req, res) => {
       let quotaReservationContext = null;
@@ -892,14 +1059,9 @@ export function attachRoutes(app) {
         }
 
         if (!openAIResponse.ok) {
-          console.error(
-            "[POST /api/transcriptions] OpenAI error:",
-            {
-              status: openAIResponse.status,
-              body: data,
-              uid: decoded.uid,
-            }
-          );
+          console.error("[POST /api/transcriptions] OpenAI error", {
+            status: openAIResponse.status,
+          });
 
           if (quotaReservation) {
             await reconcileUsageReservation(
@@ -916,9 +1078,8 @@ export function attachRoutes(app) {
           return res
             .status(openAIResponse.status)
             .json({
-              error:
-                data?.error?.message ||
-                "The transcription service failed.",
+              code: "UPSTREAM_ERROR",
+              error: "The transcription service failed.",
             });
         }
 
@@ -931,11 +1092,12 @@ export function attachRoutes(app) {
           await addUsage(db, "user", decoded.uid, usedTokens, 1);
         }
         */
+        let reconciledUsage = null;
         if (quotaReservation) {
           const usedTokens = Number.isFinite(data?.usage?.total_tokens)
             ? Math.max(0, Math.trunc(data.usage.total_tokens))
             : null;
-          await reconcileUsageReservation(
+          reconciledUsage = await reconcileUsageReservation(
             db,
             "user",
             decoded.uid,
@@ -958,13 +1120,11 @@ export function attachRoutes(app) {
           });
         }
 
-        const quota = await getQuotaSnapshot(
-          db,
-          "user",
-          decoded.uid,
-          quotaApplies,
-          { dailyLimit: dailyLimit ?? undefined }
-        );
+        const quota = createQuotaSnapshot({
+          applies: quotaApplies,
+          tokensUsed: reconciledUsage?.tokens_used || 0,
+          dailyLimit: dailyLimit ?? undefined,
+        });
 
         return res.json({
           ok: true,
@@ -988,18 +1148,26 @@ export function attachRoutes(app) {
           }).catch(() => null);
         }
 
-        console.error(
-          "[POST /api/transcriptions]",
-          error
-        );
+        if (
+          await sendAccountDeletionRaceResponse(res, {
+            uid: req.authenticatedUser?.uid,
+            db: quotaReservationContext?.db || null,
+            error,
+            context: "[POST /api/transcriptions deletion race]",
+          })
+        ) {
+          return;
+        }
+        logErrorMetadata("[POST /api/transcriptions]", error);
 
+        const upstreamTimedOut = error?.code === "UPSTREAM_TIMEOUT";
         return res
-          .status(error?.code === "UPSTREAM_TIMEOUT" ? 504 : 500)
+          .status(upstreamTimedOut ? 504 : 500)
           .json({
-          ...(error?.code ? { code: error.code } : {}),
-          error:
-            error?.message ||
-            "Unable to transcribe the recording.",
+          ...(upstreamTimedOut ? { code: "UPSTREAM_TIMEOUT" } : {}),
+          error: upstreamTimedOut
+            ? "The transcription service timed out."
+            : "Unable to transcribe the recording.",
           ...(quota ? { quota: quotaResponse(quota) } : {}),
         });
       }
@@ -1013,8 +1181,10 @@ export function attachRoutes(app) {
     "/summarize",
     authenticateRequest,
     rateLimitAuthenticatedRequest("summary", SUMMARY_RATE_LIMIT),
+    limitConcurrentSummaries,
     async (req, res) => {
     let quotaReservationContext = null;
+    let db = null;
 
     try {
       const decoded = req.authenticatedUser;
@@ -1053,7 +1223,7 @@ export function attachRoutes(app) {
         },
         ...messages,
       ];
-      const db = await getDb();
+      db = await getDb();
       const subscription = await getUserSubscription(db, decoded.uid);
       const { plan } = resolveSubscriptionAccess(subscription);
       const dailyLimit = plan.dailyTokenLimit;
@@ -1061,10 +1231,9 @@ export function attachRoutes(app) {
       let quotaBudget = null;
       let quotaReservation = null;
 
-      if (
-        estimateTokensFromMessages(summaryQuotaMessages) >
-        plan.maxPromptTokens
-      ) {
+      const estimatedSummaryPromptTokens =
+        estimateTokensFromMessages(summaryQuotaMessages);
+      if (estimatedSummaryPromptTokens > plan.maxPromptTokens) {
         return res.status(413).json({
           code: "REQUEST_TOO_LARGE",
           error: "This conversation is too large to summarize.",
@@ -1082,7 +1251,7 @@ export function attachRoutes(app) {
           tokensUsed: usage.tokens_used,
           dailyLimit,
           maxCompletionTokens: plan.maxCompletionTokens,
-          messages: summaryQuotaMessages,
+          estPromptTokens: estimatedSummaryPromptTokens,
         });
 
         if (!quotaBudget.ok) {
@@ -1184,14 +1353,9 @@ export function attachRoutes(app) {
       }
 
       if (!openAIResponse.ok) {
-        console.error(
-          "[POST /summarize] OpenAI error:",
-          {
-            status: openAIResponse.status,
-            body: data || responseText,
-            uid: decoded.uid,
-          }
-        );
+        console.error("[POST /summarize] OpenAI error", {
+          status: openAIResponse.status,
+        });
 
         if (quotaReservation) {
           await reconcileUsageReservation(
@@ -1208,10 +1372,8 @@ export function attachRoutes(app) {
         return res
           .status(openAIResponse.status)
           .json({
-            error:
-              data?.error?.message ||
-              responseText ||
-              "Failed to summarize",
+            code: "UPSTREAM_ERROR",
+            error: "Failed to summarize",
           });
       }
 
@@ -1224,11 +1386,12 @@ export function attachRoutes(app) {
         await addUsage(db, "user", decoded.uid, usedTokens, 1);
       }
       */
+      let reconciledUsage = null;
       if (quotaReservation) {
         const usedTokens = Number.isFinite(data?.usage?.total_tokens)
           ? Math.max(0, Math.trunc(data.usage.total_tokens))
           : null;
-        await reconcileUsageReservation(
+        reconciledUsage = await reconcileUsageReservation(
           db,
           "user",
           decoded.uid,
@@ -1241,13 +1404,11 @@ export function attachRoutes(app) {
 
       const summary =
         data?.choices?.[0]?.message?.content ?? "";
-      const quota = await getQuotaSnapshot(
-        db,
-        "user",
-        decoded.uid,
-        quotaApplies,
-        { dailyLimit: dailyLimit ?? undefined }
-      );
+      const quota = createQuotaSnapshot({
+        applies: quotaApplies,
+        tokensUsed: reconciledUsage?.tokens_used || 0,
+        dailyLimit: dailyLimit ?? undefined,
+      });
 
       return res.json({
         summary,
@@ -1270,7 +1431,17 @@ export function attachRoutes(app) {
         }).catch(() => null);
       }
 
-      console.error("[POST /summarize]", error);
+      if (
+        await sendAccountDeletionRaceResponse(res, {
+          uid: req.authenticatedUser?.uid,
+          db: quotaReservationContext?.db || null,
+          error,
+          context: "[POST /summarize deletion race]",
+        })
+      ) {
+        return;
+      }
+      logErrorMetadata("[POST /summarize]", error);
 
       return res
         .status(error?.code === "UPSTREAM_TIMEOUT" ? 504 : 500)
@@ -1287,8 +1458,36 @@ export function attachRoutes(app) {
   );
 }
 
+function sendAppleSignInError(res, error, logContext) {
+  console.error(logContext, {
+    name: String(error?.name || "Error"),
+    code: error?.code ? String(error.code) : null,
+    status: Number.isFinite(error?.status) ? error.status : null,
+    retryable: error?.retryable === true,
+  });
+  if (error instanceof AppleSignInError) {
+    return res.status(error.status).json({
+      code: error.code,
+      error: error.message,
+      retryable: error.retryable,
+    });
+  }
+  if (error?.code === "APPLE_SIGN_IN_NOT_CONFIGURED") {
+    return res.status(503).json({
+      code: error.code,
+      error: "Sign in with Apple revocation is not configured.",
+      retryable: false,
+    });
+  }
+  return res.status(500).json({
+    code: "APPLE_SIGN_IN_ERROR",
+    error: "Sign in with Apple credential processing failed.",
+    retryable: false,
+  });
+}
+
 function sendAppleSubscriptionError(res, error, logContext) {
-  console.error(logContext, error);
+  logErrorMetadata(logContext, error);
   if (error instanceof AppleSubscriptionOwnershipError) {
     return res.status(409).json({ code: error.code, error: error.message });
   }

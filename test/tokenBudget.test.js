@@ -189,3 +189,20 @@ test("rejects a prompt that consumes the remaining quota", () => {
   });
   assert.doesNotMatch(budget.reason, /sign[ -]?in|guest|trial/i);
 });
+
+test("accepts a precomputed prompt estimate without serializing messages again", () => {
+  assert.deepEqual(
+    computeTokenBudget({
+      tokensUsed: 100,
+      dailyLimit: 1_000,
+      maxCompletionTokens: 300,
+      estPromptTokens: 200,
+    }),
+    {
+      ok: true,
+      remainingTokens: 900,
+      estPromptTokens: 200,
+      maxCompletionTokens: 300,
+    }
+  );
+});

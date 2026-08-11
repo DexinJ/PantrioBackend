@@ -36,6 +36,7 @@ test("atomically rejects concurrent reservations beyond the daily limit", async 
   const usage = await getUsageRow(db, "user", "free-user");
 
   assert.equal(accepted.length, 1);
+  assert.equal(accepted[0].tokensUsed, 600);
   assert.equal(usage.tokens_used, 600);
 });
 
@@ -49,7 +50,7 @@ test("reconciles a reservation to provider-reported usage", async (t) => {
     1_000
   );
 
-  await reconcileUsageReservation(
+  const reconciled = await reconcileUsageReservation(
     db,
     "user",
     "free-user",
@@ -59,6 +60,7 @@ test("reconciles a reservation to provider-reported usage", async (t) => {
   );
 
   const usage = await getUsageRow(db, "user", "free-user");
+  assert.deepEqual(reconciled, { tokens_used: 225, requests: 1 });
   assert.deepEqual(usage, { tokens_used: 225, requests: 1 });
 });
 

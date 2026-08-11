@@ -24,10 +24,39 @@ function upsertToolCalls(toolCallState, toolCallsDelta) {
   }
 }
 
+async function withAbortTimeout(controller, timeoutMs, operation) {
+  const normalizedTimeoutMs =
+    Number.isFinite(timeoutMs) && timeoutMs > 0
+      ? Math.min(Math.trunc(timeoutMs), 300_000)
+      : 120_000;
+  let timedOut = false;
+  const timeout = setTimeout(() => {
+    timedOut = true;
+    controller.abort();
+  }, normalizedTimeoutMs);
+  timeout.unref?.();
+
+  try {
+    return await operation();
+  } catch (error) {
+    if (timedOut) {
+      const timeoutError = new Error("The AI service timed out.", {
+        cause: error,
+      });
+      timeoutError.name = "TimeoutError";
+      timeoutError.code = "UPSTREAM_TIMEOUT";
+      throw timeoutError;
+    }
+    throw error;
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+
 /**
  * Stream one OpenAI call and forward deltas to ws.
- * If the model requests tools, this ALSO emits:
- *   { type:"tool_calls", requestId, toolCalls:[...] }
+ * Tool calls are returned to the gateway. The gateway owns routing so raw
+ * server-owned calls are never published before ownership is split.
  *
  * Returns tool calls + usage (when include_usage enabled).
  */
@@ -39,7 +68,9 @@ export async function streamOpenAIOnce({
   messages,
   controller,
   maxTokens,
+  timeoutMs = 120_000,
 }) {
+  return withAbortTimeout(controller, timeoutMs, async () => {
   let firstTokenAt = null;
   const t0 = Date.now();
   const resp = await fetch("https://api.openai.com/v1/chat/completions", {
@@ -65,11 +96,10 @@ export async function streamOpenAIOnce({
 
 
   if (!resp.ok || !resp.body) {
-    const text = await resp.text();
+    await resp.body?.cancel?.().catch?.(() => {});
 
     console.error("[OpenAI chat stream] upstream request failed", {
       status: resp.status,
-      body: text,
     });
 
     return {
@@ -88,6 +118,7 @@ export async function streamOpenAIOnce({
   const toolCallState = [];
   let finishReason = null;
   let usage = null;
+  let lastToolProgressSignature = "";
 
   while (true) {
     const { value, done } = await reader.read();
@@ -139,7 +170,12 @@ export async function streamOpenAIOnce({
           const names = toolCallState
             .map((t) => t?.function?.name)
             .filter(Boolean);
-          if (names.length) {
+          const progressSignature = JSON.stringify(names);
+          if (
+            names.length &&
+            progressSignature !== lastToolProgressSignature
+          ) {
+            lastToolProgressSignature = progressSignature;
             send(ws, { type: "tool_progress", requestId, toolNames: names });
           }
         }
@@ -151,12 +187,6 @@ export async function streamOpenAIOnce({
 
   const toolCalls = toolCallState.filter(Boolean);
   const needsTools = finishReason === "tool_calls" && toolCalls.length > 0;
-  console.log(toolCalls);
-  // 🔥 NEW: emit the actual tool calls (name + id + accumulated args)
-  if (needsTools) {
-    send(ws, { type: "tool_calls", requestId, toolCalls });
-  }
-
   return {
     ok: true,
     finishReason,
@@ -164,4 +194,5 @@ export async function streamOpenAIOnce({
     toolCalls,
     usage,
   };
+  });
 }

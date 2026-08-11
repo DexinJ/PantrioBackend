@@ -23,7 +23,7 @@ export async function addUsage(db, ownerType, ownerKey, addTokens, addRequests =
   const day = dayKeyLA();
   const now = Date.now();
 
-  await db.run(
+  return db.get(
     `
     INSERT INTO usage_daily (owner_type, owner_key, day_key, tokens_used, requests, updated_at)
     VALUES (?, ?, ?, ?, ?, ?)
@@ -32,6 +32,7 @@ export async function addUsage(db, ownerType, ownerKey, addTokens, addRequests =
       tokens_used = tokens_used + excluded.tokens_used,
       requests = requests + excluded.requests,
       updated_at = excluded.updated_at
+    RETURNING tokens_used, requests
     `,
     [ownerType, ownerKey, day, addTokens, addRequests, now]
   );
@@ -61,7 +62,7 @@ export async function reserveUsage(
 
   const day = dayKeyLA();
   const now = Date.now();
-  const result = await db.run(
+  const row = await db.get(
     `
     INSERT INTO usage_daily (owner_type, owner_key, day_key, tokens_used, requests, updated_at)
     VALUES (?, ?, ?, ?, 0, ?)
@@ -70,12 +71,18 @@ export async function reserveUsage(
       tokens_used = usage_daily.tokens_used + excluded.tokens_used,
       updated_at = excluded.updated_at
     WHERE usage_daily.tokens_used + excluded.tokens_used <= ?
+    RETURNING tokens_used, requests
     `,
     [ownerType, ownerKey, day, reserveTokens, now, dailyLimit]
   );
 
-  return result?.changes === 1
-    ? { tokens: reserveTokens, dayKey: day }
+  return row
+    ? {
+        tokens: reserveTokens,
+        dayKey: day,
+        tokensUsed: row.tokens_used,
+        requests: row.requests,
+      }
     : null;
 }
 
@@ -117,18 +124,20 @@ export async function reconcileUsageReservation(
   const now = Date.now();
   const adjustment =
     actualTokens === null ? 0 : actualTokens - reservedTokens;
-  const result = await db.run(
+  const row = await db.get(
     `UPDATE usage_daily
         SET tokens_used = MAX(0, tokens_used + ?),
             requests = requests + ?,
             updated_at = ?
       WHERE owner_type = ?
         AND owner_key = ?
-        AND day_key = ?`,
+        AND day_key = ?
+      RETURNING tokens_used, requests`,
     [adjustment, addRequests, now, ownerType, ownerKey, reservedDay]
   );
 
-  if (result?.changes !== 1) {
+  if (!row) {
     throw new Error("Usage reservation was not found for reconciliation");
   }
+  return row;
 }

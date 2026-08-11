@@ -7,6 +7,7 @@ import { open } from "sqlite";
 
 import {
   AppleSubscriptionOwnershipError,
+  findUserByAppleAccountToken,
   saveVerifiedAppleState,
 } from "../src/subscriptions/appleSubscriptionStore.js";
 import { getUserSubscription } from "../src/subscriptions/subscriptionStore.js";
@@ -102,5 +103,22 @@ test("account deletion preserves a non-user ownership tombstone", async (t) => {
       })
     ),
     AppleSubscriptionOwnershipError
+  );
+});
+
+test("finds app-account tokens through the normalized lookup contract", async (t) => {
+  const db = await openDb(t);
+  await db.run(
+    `INSERT INTO users (
+       uid, username, apple_app_account_token, created_at, updated_at
+     ) VALUES ('token-owner', 'owner', 'Mixed-Token-Value', 1, 1)`
+  );
+
+  assert.deepEqual(
+    await findUserByAppleAccountToken(db, "  MIXED-token-value  "),
+    {
+      uid: "token-owner",
+      apple_app_account_token: "Mixed-Token-Value",
+    }
   );
 });

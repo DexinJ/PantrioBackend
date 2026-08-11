@@ -5,6 +5,10 @@
 // - Keeps the rest unchanged
 
 import { SERPER_API_KEY } from "../config/env.js";
+import {
+  SafeWebFetchError,
+  fetchPublicTextPage,
+} from "./safeWebFetch.js";
 
 // ✅ Single source of truth for what GPT is allowed to send
 export const PRESET_CATEGORIES = [
@@ -82,13 +86,34 @@ function isProbablyRecipePage(text) {
 }
 // ✅ END CHANGED
 
+async function fetchWithDeadline(url, options, { signal, timeoutMs = 10_000 } = {}) {
+  const controller = new AbortController();
+  const forwardAbort = () => controller.abort(signal?.reason);
+  if (signal?.aborted) {
+    forwardAbort();
+  } else {
+    signal?.addEventListener("abort", forwardAbort, { once: true });
+  }
+  const timeout = setTimeout(
+    () => controller.abort(new Error("Request timed out.")),
+    timeoutMs
+  );
+  timeout.unref?.();
+
+  try {
+    return await fetch(url, { ...options, signal: controller.signal });
+  } finally {
+    clearTimeout(timeout);
+    signal?.removeEventListener("abort", forwardAbort);
+  }
+}
+
 export const TOOLS = {
   /**
    * Web search via Serper.dev
    * Returns: { query, results: [{ title, link, snippet }] }
    */
-  webSearch: async (args, _ctx) => {
-    console.log("Starting Search");
+  webSearch: async (args, ctx) => {
     const q = typeof args?.query === "string" ? args.query.trim() : "";
     const k = Number.isFinite(args?.k) ? Math.max(1, Math.min(10, args.k)) : 5;
 
@@ -98,20 +123,31 @@ export const TOOLS = {
       return { error: "Missing SERPER_API_KEY on server", query: q, results: [] };
     }
 
-    const resp = await fetch("https://google.serper.dev/search", {
-      method: "POST",
-      headers: {
-        "X-API-KEY": SERPER_API_KEY,
-        "Content-Type": "application/json",
-      },
-      body: JSON.stringify({ q, num: k }),
-    });
+    let resp;
+    try {
+      resp = await fetchWithDeadline(
+        "https://google.serper.dev/search",
+        {
+          method: "POST",
+          headers: {
+            "X-API-KEY": SERPER_API_KEY,
+            "Content-Type": "application/json",
+          },
+          body: JSON.stringify({ q, num: k }),
+        },
+        { signal: ctx?.signal }
+      );
+    } catch {
+      return {
+        error: "Web search is temporarily unavailable.",
+        query: q,
+        results: [],
+      };
+    }
 
     if (!resp.ok) {
-      const text = await resp.text().catch(() => "");
       return {
         error: `Serper error ${resp.status}`,
-        details: text?.slice?.(0, 500) || "",
         query: q,
         results: [],
       };
@@ -130,7 +166,7 @@ export const TOOLS = {
   },
 
   // ✅ NEW: browse/fetch a URL and return readable text
-  webFetch: async (args, _ctx) => {
+  webFetch: async (args, ctx) => {
     const url = typeof args?.url === "string" ? args.url.trim() : "";
     const maxChars = Number.isFinite(args?.maxChars)
       ? Math.max(1000, Math.min(20000, args.maxChars))
@@ -138,42 +174,31 @@ export const TOOLS = {
 
     if (!url) return { error: "Missing url", url: "", text: "" };
 
-    // basic safety: only http(s)
-    if (!/^https?:\/\//i.test(url)) {
-      return { error: "Invalid URL (must start with http/https)", url, text: "" };
-    }
+    try {
+      const page = await fetchPublicTextPage(url, { signal: ctx?.signal });
+      const fullText = stripHtmlToText(page.text);
+      const clipped = fullText.slice(0, maxChars);
 
-    // fetch page
-    const resp = await fetch(url, {
-      method: "GET",
-      headers: {
-        // some sites block empty UA
-        "User-Agent":
-          "Mozilla/5.0 (compatible; FridgeAppBot/1.0; +https://example.invalid)",
-        Accept: "text/html,application/xhtml+xml",
-      },
-    });
-
-    if (!resp.ok) {
-      const text = await resp.text().catch(() => "");
       return {
-        error: `Fetch error ${resp.status}`,
-        details: text?.slice?.(0, 500) || "",
+        url: page.url,
+        text: clipped,
+        clipped: page.truncated || fullText.length > clipped.length,
+        isRecipeLikely: isProbablyRecipePage(clipped),
+      };
+    } catch (error) {
+      return {
+        code:
+          error instanceof SafeWebFetchError
+            ? error.code
+            : "FETCH_FAILED",
+        error:
+          error instanceof SafeWebFetchError
+            ? error.message
+            : "The webpage could not be fetched.",
         url,
         text: "",
       };
     }
-
-    const html = await resp.text().catch(() => "");
-    const fullText = stripHtmlToText(html);
-    const clipped = fullText.slice(0, maxChars);
-
-    return {
-      url,
-      text: clipped,
-      clipped: fullText.length > clipped.length,
-      isRecipeLikely: isProbablyRecipePage(clipped),
-    };
   },
 };
 

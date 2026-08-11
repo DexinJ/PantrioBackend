@@ -18,6 +18,48 @@ CREATE TABLE IF NOT EXISTS users (
   updated_at INTEGER NOT NULL
 );
 
+-- Sign in with Apple refresh tokens are encrypted by the application before
+-- storage. This credential is distinct from StoreKit's appAccountToken below
+-- and is retained only while its Firebase user exists.
+CREATE TABLE IF NOT EXISTS apple_sign_in_credentials (
+  firebase_uid TEXT PRIMARY KEY,
+  apple_subject TEXT NOT NULL,
+  client_id TEXT NOT NULL,
+  encrypted_refresh_token TEXT NOT NULL,
+  created_at INTEGER NOT NULL,
+  updated_at INTEGER NOT NULL,
+  UNIQUE(client_id, apple_subject),
+  FOREIGN KEY(firebase_uid) REFERENCES users(uid) ON DELETE CASCADE
+);
+
+-- Durable account-deletion tombstones deliberately have no users foreign key.
+-- They block cached Firebase sessions from recreating an account, make the
+-- cross-service workflow restartable, and preserve the non-secret Apple
+-- revocation outcome after the user row and encrypted login credential are
+-- removed.
+CREATE TABLE IF NOT EXISTS account_deletions (
+  firebase_uid TEXT PRIMARY KEY,
+  status TEXT NOT NULL CHECK(status IN ('processing', 'complete')),
+  firebase_status TEXT NOT NULL CHECK(firebase_status IN ('pending', 'deleted')),
+  local_data_status TEXT NOT NULL CHECK(local_data_status IN ('pending', 'deleted')),
+  apple_identity_linked INTEGER NOT NULL CHECK(apple_identity_linked IN (0, 1)),
+  apple_revocation_status TEXT NOT NULL CHECK(
+    apple_revocation_status IN ('pending', 'revoked', 'manual_required', 'not_linked')
+  ),
+  apple_subject TEXT,
+  apple_client_id TEXT,
+  encrypted_apple_refresh_token TEXT,
+  apple_revocation_attempts INTEGER NOT NULL DEFAULT 0,
+  apple_next_retry_at INTEGER,
+  firebase_deletion_attempts INTEGER NOT NULL DEFAULT 0,
+  firebase_next_retry_at INTEGER,
+  requested_at INTEGER NOT NULL,
+  updated_at INTEGER NOT NULL,
+  completed_at INTEGER,
+  last_error_code TEXT,
+  last_error_message TEXT
+);
+
 -- Verified App Store subscription state. Client StoreKit telemetry remains on
 -- users for diagnostics, but these rows are the only production entitlement
 -- authority.
@@ -120,5 +162,50 @@ CREATE TABLE IF NOT EXISTS usage_daily (
 CREATE INDEX IF NOT EXISTS idx_conversations_owner ON conversations(owner_type, owner_key, created_at);
 CREATE INDEX IF NOT EXISTS idx_messages_conv ON messages(conversation_id, created_at);
 CREATE INDEX IF NOT EXISTS idx_apple_subscriptions_user ON apple_subscriptions(firebase_uid, verified_at);
+CREATE INDEX IF NOT EXISTS idx_apple_subscriptions_user_environment
+  ON apple_subscriptions(firebase_uid, environment, verified_at DESC);
 CREATE INDEX IF NOT EXISTS idx_apple_transactions_original ON apple_transactions(environment, original_transaction_id);
 CREATE INDEX IF NOT EXISTS idx_apple_transactions_user ON apple_transactions(firebase_uid, signed_date);
+CREATE INDEX IF NOT EXISTS idx_account_deletions_status ON account_deletions(status, updated_at);
+CREATE INDEX IF NOT EXISTS idx_account_deletions_recovery
+  ON account_deletions(status, apple_next_retry_at, updated_at);
+CREATE INDEX IF NOT EXISTS idx_account_deletions_firebase_recovery
+  ON account_deletions(status, firebase_next_retry_at, updated_at);
+CREATE INDEX IF NOT EXISTS idx_apple_notification_events_processed
+  ON apple_notification_events(processed_at);
+CREATE INDEX IF NOT EXISTS idx_usage_daily_day_key ON usage_daily(day_key);
+
+-- These guards close the narrow race where a request verifies Firebase just
+-- before deletion creates its tombstone and then attempts a user-scoped insert
+-- after local cleanup. On the shared SQLite connection, either the insert
+-- commits before the tombstone (and cleanup removes it) or the trigger blocks
+-- the insert after the tombstone exists.
+CREATE TRIGGER IF NOT EXISTS prevent_deleted_user_insert
+BEFORE INSERT ON users
+WHEN EXISTS (
+  SELECT 1 FROM account_deletions
+   WHERE firebase_uid = NEW.uid
+)
+BEGIN
+  SELECT RAISE(ABORT, 'ACCOUNT_DELETION_BLOCKED');
+END;
+
+CREATE TRIGGER IF NOT EXISTS prevent_deleted_user_usage_insert
+BEFORE INSERT ON usage_daily
+WHEN NEW.owner_type = 'user' AND EXISTS (
+  SELECT 1 FROM account_deletions
+   WHERE firebase_uid = NEW.owner_key
+)
+BEGIN
+  SELECT RAISE(ABORT, 'ACCOUNT_DELETION_BLOCKED');
+END;
+
+CREATE TRIGGER IF NOT EXISTS prevent_deleted_user_conversation_insert
+BEFORE INSERT ON conversations
+WHEN NEW.owner_type = 'user' AND EXISTS (
+  SELECT 1 FROM account_deletions
+   WHERE firebase_uid = NEW.owner_key
+)
+BEGIN
+  SELECT RAISE(ABORT, 'ACCOUNT_DELETION_BLOCKED');
+END;
