@@ -69,6 +69,9 @@ export async function streamOpenAIOnce({
   controller,
   maxTokens,
   timeoutMs = 120_000,
+  tools = OPENAI_TOOLS,
+  toolChoice = "auto",
+  parallelToolCalls = false,
 }) {
   return withAbortTimeout(controller, timeoutMs, async () => {
   let firstTokenAt = null;
@@ -84,8 +87,15 @@ export async function streamOpenAIOnce({
       messages,
       stream: true,
       stream_options: { include_usage: true },
-      tools: OPENAI_TOOLS,
-      tool_choice: "auto",
+      ...(Array.isArray(tools) && tools.length
+        ? {
+            tools,
+            tool_choice: toolChoice,
+            ...(typeof parallelToolCalls === "boolean"
+              ? { parallel_tool_calls: parallelToolCalls }
+              : {}),
+          }
+        : {}),
       ...(Number.isInteger(maxTokens) && maxTokens > 0
         ? { max_completion_tokens: maxTokens }
         : {}),

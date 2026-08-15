@@ -697,6 +697,291 @@ test("routes a mixed tool batch so the client receives only client-owned calls o
   );
 });
 
+test("recipe intent forces one isolated server recommendation and disables continuation tools", async (t) => {
+  const db = await openDb(t);
+  const rounds = [];
+  const serverCallsSeen = [];
+  let serverContext = null;
+  const ws = connect(t, {
+    getDbFn: async () => db,
+    verifySignedTokenFn: async () => ({ uid: "recipe-tools-user" }),
+    verifyActiveTokenFn: async () => ({ uid: "recipe-tools-user" }),
+    runToolCallsFn: async (calls, context) => {
+      serverCallsSeen.push(...calls.map((call) => call.function.name));
+      serverContext = context.recipeContext;
+      return calls.map((call) => ({
+        role: "tool",
+        tool_call_id: call.id,
+        content: JSON.stringify({ recipes: [{ title: "Test recipe" }] }),
+      }));
+    },
+    streamOpenAIOnceFn: async (options) => {
+      rounds.push(options);
+      if (rounds.length === 1) {
+        return {
+          ok: true,
+          needsTools: true,
+          toolCalls: [
+            {
+              id: "recipe-call",
+              type: "function",
+              function: { name: "recommendRecipes", arguments: "{}" },
+            },
+            {
+              id: "unsafe-extra-call",
+              type: "function",
+              function: {
+                name: "proposeAddAllToFridge",
+                arguments: '{"items":[{"name":"recipe ingredient"}]}',
+              },
+            },
+          ],
+          usage: { total_tokens: 10 },
+        };
+      }
+      return {
+        ok: true,
+        needsTools: false,
+        toolCalls: [],
+        usage: { total_tokens: 10 },
+      };
+    },
+  });
+
+  ws.emit(
+    "message",
+    Buffer.from(
+      JSON.stringify({
+        type: "start",
+        requestId: "isolated-recipes",
+        token: "valid-token",
+        intent: "recipe_recommendation",
+        recipeContext: {
+          inventory: [{ name: " spinach ", quantity: "1 bag" }],
+          preferences: { explicit: { preferredCuisines: ["Thai"] } },
+          ignored: "not trusted",
+        },
+        messages: [{ role: "user", content: "Suggest a light Thai meal" }],
+      })
+    )
+  );
+
+  await waitFor(() =>
+    ws.sent.some(
+      ({ type, requestId }) =>
+        type === "done" && requestId === "isolated-recipes"
+    )
+  );
+
+  assert.equal(rounds.length, 2);
+  assert.deepEqual(
+    rounds[0].tools.map(({ function: tool }) => tool.name),
+    ["recommendRecipes"]
+  );
+  assert.deepEqual(rounds[0].toolChoice, {
+    type: "function",
+    function: { name: "recommendRecipes" },
+  });
+  assert.equal(rounds[0].parallelToolCalls, false);
+  assert.deepEqual(rounds[1].tools, []);
+  assert.equal(rounds[1].toolChoice, undefined);
+  assert.deepEqual(serverCallsSeen, ["recommendRecipes"]);
+  assert.deepEqual(serverContext.inventory, [
+    { name: "spinach", quantity: "1 bag" },
+  ]);
+  assert.equal("ignored" in serverContext, false);
+  assert.equal(
+    ws.sent.some(({ type }) => type === "tool_calls"),
+    false
+  );
+  assert.deepEqual(
+    rounds[1].messages
+      .filter(({ role }) => role === "tool")
+      .map(({ tool_call_id: id }) => id)
+      .sort(),
+    ["recipe-call", "unsafe-extra-call"]
+  );
+});
+
+test("preference proposals isolate one confirmation from mutation tools", async (t) => {
+  const db = await openDb(t);
+  const rounds = [];
+  const ws = connect(t, {
+    getDbFn: async () => db,
+    verifySignedTokenFn: async () => ({ uid: "preference-tools-user" }),
+    verifyActiveTokenFn: async () => ({ uid: "preference-tools-user" }),
+    streamOpenAIOnceFn: async (options) => {
+      rounds.push(options);
+      if (rounds.length === 1) {
+        return {
+          ok: true,
+          needsTools: true,
+          toolCalls: [
+            {
+              id: "preference-proposal",
+              type: "function",
+              function: {
+                name: "proposeRecipePreferenceUpdate",
+                arguments:
+                  '{"operation":"merge","patch":{"preferredCuisines":["Thai"]}}',
+              },
+            },
+            {
+              id: "unsafe-fridge-add",
+              type: "function",
+              function: { name: "addFridgeItem", arguments: '{"name":"Thai"}' },
+            },
+          ],
+          usage: { total_tokens: 10 },
+        };
+      }
+      return {
+        ok: true,
+        needsTools: false,
+        toolCalls: [],
+        usage: { total_tokens: 10 },
+      };
+    },
+  });
+
+  ws.emit(
+    "message",
+    Buffer.from(
+      JSON.stringify({
+        type: "start",
+        requestId: "isolated-preferences",
+        token: "valid-token",
+        messages: [
+          { role: "user", content: "Remember that I prefer Thai recipes" },
+        ],
+      })
+    )
+  );
+  await waitFor(() =>
+    ws.sent.some(
+      ({ type, requestId }) =>
+        type === "tool_calls" && requestId === "isolated-preferences"
+    )
+  );
+
+  const proposalFrame = ws.sent.find(
+    ({ type, requestId }) =>
+      type === "tool_calls" && requestId === "isolated-preferences"
+  );
+  assert.deepEqual(
+    proposalFrame.toolCalls.map(({ id }) => id),
+    ["preference-proposal"]
+  );
+
+  ws.emit(
+    "message",
+    Buffer.from(
+      JSON.stringify({
+        type: "tool_results",
+        requestId: "isolated-preferences",
+        results: [
+          {
+            tool_call_id: "preference-proposal",
+            content: JSON.stringify({ ok: true, proposalShown: true }),
+          },
+        ],
+      })
+    )
+  );
+  await waitFor(() =>
+    ws.sent.some(
+      ({ type, requestId }) =>
+        type === "done" && requestId === "isolated-preferences"
+    )
+  );
+
+  assert.deepEqual(rounds[1].tools, []);
+  assert.deepEqual(
+    rounds[1].messages
+      .filter(({ role }) => role === "tool")
+      .map(({ tool_call_id: id }) => id)
+      .sort(),
+    ["preference-proposal", "unsafe-fridge-add"]
+  );
+});
+
+test("bulk fridge proposals cannot repeat across tool rounds", async (t) => {
+  const db = await openDb(t);
+  const rounds = [];
+  const ws = connect(t, {
+    getDbFn: async () => db,
+    verifySignedTokenFn: async () => ({ uid: "bulk-proposal-user" }),
+    verifyActiveTokenFn: async () => ({ uid: "bulk-proposal-user" }),
+    streamOpenAIOnceFn: async (options) => {
+      rounds.push(options);
+      return rounds.length === 1
+        ? {
+            ok: true,
+            needsTools: true,
+            toolCalls: [
+              {
+                id: "bulk-proposal",
+                type: "function",
+                function: {
+                  name: "proposeAddAllToFridge",
+                  arguments: '{"items":[{"name":"milk"}]}',
+                },
+              },
+            ],
+            usage: { total_tokens: 10 },
+          }
+        : {
+            ok: true,
+            needsTools: false,
+            toolCalls: [],
+            usage: { total_tokens: 10 },
+          };
+    },
+  });
+
+  ws.emit(
+    "message",
+    Buffer.from(
+      JSON.stringify({
+        type: "start",
+        requestId: "one-bulk-proposal",
+        token: "valid-token",
+        messages: [{ role: "user", content: "Add the items from my image" }],
+      })
+    )
+  );
+  await waitFor(() =>
+    ws.sent.some(
+      ({ type, requestId }) =>
+        type === "tool_calls" && requestId === "one-bulk-proposal"
+    )
+  );
+  ws.emit(
+    "message",
+    Buffer.from(
+      JSON.stringify({
+        type: "tool_results",
+        requestId: "one-bulk-proposal",
+        results: [
+          {
+            tool_call_id: "bulk-proposal",
+            content: JSON.stringify({ ok: true, proposalShown: true }),
+          },
+        ],
+      })
+    )
+  );
+  await waitFor(() =>
+    ws.sent.some(
+      ({ type, requestId }) =>
+        type === "done" && requestId === "one-bulk-proposal"
+    )
+  );
+
+  assert.equal(rounds.length, 2);
+  assert.deepEqual(rounds[1].tools, []);
+});
+
 test("a client cannot satisfy a server-owned tool ID while that tool is running", async (t) => {
   const db = await openDb(t);
   let releaseServerTool;

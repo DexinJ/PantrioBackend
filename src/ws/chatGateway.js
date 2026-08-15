@@ -50,7 +50,11 @@ import {
 
 import { streamOpenAIOnce } from "../chat/openaiStream.js";
 import { resolveChatModel } from "../chat/modelPolicy.js";
-import { OPENAI_TOOLS } from "../chat/tools.js";
+import {
+  normalizeChatIntent,
+  resolveRoundToolPolicy,
+  sanitizeRecipeContext,
+} from "../chat/recipeRequest.js";
 import { runToolCalls } from "../chat/toolRunner.js"; // ✅ HYBRID: enable server-side tools
 
 let activeChatRequests = 0;
@@ -250,6 +254,7 @@ function makeAssistantToolCallMsg(toolCalls) {
 // ✅ HYBRID: server-only tools (secrets / internet)
 const SERVER_TOOLS = new Set([
   "webSearch",
+  "recommendRecipes",
   // "webFetch", // add if you implement page fetching
 ]);
 
@@ -513,9 +518,21 @@ export function attachChatGateway(
 
       let maxTokensForThisRound = plan.maxCompletionTokens;
       let quotaReservation = null;
+      const toolPolicy = state.toolsLockedAfterIsolatedAction
+        ? {
+            tools: [],
+            toolChoice: undefined,
+            parallelToolCalls: undefined,
+          }
+        : resolveRoundToolPolicy({
+            intent: state.intent,
+            round: state.round || 0,
+          });
       const budgetMessages = [
         ...workingMessages,
-        { role: "system", content: { tools: OPENAI_TOOLS } },
+        ...(toolPolicy.tools.length
+          ? [{ role: "system", content: { tools: toolPolicy.tools } }]
+          : []),
       ];
       const estPromptTokens = estimateTokensFromMessages(budgetMessages);
 
@@ -625,6 +642,9 @@ export function attachChatGateway(
           controller,
           // maxTokens: maxTokensForThisRequest,
           maxTokens: maxTokensForThisRound,
+          tools: toolPolicy.tools,
+          toolChoice: toolPolicy.toolChoice,
+          parallelToolCalls: toolPolicy.parallelToolCalls,
         });
       } catch (error) {
         if (quotaReservation) {
@@ -753,11 +773,51 @@ export function attachChatGateway(
       state.awaitingTools = true;
       state.acceptingClientToolResults = false;
       state.toolCalls = one.toolCalls || [];
+      const recipeRecommendationCall = state.toolCalls.find(
+        (call) => call?.function?.name === "recommendRecipes"
+      );
+      const preferenceProposalCall = state.toolCalls.find(
+        (call) => call?.function?.name === "proposeRecipePreferenceUpdate"
+      );
+      const fridgeProposalCall = state.toolCalls.find(
+        (call) => call?.function?.name === "proposeAddAllToFridge"
+      );
+      const isolatedToolCall =
+        recipeRecommendationCall || preferenceProposalCall || fridgeProposalCall;
+      if (isolatedToolCall) {
+        state.toolsLockedAfterIsolatedAction = true;
+      }
+      if (recipeRecommendationCall) {
+        // A recommendation result must be formatted next, never followed by a
+        // second search or a fridge mutation tool, even if intent inference
+        // missed an unusual recipe phrasing on the first round.
+        state.intent = "recipe_recommendation";
+      }
       state.collectedToolMsgs = [];
       state.clientToolCallIds = new Set();
       state.round = (state.round || 0) + 1;
 
-      const { serverCalls, clientCalls } = splitToolCalls(state.toolCalls);
+      let { serverCalls, clientCalls } = splitToolCalls(state.toolCalls);
+      if (isolatedToolCall) {
+        const skippedCalls = state.toolCalls.filter(
+          (call) => call !== isolatedToolCall
+        );
+        ({ serverCalls, clientCalls } = splitToolCalls([isolatedToolCall]));
+        state.collectedToolMsgs.push(
+          ...skippedCalls
+            .filter((call) => call?.id)
+            .map((call) => ({
+              role: "tool",
+              tool_call_id: call.id,
+              content: JSON.stringify({
+                ok: false,
+                skipped: true,
+                reason:
+                  "Recipe and preference actions are isolated from other tool actions.",
+              }),
+            }))
+        );
+      }
 
       // ✅ HYBRID: run server tools immediately (e.g., webSearch)
       if (serverCalls.length) {
@@ -784,6 +844,7 @@ export function attachChatGateway(
                 db: state.db,
                 ownerType: state.ownerType,
                 ownerKey: state.ownerKey,
+                recipeContext: state.recipeContext,
               }),
           });
           if (active.get(requestId) !== state) return;
@@ -1156,6 +1217,21 @@ export function attachChatGateway(
         return;
       }
       const language = msg.language?.trim() || "en";
+      if (
+        msg.intent !== undefined &&
+        msg.intent !== "chat" &&
+        msg.intent !== "recipe_recommendation"
+      ) {
+        send(ws, {
+          type: "error",
+          requestId,
+          code: "INVALID_REQUEST",
+          message: "intent must be 'chat' or 'recipe_recommendation'.",
+        });
+        return;
+      }
+      const intent = normalizeChatIntent(msg.intent);
+      const recipeContext = sanitizeRecipeContext(msg.recipeContext);
 
       // SQLite-backed token budget enforcement (trial)
       // const db = await getDb();
@@ -1227,6 +1303,8 @@ export function attachChatGateway(
         ],
         model,
         language,
+        intent,
+        recipeContext,
         isAuthed,
         userId,
         db,
@@ -1238,6 +1316,7 @@ export function attachChatGateway(
         plan,
         dailyLimit,
         round: 0,
+        toolsLockedAfterIsolatedAction: false,
 
         awaitingTools: false,
         acceptingClientToolResults: false,

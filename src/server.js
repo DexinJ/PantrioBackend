@@ -8,7 +8,7 @@ import { initFirebaseAdmin } from "./auth/firebase.js";
 import { attachRoutes } from "./http/routes.js";
 import { attachChatGateway } from "./ws/chatGateway.js";
 import { initDb } from "./db/initDb.js";
-import { MAX_WS_PAYLOAD_BYTES } from "./config/policy.js";
+// import { MAX_WS_PAYLOAD_BYTES } from "./config/policy.js";
 import { initializeAppleSubscriptions } from "./subscriptions/appleConfig.js";
 import { initializeAppleSignIn } from "./auth/appleSignInConfig.js";
 import { closeDb, getDb } from "./db/db.js";
@@ -69,7 +69,7 @@ const server = http.createServer(app);
 const wss = new WebSocketServer({
   server,
   path: "/chat",
-  maxPayload: MAX_WS_PAYLOAD_BYTES,
+  // maxPayload: MAX_WS_PAYLOAD_BYTES,
 });
 
 const chatGateway = attachChatGateway(wss);

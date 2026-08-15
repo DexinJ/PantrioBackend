@@ -29,6 +29,8 @@ export const ALLOWED_MODELS_AUTHED = new Set([
   export const TRIAL_ALLOWED_TOOLS = new Set([
     "webSearch",
     "webFetch",
+    "recommendRecipes",
+    "proposeRecipePreferenceUpdate",
     "addFridgeItem",
     "addShoppingItem",
     "removeFridgeItem",

@@ -332,10 +332,11 @@ The session response is shaped as:
 
 Quota and rate failures use terminal `{ "type": "error", "code", "message",
 "quota" }` WebSocket messages. HTTP AI endpoints use the same `code`, `error`,
-and nested `quota` fields. WebSocket payloads are capped at 8 MiB, starts accept
-at most 50 bounded-complexity messages, and tool continuations stop after six
-rounds. Audio uploads are capped at 2 MiB; the mobile client records at most 60
-seconds at 32 kbps.
+and nested `quota` fields.
+<!-- WebSocket payloads are capped at 8 MiB. -->
+Starts accept at most 50 bounded-complexity messages, and tool continuations
+stop after six rounds. Audio uploads are capped at 2 MiB; the mobile client
+records at most 60 seconds at 32 kbps.
 
 ## Deployment note
 

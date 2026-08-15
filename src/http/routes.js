@@ -25,6 +25,13 @@ import {
   MAX_CHAT_PAYLOAD_NODES,
 } from "../config/policy.js";
 import {
+  RecipeRecommendationError,
+  recommendRecipes as runRecipeRecommendations,
+} from "../chat/recipeRecommendations.js";
+import { fetchPublicTextPage } from "../chat/safeWebFetch.js";
+import { TOOLS } from "../chat/tools.js";
+import { sanitizeRecipeContext } from "../chat/recipeRequest.js";
+import {
   SubscriptionStatusValidationError,
   normalizeSubscriptionSnapshot,
 } from "../subscriptions/subscriptionStatus.js";
@@ -69,12 +76,14 @@ import { inspectReadiness } from "../operations/readiness.js";
 const MAX_AUDIO_FILE_SIZE = 2 * 1024 * 1024;
 const TRANSCRIPTION_RATE_LIMIT = { windowMs: 60_000, max: 6 };
 const SUMMARY_RATE_LIMIT = { windowMs: 60_000, max: 10 };
+const RECIPE_RECOMMENDATION_RATE_LIMIT = { windowMs: 60_000, max: 6 };
 const APPLE_VERIFICATION_RATE_LIMIT = { windowMs: 60_000, max: 10 };
 const APPLE_AUTH_LINK_RATE_LIMIT = { windowMs: 60_000, max: 5 };
 const MAX_CONCURRENT_APPLE_WEBHOOKS = 8;
 const MAX_CONCURRENT_APPLE_VERIFICATIONS = 4;
 const MAX_CONCURRENT_TRANSCRIPTIONS = 4;
 const MAX_CONCURRENT_SUMMARIES = 8;
+const MAX_CONCURRENT_RECIPE_RECOMMENDATIONS = 4;
 const OPENAI_REST_TIMEOUT_MS = 90_000;
 const limitConcurrentAppleWebhooks = createConcurrencyGuard({
   maxConcurrent: MAX_CONCURRENT_APPLE_WEBHOOKS,
@@ -100,6 +109,12 @@ const limitConcurrentSummaries = createConcurrencyGuard({
   code: "SUMMARY_BUSY",
   message: "The summary service is temporarily busy.",
 });
+const limitConcurrentRecipeRecommendations = createConcurrencyGuard({
+  maxConcurrent: MAX_CONCURRENT_RECIPE_RECOMMENDATIONS,
+  retryAfterSeconds: 5,
+  code: "RECIPE_RECOMMENDATION_BUSY",
+  message: "Recipe recommendations are temporarily busy.",
+});
 
 const ALLOWED_AUDIO_TYPES = new Set([
   "audio/m4a",
@@ -118,6 +133,8 @@ const uploadAudio = multer({
   limits: {
     fileSize: MAX_AUDIO_FILE_SIZE,
     files: 1,
+    fields: 0,
+    parts: 1,
   },
   fileFilter: (_req, file, callback) => {
     if (!file?.mimetype) {
@@ -313,6 +330,100 @@ function rateLimitAuthenticatedRequest(scope, limit) {
   };
 }
 
+function isPlainRecord(value) {
+  return Boolean(value && typeof value === "object" && !Array.isArray(value));
+}
+
+function createRecipeRequestAbortScope(req, res) {
+  const controller = new AbortController();
+  const abort = () => {
+    if (!controller.signal.aborted) {
+      controller.abort(new Error("The recipe recommendation request disconnected."));
+    }
+  };
+  req.once?.("aborted", abort);
+  res.once?.("close", abort);
+
+  return {
+    signal: controller.signal,
+    cleanup() {
+      req.removeListener?.("aborted", abort);
+      res.removeListener?.("close", abort);
+    },
+  };
+}
+
+export function createRecipeRecommendationHandler({
+  recommendRecipesFn = runRecipeRecommendations,
+  search = TOOLS.webSearch,
+  fetchPage = fetchPublicTextPage,
+  sanitizeRecipeContextFn = sanitizeRecipeContext,
+} = {}) {
+  if (typeof recommendRecipesFn !== "function") {
+    throw new TypeError("recommendRecipesFn must be a function");
+  }
+  if (typeof search !== "function") {
+    throw new TypeError("search must be a function");
+  }
+  if (typeof fetchPage !== "function") {
+    throw new TypeError("fetchPage must be a function");
+  }
+  if (typeof sanitizeRecipeContextFn !== "function") {
+    throw new TypeError("sanitizeRecipeContextFn must be a function");
+  }
+
+  return async function recipeRecommendationHandler(req, res) {
+    if (!req.authenticatedUser?.uid) {
+      return res.status(401).json({
+        code: "AUTH_REQUIRED",
+        error: "Authentication is required.",
+      });
+    }
+
+    const body = req.body;
+    const overrides = body?.overrides ?? {};
+    const recipeContext = body?.recipeContext ?? {};
+    if (
+      !isPlainRecord(body) ||
+      !isPlainRecord(overrides) ||
+      !isPlainRecord(recipeContext) ||
+      !payloadComplexityIsValid(body)
+    ) {
+      return res.status(400).json({
+        code: "INVALID_RECIPE_REQUEST",
+        error: "overrides and recipeContext must be reasonably sized objects.",
+      });
+    }
+
+    const abortScope = createRecipeRequestAbortScope(req, res);
+    try {
+      const safeRecipeContext = sanitizeRecipeContextFn(recipeContext);
+      const result = await recommendRecipesFn(overrides, safeRecipeContext, {
+        search,
+        fetchPage,
+        signal: abortScope.signal,
+      });
+      if (abortScope.signal.aborted || res.headersSent) return;
+      return res.json(result);
+    } catch (error) {
+      if (abortScope.signal.aborted || res.headersSent) return;
+      logErrorMetadata("[POST /api/recipes/recommend]", error);
+      const timedOut =
+        error instanceof RecipeRecommendationError && error.code === "TIMEOUT";
+      return res.status(timedOut ? 504 : 500).json({
+        code: timedOut
+          ? "RECIPE_RECOMMENDATION_TIMEOUT"
+          : "RECIPE_RECOMMENDATION_FAILED",
+        error: timedOut
+          ? "Recipe recommendation timed out."
+          : "Could not recommend recipes.",
+      });
+    } finally {
+      abortScope.cleanup();
+    }
+  };
+}
+
 function handleAudioUpload(req, res, next) {
   uploadAudio.single("file")(req, res, (error) => {
     if (!error) {
@@ -338,6 +449,25 @@ function handleAudioUpload(req, res, next) {
       error: error?.message || "Invalid audio upload.",
     });
   });
+}
+
+// This endpoint authenticates with an explicit Firebase Bearer token and does
+// not use cookies, so browser clients can safely call it from another origin.
+export function allowTranscriptionCors(req, res, next) {
+  res.setHeader("Access-Control-Allow-Origin", "*");
+  res.setHeader("Access-Control-Allow-Methods", "POST, OPTIONS");
+  res.setHeader(
+    "Access-Control-Allow-Headers",
+    "Authorization, Content-Type"
+  );
+  res.setHeader("Access-Control-Max-Age", "600");
+
+  if (req.method === "OPTIONS") {
+    res.status(204).end();
+    return;
+  }
+
+  next();
 }
 
 export function attachRoutes(app) {
@@ -366,6 +496,17 @@ export function attachRoutes(app) {
   app.get("/ready", readinessHandler);
   // Preserve the deployment's existing probe URL, but make it truthful.
   app.get("/health", readinessHandler);
+
+  app.post(
+    "/api/recipes/recommend",
+    authenticateRequest,
+    rateLimitAuthenticatedRequest(
+      "recipe-recommendation",
+      RECIPE_RECOMMENDATION_RATE_LIMIT
+    ),
+    limitConcurrentRecipeRecommendations,
+    createRecipeRecommendationHandler()
+  );
 
   // --------------------
   // Auth test
@@ -874,8 +1015,10 @@ export function attachRoutes(app) {
   // multipart/form-data:
   //   file: audio recording
   // --------------------
+  app.options("/api/transcriptions", allowTranscriptionCors);
   app.post(
     "/api/transcriptions",
+    allowTranscriptionCors,
     authenticateRequest,
     rateLimitAuthenticatedRequest(
       "transcription",

@@ -1,6 +1,8 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 
+import { RECOMMEND_RECIPES_TOOL } from "../src/chat/tools.js";
+
 test("sends the computed completion cap to Chat Completions", async (t) => {
   process.env.OPENAI_API_KEY ||= "test-openai-key";
 
@@ -48,6 +50,7 @@ test("sends the computed completion cap to Chat Completions", async (t) => {
   assert.equal(result.ok, true);
   assert.equal(requestBody.max_completion_tokens, 123);
   assert.equal(requestBody.stream_options.include_usage, true);
+  assert.equal(requestBody.parallel_tool_calls, false);
   assert.ok(sent.some((payload) => payload.type === "usage"));
 });
 
@@ -202,4 +205,66 @@ test("returns tool calls without publishing ownership and deduplicates progress"
   ]);
   assert.equal(sent.filter(({ type }) => type === "tool_progress").length, 1);
   assert.equal(sent.some(({ type }) => type === "tool_calls"), false);
+});
+
+test("serializes forced recipe-tool policy and omits tools on continuation", async (t) => {
+  process.env.OPENAI_API_KEY ||= "test-openai-key";
+  const originalFetch = globalThis.fetch;
+  const requestBodies = [];
+  globalThis.fetch = async (_url, options) => {
+    requestBodies.push(JSON.parse(options.body));
+    const encoder = new TextEncoder();
+    const event =
+      'data: {"choices":[{"delta":{"content":"ok"},"finish_reason":"stop"}]}\n\n' +
+      "data: [DONE]\n\n";
+    return {
+      ok: true,
+      body: new ReadableStream({
+        start(controller) {
+          controller.enqueue(encoder.encode(event));
+          controller.close();
+        },
+      }),
+    };
+  };
+  t.after(() => {
+    globalThis.fetch = originalFetch;
+  });
+
+  const { streamOpenAIOnce } = await import("../src/chat/openaiStream.js");
+  const common = {
+    ws: { OPEN: 1, readyState: 1 },
+    send: () => {},
+    model: "gpt-5-mini",
+    messages: [{ role: "user", content: "Suggest recipes" }],
+    maxTokens: 100,
+  };
+  const forcedChoice = {
+    type: "function",
+    function: { name: "recommendRecipes" },
+  };
+
+  await streamOpenAIOnce({
+    ...common,
+    requestId: "recipe-first-round",
+    controller: new AbortController(),
+    tools: [RECOMMEND_RECIPES_TOOL],
+    toolChoice: forcedChoice,
+    parallelToolCalls: false,
+  });
+  await streamOpenAIOnce({
+    ...common,
+    requestId: "recipe-continuation",
+    controller: new AbortController(),
+    tools: [],
+    toolChoice: undefined,
+    parallelToolCalls: undefined,
+  });
+
+  assert.deepEqual(requestBodies[0].tools, [RECOMMEND_RECIPES_TOOL]);
+  assert.deepEqual(requestBodies[0].tool_choice, forcedChoice);
+  assert.equal(requestBodies[0].parallel_tool_calls, false);
+  for (const field of ["tools", "tool_choice", "parallel_tool_calls"]) {
+    assert.equal(Object.hasOwn(requestBodies[1], field), false, field);
+  }
 });

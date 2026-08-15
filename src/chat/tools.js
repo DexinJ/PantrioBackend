@@ -9,6 +9,7 @@ import {
   SafeWebFetchError,
   fetchPublicTextPage,
 } from "./safeWebFetch.js";
+import { recommendRecipes as runRecipeRecommendations } from "./recipeRecommendations.js";
 
 // ✅ Single source of truth for what GPT is allowed to send
 export const PRESET_CATEGORIES = [
@@ -108,6 +109,30 @@ async function fetchWithDeadline(url, options, { signal, timeoutMs = 10_000 } = 
   }
 }
 
+export function createRecommendRecipesTool({
+  recommendRecipesFn = runRecipeRecommendations,
+  search,
+  fetchPage = fetchPublicTextPage,
+} = {}) {
+  if (typeof recommendRecipesFn !== "function") {
+    throw new TypeError("recommendRecipesFn must be a function");
+  }
+  if (search !== undefined && typeof search !== "function") {
+    throw new TypeError("search must be a function when provided");
+  }
+  if (typeof fetchPage !== "function") {
+    throw new TypeError("fetchPage must be a function");
+  }
+
+  return async function recommendRecipesTool(args, ctx) {
+    return recommendRecipesFn(args, ctx?.recipeContext || {}, {
+      search: search || TOOLS.webSearch,
+      fetchPage,
+      signal: ctx?.signal,
+    });
+  };
+}
+
 export const TOOLS = {
   /**
    * Web search via Serper.dev
@@ -200,6 +225,8 @@ export const TOOLS = {
       };
     }
   },
+
+  recommendRecipes: createRecommendRecipesTool(),
 };
 
 
@@ -246,6 +273,131 @@ const EXPIRES_AT_SCHEMA = {
     "REQUIRED. Expiration date/time for this item. Prefer ISO date 'YYYY-MM-DD' (e.g., '2026-02-01'). If user gives relative time like 'in 5 days', convert to an ISO date string.",
 };
 
+export const RECOMMEND_RECIPES_TOOL = {
+  type: "function",
+  function: {
+    name: "recommendRecipes",
+    description:
+      "Find and rank real recipes using the user's trusted fridge inventory and saved recipe preferences. Use this for recipe ideas, meal ideas, or 'what can I cook?' requests. Call it once per user request. Put only constraints stated for the current request in the arguments; saved defaults and fridge items are supplied separately by the app.",
+    parameters: {
+      type: "object",
+      properties: {
+        preferredCuisines: {
+          type: "array",
+          items: { type: "string" },
+          maxItems: 5,
+          description:
+            "Cuisines requested for this meal, such as Asian, Japanese, Mexican, or American.",
+        },
+        energyPreference: {
+          type: "string",
+          enum: ["any", "light", "balanced", "hearty"],
+          description: "How light or filling this meal should be.",
+        },
+        maxCaloriesPerServing: {
+          type: ["integer", "null"],
+          minimum: 100,
+          maximum: 2500,
+          description:
+            "Explicit calorie ceiling per serving, or null when none was stated.",
+        },
+        maxPrepMinutes: {
+          type: ["integer", "null"],
+          minimum: 5,
+          maximum: 480,
+          description:
+            "Explicit total-time ceiling in minutes, or null when none was stated.",
+        },
+        mealType: {
+          type: ["string", "null"],
+          description:
+            "Requested meal type, such as breakfast, lunch, dinner, snack, or dessert.",
+        },
+        dietaryPatterns: {
+          type: "array",
+          items: { type: "string" },
+          maxItems: 8,
+          description:
+            "Dietary constraints stated for this meal, such as vegetarian or gluten-free.",
+        },
+        mustUseIngredients: {
+          type: "array",
+          items: { type: "string" },
+          maxItems: 20,
+          description:
+            "Ingredients the user explicitly asked to use. Do not copy the full fridge inventory here.",
+        },
+        excludedIngredients: {
+          type: "array",
+          items: { type: "string" },
+          maxItems: 20,
+          description:
+            "Ingredients the user explicitly asked to avoid for this meal.",
+        },
+        servings: {
+          type: "integer",
+          minimum: 1,
+          maximum: 12,
+          description: "Requested serving count.",
+        },
+        resultCount: {
+          type: "integer",
+          minimum: 1,
+          maximum: 6,
+          description: "Number of recipe suggestions requested. Default is 5.",
+        },
+      },
+      additionalProperties: false,
+    },
+  },
+};
+
+export const PROPOSE_RECIPE_PREFERENCE_UPDATE_TOOL = {
+  type: "function",
+  function: {
+    name: "proposeRecipePreferenceUpdate",
+    description:
+      "Show a confirmation card for saving persistent recipe preferences. Use when the user asks to remember/save/always/usually prefer something, or clearly states a durable allergy or dietary pattern. This tool does not save by itself. Never use it for a one-meal constraint such as 'no peanuts tonight'.",
+    parameters: {
+      type: "object",
+      properties: {
+        operation: {
+          type: "string",
+          enum: ["merge", "remove", "replace"],
+          description:
+            "Use merge to add preferences (default), remove to delete named list values, and replace only when the user explicitly asks to replace or clear a field.",
+        },
+        patch: {
+          type: "object",
+          properties: {
+            preferredCuisines: { type: "array", items: { type: "string" }, maxItems: 20 },
+            dislikedCuisines: { type: "array", items: { type: "string" }, maxItems: 20 },
+            allergens: { type: "array", items: { type: "string" }, maxItems: 20 },
+            dietaryPatterns: { type: "array", items: { type: "string" }, maxItems: 20 },
+            excludedIngredients: { type: "array", items: { type: "string" }, maxItems: 30 },
+            dislikedIngredients: { type: "array", items: { type: "string" }, maxItems: 30 },
+            preferredEnergy: {
+              type: "string",
+              enum: ["any", "light", "balanced", "hearty"],
+            },
+            maxCaloriesPerServing: { type: ["integer", "null"], minimum: 100, maximum: 2500 },
+            maxPrepMinutes: { type: ["integer", "null"], minimum: 5, maximum: 480 },
+            defaultServings: { type: "integer", minimum: 1, maximum: 12 },
+          },
+          additionalProperties: false,
+        },
+        summary: {
+          type: "string",
+          maxLength: 160,
+          description: "Short user-facing summary of what will be saved.",
+        },
+      },
+      required: ["patch"],
+      additionalProperties: false,
+    },
+  },
+};
+
 // OpenAI tool schema
 export const OPENAI_TOOLS = [
   {
@@ -253,7 +405,7 @@ export const OPENAI_TOOLS = [
     function: {
       name: "webSearch",
       description:
-        "Search the web when the user asks for recipes (e.g., recipe ideas, what can I cook, meal ideas) OR explicitly asks to browse/search online OR when answering requires up-to-date external facts (news, prices, recalls). Do NOT use for normal fridge/shopping actions. When used for recipes, return real recipe links from well-known cooking sites.",
+        "Search the web only when the user explicitly asks to browse/search online or when an answer requires up-to-date external facts such as news, prices, or recalls. Do not use for recipe recommendations; use recommendRecipes instead. Do not use for normal fridge or shopping-list actions.",
       parameters: {
         type: "object",
         properties: {
@@ -270,6 +422,8 @@ export const OPENAI_TOOLS = [
       },
     },
   },
+  RECOMMEND_RECIPES_TOOL,
+  PROPOSE_RECIPE_PREFERENCE_UPDATE_TOOL,
 // src/chat/tools.js (OPENAI_TOOLS array)
   // {
   //   type: "function",
@@ -436,7 +590,7 @@ export const OPENAI_TOOLS = [
     function: {
       name: "proposeAddAllToFridge",
       description:
-        "UI-only (no state changes): propose an 'Add all to fridge' button/card with extracted items. Each item MUST include categories with exactly 1 storage, exactly 1 urgency, exactly 1 food_type, and exactly 1 expiresAt (YYYY-MM-DD). state is optional. Predict the expiration date for each item based on food_type and storage. Never invent categories.",
+        "UI-only (no state changes): after the user attaches a fridge image, or explicitly asks to add a clearly listed batch, show one 'Add all to fridge' confirmation card for the extracted items. Never use this for recipe ingredients, recipe results, meal ideas, or ordinary bullet lists. Each item MUST include categories with exactly 1 storage, exactly 1 urgency, exactly 1 food_type, and exactly 1 expiresAt (YYYY-MM-DD). state is optional. Predict the expiration date for each item based on food_type and storage. Never invent categories.",
       parameters: {
         type: "object",
         properties: {
