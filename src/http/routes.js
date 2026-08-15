@@ -499,7 +499,7 @@ export function attachRoutes(app) {
 
   app.post(
     "/api/recipes/recommend",
-    authenticateRequest,
+    authenticateRequest, 
     rateLimitAuthenticatedRequest(
       "recipe-recommendation",
       RECIPE_RECOMMENDATION_RATE_LIMIT
