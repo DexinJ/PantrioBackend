@@ -7,6 +7,7 @@ import {
   MAX_CHAT_PAYLOAD_NODES,
   MAX_CONCURRENT_CHAT_REQUESTS,
   MAX_CONCURRENT_CHAT_REQUESTS_PER_USER,
+  LAST_REQUEST_COMPLETION_TOKENS,
   MAX_PENDING_CHAT_STARTS,
   MAX_PENDING_CHAT_STARTS_PER_CONNECTION,
   MAX_TOOL_ROUNDS,
@@ -37,7 +38,8 @@ import {
 // import { computeTrialMaxTokens, remainingTrialTokens } from "../usage/trialBudget.js";
 // The trial-only helper above is retained as a comment for migration history.
 import {
-  computeTokenBudget,
+  computeRemainingTokens,
+  DAILY_TOKEN_LIMIT_REACHED_MESSAGE,
   estimateTokensFromMessages,
 } from "../usage/tokenBudget.js";
 import { getUserSubscription } from "../subscriptions/subscriptionStore.js";
@@ -56,6 +58,7 @@ import {
   sanitizeRecipeContext,
 } from "../chat/recipeRequest.js";
 import { runToolCalls } from "../chat/toolRunner.js"; // ✅ HYBRID: enable server-side tools
+import { trimWorkingMessagesToFit } from "../chat/messageTrimmer.js";
 
 let activeChatRequests = 0;
 const activeChatRequestsByUser = new Map();
@@ -117,17 +120,6 @@ function send(ws, obj) {
     });
     return false;
   }
-}
-
-function quotaFromRemaining(remainingTokens, dailyLimit) {
-  return createQuotaSnapshot({
-    applies: true,
-    tokensUsed: Math.max(
-      0,
-      dailyLimit - remainingTokens
-    ),
-    dailyLimit,
-  });
 }
 
 function sendQuotaError(
@@ -505,7 +497,6 @@ export function attachChatGateway(
       const {
         controller,
         model,
-        workingMessages,
         // maxTokensForThisRequest, // Replaced by a fresh per-round quota check.
         db,
         ownerType,
@@ -528,94 +519,131 @@ export function attachChatGateway(
             intent: state.intent,
             round: state.round || 0,
           });
+      const toolDefinitionMessages = toolPolicy.tools.length
+        ? [{ role: "system", content: { tools: toolPolicy.tools } }]
+        : [];
       const budgetMessages = [
-        ...workingMessages,
-        ...(toolPolicy.tools.length
-          ? [{ role: "system", content: { tools: toolPolicy.tools } }]
-          : []),
+        ...state.workingMessages,
+        ...toolDefinitionMessages,
       ];
-      const estPromptTokens = estimateTokensFromMessages(budgetMessages);
+      let estPromptTokens = estimateTokensFromMessages(budgetMessages);
 
+      // Per-request hard ceiling: prefer dropping the oldest tool rounds so a
+      // user's request is never abandoned just because earlier rounds grew the
+      // prompt. Only when even the base conversation is too large do we give up.
       if (estPromptTokens > plan.maxPromptTokens) {
-        send(ws, {
-          type: "error",
-          requestId,
-          code: "REQUEST_TOO_LARGE",
-          message: "This conversation is too large to send.",
-        });
-        deleteActiveRequest(requestId);
-        return;
-      }
-
-      if (quotaApplies) {
-        const usage = await getUsageRow(db, ownerType, ownerKey);
-        const budget = computeTokenBudget({
-          tokensUsed: usage.tokens_used,
-          dailyLimit,
-          maxCompletionTokens: plan.maxCompletionTokens,
-          messages: budgetMessages,
-          estPromptTokens,
-        });
-
-        if (!budget.ok) {
-          const quota = quotaFromRemaining(budget.remainingTokens, dailyLimit);
-          sendQuotaError(ws, {
+        const trimmed = trimWorkingMessagesToFit(
+          state.workingMessages,
+          plan.maxPromptTokens,
+          { extraMessages: toolDefinitionMessages }
+        );
+        if (!trimmed) {
+          send(ws, {
+            type: "error",
             requestId,
-            code:
-              budget.remainingTokens <= 0
-                ? "QUOTA_EXHAUSTED"
-                : "REQUEST_TOO_LARGE",
-            message: budget.reason,
-            quota,
+            code: "REQUEST_TOO_LARGE",
+            message: "This conversation is too large to send.",
           });
           deleteActiveRequest(requestId);
           return;
         }
+        state.workingMessages = trimmed;
+        estPromptTokens = estimateTokensFromMessages([
+          ...state.workingMessages,
+          ...toolDefinitionMessages,
+        ]);
+      }
 
-        maxTokensForThisRound = budget.maxCompletionTokens;
-        const reserveTokens =
-          budget.estPromptTokens + budget.maxCompletionTokens;
-        quotaReservation = await reserveUsage(
-          db,
-          ownerType,
-          ownerKey,
-          reserveTokens,
+      if (quotaApplies) {
+        const usage = await getUsageRow(db, ownerType, ownerKey);
+        const remainingTokens = computeRemainingTokens(
+          usage.tokens_used,
           dailyLimit
         );
 
-        if (!quotaReservation) {
-          const latestUsage = await getUsageRow(db, ownerType, ownerKey);
+        // Hard daily stop. Once the day is spent, no further requests start.
+        if (remainingTokens <= 0) {
           const quota = createQuotaSnapshot({
             applies: true,
-            tokensUsed: latestUsage.tokens_used,
+            tokensUsed: usage.tokens_used,
             dailyLimit,
           });
           sendQuotaError(ws, {
             requestId,
             code: "QUOTA_EXHAUSTED",
-            message:
-              "Not enough daily token budget remains for this request.",
+            message: DAILY_TOKEN_LIMIT_REACHED_MESSAGE,
             quota,
           });
           deleteActiveRequest(requestId);
           return;
         }
 
-        const quota = await getQuotaSnapshot(
-          db,
-          ownerType,
-          ownerKey,
-          true,
-          { dailyLimit }
-        );
-        send(ws, {
-          type: isAuthed ? "quota_budget" : "trial_budget",
-          requestId,
-          quota,
-          ...quotaLegacyFields(quota),
-          estPromptTokens: budget.estPromptTokens,
-          maxCompletionTokens: maxTokensForThisRound,
-        });
+        // Admission happens once, on the first round. A request is served to
+        // completion as long as the day is not already spent; later tool rounds
+        // are never killed by a fresh quota read. The reservation below clamps
+        // to the remaining budget (the atomic guard stays the race-proof daily
+        // stop), and reconciliation with provider usage lands the final total.
+        // That means the last request of the day may end slightly over the
+        // limit; the next request then sees remainingTokens === 0 and stops.
+        if ((state.round || 0) === 0) {
+          const maxCompletionTokens = Math.min(
+            plan.maxCompletionTokens,
+            LAST_REQUEST_COMPLETION_TOKENS
+          );
+          const reserveTokens = Math.max(
+            1,
+            Math.min(
+              remainingTokens,
+              estPromptTokens + maxCompletionTokens
+            )
+          );
+          quotaReservation = await reserveUsage(
+            db,
+            ownerType,
+            ownerKey,
+            reserveTokens,
+            dailyLimit
+          );
+
+          if (!quotaReservation) {
+            const latestUsage = await getUsageRow(db, ownerType, ownerKey);
+            const quota = createQuotaSnapshot({
+              applies: true,
+              tokensUsed: latestUsage.tokens_used,
+              dailyLimit,
+            });
+            sendQuotaError(ws, {
+              requestId,
+              code: "QUOTA_EXHAUSTED",
+              message:
+                "Not enough daily token budget remains for this request.",
+              quota,
+            });
+            deleteActiveRequest(requestId);
+            return;
+          }
+
+          maxTokensForThisRound = maxCompletionTokens;
+          const quota = await getQuotaSnapshot(
+            db,
+            ownerType,
+            ownerKey,
+            true,
+            { dailyLimit }
+          );
+          send(ws, {
+            type: isAuthed ? "quota_budget" : "trial_budget",
+            requestId,
+            quota,
+            ...quotaLegacyFields(quota),
+            estPromptTokens,
+            maxCompletionTokens: maxTokensForThisRound,
+          });
+        } else {
+          // Already-admitted request: keep serving with the plan's completion
+          // allowance; the round-0 reservation already accounted for the day.
+          maxTokensForThisRound = plan.maxCompletionTokens;
+        }
       }
 
       /* Previous direct stream call. Quota-limited calls now reserve their
@@ -638,7 +666,7 @@ export function attachChatGateway(
           send,
           requestId,
           model,
-          messages: workingMessages,
+          messages: state.workingMessages,
           controller,
           // maxTokens: maxTokensForThisRequest,
           maxTokens: maxTokensForThisRound,

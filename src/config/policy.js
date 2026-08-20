@@ -45,7 +45,7 @@ export const ALLOWED_MODELS_AUTHED = new Set([
   
   // Trial token budgets (SQLite-backed daily quota)
   export const TRIAL_TOKENS_PER_DAY = 20_000;      // adjust to your product
-  export const TRIAL_MAX_COMPLETION_TOKENS = 600;  // per request cap
+  export const TRIAL_MAX_COMPLETION_TOKENS = 4_000;  // per request cap
 
   // The existing trial budget is now the shared daily budget for every
   // user whose stored subscription is not entitled. Keep the trial names
@@ -55,6 +55,9 @@ export const ALLOWED_MODELS_AUTHED = new Set([
     TRIAL_MAX_COMPLETION_TOKENS;
   export const SUBSCRIBER_MAX_COMPLETION_TOKENS = 4_000;
   export const SUBSCRIBER_MAX_PROMPT_TOKENS = 50_000;
+  // When a free request is admitted as the last request of the day, cap its
+  // completion allowance so the overshoot past the daily limit stays bounded.
+  export const LAST_REQUEST_COMPLETION_TOKENS = 2_000;
   export const MAX_CHAT_MESSAGES = 50;
   export const MAX_CHAT_PAYLOAD_DEPTH = 20;
   export const MAX_CHAT_PAYLOAD_NODES = 10_000;
