@@ -807,7 +807,12 @@ function findConstraintConflict(recipe, rules) {
   return null;
 }
 
-function applyHardConstraints(recipes, inputs, rules) {
+function applyHardConstraints(
+  recipes,
+  inputs,
+  rules,
+  { keepUnknownWhenEstimated = false } = {}
+) {
   const stats = {
     excludedIngredient: 0,
     overCalorieLimit: 0,
@@ -815,6 +820,10 @@ function applyHardConstraints(recipes, inputs, rules) {
     overTimeLimit: 0,
     timeUnknown: 0,
   };
+  if (keepUnknownWhenEstimated) {
+    stats.caloriesUnknownSoft = 0;
+    stats.timeUnknownSoft = 0;
+  }
   const accepted = [];
   for (const recipe of recipes) {
     if (findConstraintConflict(recipe, rules)) {
@@ -823,22 +832,30 @@ function applyHardConstraints(recipes, inputs, rules) {
     }
     if (inputs.maxCaloriesPerServing != null) {
       if (recipe.caloriesPerServing == null) {
-        stats.caloriesUnknown += 1;
-        continue;
-      }
-      if (recipe.caloriesPerServing > inputs.maxCaloriesPerServing) {
+        if (keepUnknownWhenEstimated) {
+          stats.caloriesUnknownSoft += 1;
+        } else {
+          stats.caloriesUnknown += 1;
+          continue;
+        }
+      } else if (recipe.caloriesPerServing > inputs.maxCaloriesPerServing) {
         stats.overCalorieLimit += 1;
         continue;
       }
     }
     // maxPrepMinutes is the public contract's total-time ceiling. As with an
-    // explicit calorie cap, unknown publisher data cannot be claimed to fit.
+    // explicit calorie cap, unverified timing cannot be claimed to fit. When
+    // AI estimation is active, recipes that could not be estimated are kept
+    // with a soft penalty and warnings instead of being dropped.
     if (inputs.maxPrepMinutes != null) {
       if (recipe.totalMinutes == null) {
-        stats.timeUnknown += 1;
-        continue;
-      }
-      if (recipe.totalMinutes > inputs.maxPrepMinutes) {
+        if (keepUnknownWhenEstimated) {
+          stats.timeUnknownSoft += 1;
+        } else {
+          stats.timeUnknown += 1;
+          continue;
+        }
+      } else if (recipe.totalMinutes > inputs.maxPrepMinutes) {
         stats.overTimeLimit += 1;
         continue;
       }
@@ -1186,7 +1203,11 @@ function publicRecipe(recipe) {
  *
  * `deps.search` intentionally matches the existing TOOLS.webSearch signature:
  *   search({ query, k }, { signal }) -> { results: [{ title, link, snippet }] }
- * Network dependencies remain injectable for deterministic unit tests.
+ * `deps.estimateMeta` is an optional best-effort metadata estimator for
+ * recipes the publisher left without calories/time. It receives only recipes
+ * with missing metadata, mutates them in place with "ai_estimated" confidence
+ * labels, and returns `{ ok, estimatedCount, failedCount }`. Network and LLM
+ * dependencies remain injectable for deterministic unit tests.
  */
 export async function recommendRecipes(
   overrides = {},
@@ -1196,6 +1217,8 @@ export async function recommendRecipes(
     fetchPage = fetchPublicTextPage,
     signal,
     limits: requestedLimits,
+    estimateMeta,
+    estimationEnabled = false,
   } = {}
 ) {
   if (typeof search !== "function") {
@@ -1255,10 +1278,55 @@ export async function recommendRecipes(
       );
     }
 
+    // Best-effort metadata estimation: fill missing calories/time with AI
+    // estimates labeled as such, so hard caps filter on the estimate instead
+    // of silently discarding every recipe with incomplete publisher data.
+    const estimationActive =
+      estimationEnabled && typeof estimateMeta === "function";
+    let estimatedCount = 0;
+    let estimationFailedCount = 0;
+    if (estimationActive) {
+      const missingMetadata = fetched.recipes.filter(
+        (recipe) =>
+          recipe.caloriesPerServing == null || recipe.totalMinutes == null
+      );
+      if (missingMetadata.length > 0) {
+        let estimation;
+        try {
+          estimation = await awaitAbortable(
+            () =>
+              Promise.resolve(
+                estimateMeta(missingMetadata, { signal: deadline.signal })
+              ),
+            deadline
+          );
+        } catch (error) {
+          if (deadline.signal.aborted) throw abortError(deadline);
+          estimation = null;
+        }
+        estimatedCount =
+          estimation && estimation.ok ? estimation.estimatedCount || 0 : 0;
+        estimationFailedCount = Math.max(
+          0,
+          missingMetadata.length - estimatedCount
+        );
+        if (estimationFailedCount > 0) {
+          pushWarning(
+            warnings,
+            warning(
+              "METADATA_ESTIMATION_PARTIAL",
+              "Some recipes could not be estimated; their calories or timing may be unverified."
+            )
+          );
+        }
+      }
+    }
+
     const constrained = applyHardConstraints(
       fetched.recipes,
       inputs,
-      constraintRules
+      constraintRules,
+      { keepUnknownWhenEstimated: estimationActive }
     );
     const deduped = dedupeCandidates(scoreCandidates(constrained.recipes, inputs));
     const selected = selectDiverse(deduped, inputs.resultCount).map(publicRecipe);
@@ -1286,6 +1354,8 @@ export async function recommendRecipes(
         candidatesParsed: fetched.recipes.length,
         candidatesAfterHardConstraints: constrained.recipes.length,
         returnedCount: selected.length,
+        estimatedCount,
+        estimationFailedCount,
         filtered: constrained.stats,
         applied: {
           cuisines:

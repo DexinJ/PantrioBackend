@@ -10,6 +10,10 @@ import {
   fetchPublicTextPage,
 } from "./safeWebFetch.js";
 import { recommendRecipes as runRecipeRecommendations } from "./recipeRecommendations.js";
+import {
+  estimateAndApplyRecipeMetadata,
+  recipeEstimationEnabled,
+} from "./recipeEstimation.js";
 
 // ✅ Single source of truth for what GPT is allowed to send
 export const PRESET_CATEGORIES = [
@@ -113,6 +117,8 @@ export function createRecommendRecipesTool({
   recommendRecipesFn = runRecipeRecommendations,
   search,
   fetchPage = fetchPublicTextPage,
+  estimateMeta = estimateAndApplyRecipeMetadata,
+  estimationEnabled = recipeEstimationEnabled(),
 } = {}) {
   if (typeof recommendRecipesFn !== "function") {
     throw new TypeError("recommendRecipesFn must be a function");
@@ -123,12 +129,17 @@ export function createRecommendRecipesTool({
   if (typeof fetchPage !== "function") {
     throw new TypeError("fetchPage must be a function");
   }
+  if (typeof estimateMeta !== "function") {
+    throw new TypeError("estimateMeta must be a function");
+  }
 
   return async function recommendRecipesTool(args, ctx) {
     return recommendRecipesFn(args, ctx?.recipeContext || {}, {
       search: search || TOOLS.webSearch,
       fetchPage,
       signal: ctx?.signal,
+      estimateMeta,
+      estimationEnabled,
     });
   };
 }

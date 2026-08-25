@@ -278,6 +278,7 @@ function normalizeRecipeNode(node, pageUrl) {
     caloriesPerServing,
     nutritionConfidence:
       caloriesPerServing == null ? "unknown" : "publisher_provided",
+    timeConfidence: totalMinutes == null ? "unknown" : "publisher_provided",
     ingredients,
     instructions: [...new Set(instructions)].slice(0, MAX_INSTRUCTIONS),
     warnings,

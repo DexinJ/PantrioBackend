@@ -91,6 +91,7 @@ test("parses and normalizes nested Recipe JSON-LD without evaluating markup", ()
     totalMinutes: 35,
     caloriesPerServing: 385,
     nutritionConfidence: "publisher_provided",
+    timeConfidence: "publisher_provided",
     ingredients: [
       "1 lb chicken breast",
       "2 cups Thai basil",

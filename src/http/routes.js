@@ -30,6 +30,10 @@ import {
 } from "../chat/recipeRecommendations.js";
 import { fetchPublicTextPage } from "../chat/safeWebFetch.js";
 import { TOOLS } from "../chat/tools.js";
+import {
+  estimateAndApplyRecipeMetadata,
+  recipeEstimationEnabled,
+} from "../chat/recipeEstimation.js";
 import { sanitizeRecipeContext } from "../chat/recipeRequest.js";
 import {
   SubscriptionStatusValidationError,
@@ -358,6 +362,8 @@ export function createRecipeRecommendationHandler({
   search = TOOLS.webSearch,
   fetchPage = fetchPublicTextPage,
   sanitizeRecipeContextFn = sanitizeRecipeContext,
+  estimateMeta = estimateAndApplyRecipeMetadata,
+  estimationEnabled = recipeEstimationEnabled(),
 } = {}) {
   if (typeof recommendRecipesFn !== "function") {
     throw new TypeError("recommendRecipesFn must be a function");
@@ -370,6 +376,9 @@ export function createRecipeRecommendationHandler({
   }
   if (typeof sanitizeRecipeContextFn !== "function") {
     throw new TypeError("sanitizeRecipeContextFn must be a function");
+  }
+  if (typeof estimateMeta !== "function") {
+    throw new TypeError("estimateMeta must be a function");
   }
 
   return async function recipeRecommendationHandler(req, res) {
@@ -402,6 +411,8 @@ export function createRecipeRecommendationHandler({
         search,
         fetchPage,
         signal: abortScope.signal,
+        estimateMeta,
+        estimationEnabled,
       });
       if (abortScope.signal.aborted || res.headersSent) return;
       return res.json(result);
