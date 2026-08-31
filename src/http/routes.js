@@ -122,6 +122,7 @@ const limitConcurrentRecipeRecommendations = createConcurrencyGuard({
 
 const ALLOWED_AUDIO_TYPES = new Set([
   "audio/m4a",
+  "audio/x-m4a",
   "audio/mp4",
   "audio/mpeg",
   "audio/mp3",
