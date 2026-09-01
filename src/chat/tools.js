@@ -321,8 +321,35 @@ export const RECOMMEND_RECIPES_TOOL = {
         },
         mealType: {
           type: ["string", "null"],
+          enum: ["breakfast", "lunch", "dinner", "snack", "dessert"],
+          description: "Requested meal type for this meal.",
+        },
+        skillLevel: {
+          type: ["string", "null"],
+          enum: ["beginner", "intermediate", "advanced"],
           description:
-            "Requested meal type, such as breakfast, lunch, dinner, snack, or dessert.",
+            "Cooking skill level requested. Only pass it when the user states a skill or difficulty; never invent one.",
+        },
+        cookingMethod: {
+          type: ["string", "null"],
+          enum: [
+            "air_fryer",
+            "instant_pot",
+            "one_pot",
+            "sheet_pan",
+            "grill",
+            "stovetop",
+            "oven",
+          ],
+          description:
+            "Cooking method the user asked for (e.g. air fryer, Instant Pot, one pot, sheet pan). Only pass it when the user states a method; never invent one.",
+        },
+        maxIngredients: {
+          type: ["integer", "null"],
+          minimum: 3,
+          maximum: 30,
+          description:
+            "Maximum number of ingredients the user is willing to use. Only pass it when the user states a count.",
         },
         dietaryPatterns: {
           type: "array",
@@ -354,8 +381,9 @@ export const RECOMMEND_RECIPES_TOOL = {
         resultCount: {
           type: "integer",
           minimum: 1,
-          maximum: 6,
-          description: "Number of recipe suggestions requested. Default is 5.",
+          maximum: 10,
+          description:
+            "Number of recipe suggestions requested (1-10, entitlement-gated). Default is 5.",
         },
       },
       additionalProperties: false,
@@ -662,4 +690,126 @@ export const OPENAI_TOOLS = [
       },
     },
   },
+
+  // Client-owned: forwarded to the app, which executes them and returns the
+  // result. Schemas live here so the model can propose them.
+  {
+    type: "function",
+    function: {
+      name: "updateFridgeItem",
+      description:
+        "Edit a single fridge item: rename it, change its quantity, categories, or expiry. Resolve the item by id when available, otherwise by exact name. For changes to several items, use proposeBulkFridgeUpdate instead.",
+      parameters: {
+        type: "object",
+        properties: {
+          id: { type: "string", description: "Fridge item id, when known." },
+          name: { type: "string", description: "Exact item name, when id is unknown." },
+          updates: {
+            type: "object",
+            properties: {
+              name: { type: "string", description: "New item name." },
+              quantity: { type: "string", description: "New amount/size." },
+              categories: CATEGORY_SCHEMA,
+              expiresInDays: {
+                type: "integer",
+                minimum: 1,
+                description:
+                  "Whole-day shelf life estimate from today; prefer this over an absolute date.",
+              },
+              expiresAt: {
+                type: "string",
+                description:
+                  "Absolute expiration date (YYYY-MM-DD) only when the user states one.",
+              },
+            },
+            additionalProperties: false,
+          },
+        },
+        required: ["updates"],
+        additionalProperties: false,
+      },
+    },
+  },
+
+  {
+    type: "function",
+    function: {
+      name: "proposeBulkFridgeUpdate",
+      description:
+        "Show one confirmation card for multiple fridge changes (rename, quantity, categories, expiry, or removal). Resolve each entry by id when available, otherwise by exact name. Nothing is changed until the user confirms on the card.",
+      parameters: {
+        type: "object",
+        properties: {
+          changes: {
+            type: "array",
+            minItems: 1,
+            maxItems: 40,
+            items: {
+              type: "object",
+              properties: {
+                id: { type: "string", description: "Fridge item id, when known." },
+                name: { type: "string", description: "Exact item name, when id is unknown." },
+                update: {
+                  type: "object",
+                  properties: {
+                    name: { type: "string" },
+                    quantity: { type: "string" },
+                    categories: CATEGORY_SCHEMA,
+                    expiresInDays: { type: "integer", minimum: 1 },
+                    expiresAt: { type: "string" },
+                  },
+                  additionalProperties: false,
+                },
+                remove: {
+                  type: "boolean",
+                  description: "Set true to remove this item from the fridge.",
+                },
+              },
+              additionalProperties: false,
+            },
+          },
+          title: { type: "string", description: "Optional card title." },
+        },
+        required: ["changes"],
+        additionalProperties: false,
+      },
+    },
+  },
+
+  {
+    type: "function",
+    function: {
+      name: "proposeAddMissingIngredientsToShoppingList",
+      description:
+        "After recommendRecipes returns, propose adding the recommended recipes' missing ingredients to the shopping list. Shows one confirmation card; nothing is added until the user confirms. Never use for the fridge and never call before recommendRecipes.",
+      parameters: {
+        type: "object",
+        properties: {
+          items: {
+            type: "array",
+            minItems: 1,
+            items: {
+              type: "object",
+              properties: {
+                name: { type: "string", description: "Ingredient name." },
+                quantity: { type: "string", description: "Optional amount." },
+                categories: CATEGORY_SCHEMA,
+              },
+              required: ["name"],
+              additionalProperties: false,
+            },
+          },
+          title: { type: "string", description: "Optional card title." },
+        },
+        required: ["items"],
+        additionalProperties: false,
+      },
+    },
+  },
 ];
+
+export const PROPOSE_ADD_MISSING_INGREDIENTS_TO_SHOPPING_LIST_TOOL =
+  OPENAI_TOOLS.find(
+    (tool) =>
+      tool?.function?.name === "proposeAddMissingIngredientsToShoppingList"
+  );

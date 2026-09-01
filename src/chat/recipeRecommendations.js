@@ -2,7 +2,17 @@ import { fetchPublicTextPage } from "./safeWebFetch.js";
 import { parseRecipeJsonLd } from "./recipeJsonLd.js";
 
 const ENERGY_PREFERENCES = new Set(["any", "light", "balanced", "hearty"]);
-const MAX_RESULT_COUNT = 6;
+const SKILL_LEVELS = new Set(["beginner", "intermediate", "advanced"]);
+const COOKING_METHODS = new Set([
+  "air_fryer",
+  "instant_pot",
+  "one_pot",
+  "sheet_pan",
+  "grill",
+  "stovetop",
+  "oven",
+]);
+const MAX_RESULT_COUNT = 10;
 const DEFAULT_RESULT_COUNT = 5;
 const DEFAULT_LIMITS = Object.freeze({
   maxSearchQueries: 2,
@@ -24,6 +34,21 @@ const LIMIT_CEILINGS = Object.freeze({
   overallTimeoutMs: 30_000,
   maxRecipesPerPage: 6,
 });
+
+// Subscriber entitlement raises the search budget and result cap. Free users
+// keep the conservative defaults above; ceilings still bound everything.
+export const SUBSCRIBER_RECIPE_LIMITS = Object.freeze({
+  maxSearchQueries: 3,
+  searchResultsPerQuery: 8,
+  maxPages: 10,
+  fetchConcurrency: 3,
+  pageTimeoutMs: 10_000,
+  pageMaxBytes: 512 * 1024,
+  overallTimeoutMs: 25_000,
+  maxRecipesPerPage: 6,
+});
+export const SUBSCRIBER_MAX_RESULT_COUNT = 10;
+export const FREE_MAX_RESULT_COUNT = 6;
 
 const TERM_STOP_WORDS = new Set([
   "a",
@@ -366,7 +391,11 @@ function normalizeEnergy(value) {
   return ENERGY_PREFERENCES.has(resolved) ? resolved : null;
 }
 
-function normalizeInputs(overrides = {}, recipeContext = {}) {
+function normalizeInputs(
+  overrides = {},
+  recipeContext = {},
+  { maxResultCount = MAX_RESULT_COUNT } = {}
+) {
   const saved = explicitPreferences(recipeContext);
   const learned = learnedPreferences(recipeContext);
   const personalizationEnabled =
@@ -412,6 +441,19 @@ function normalizeInputs(overrides = {}, recipeContext = {}) {
     max: MAX_RESULT_COUNT,
   });
 
+  const skillLevel = SKILL_LEVELS.has(normalizeText(overrides?.skillLevel))
+    ? normalizeText(overrides?.skillLevel)
+    : null;
+  const cookingMethod = COOKING_METHODS.has(
+    normalizeText(overrides?.cookingMethod).replace(/ /g, "_")
+  )
+    ? normalizeText(overrides?.cookingMethod).replace(/ /g, "_")
+    : null;
+  const maxIngredients = boundedInteger(overrides?.maxIngredients, {
+    min: 3,
+    max: 30,
+  });
+
   const selectedIngredients = normalizedStringList(
     recipeContext?.selectedIngredients,
     { maxItems: 30, maxLength: 100 }
@@ -446,12 +488,20 @@ function normalizeInputs(overrides = {}, recipeContext = {}) {
     maxCaloriesPerServing: requestedCalories ?? savedCalories,
     maxPrepMinutes: requestedMinutes ?? savedMinutes,
     mealType: clip(overrides?.mealType, 40),
+    skillLevel,
+    cookingMethod,
+    maxIngredients,
     servings:
       boundedInteger(overrides?.servings, { min: 1, max: 12 }) ??
       (personalizationEnabled
         ? boundedInteger(saved?.defaultServings, { min: 1, max: 12 })
         : null),
-    resultCount: requestedCount ?? DEFAULT_RESULT_COUNT,
+    // Clamp to the entitlement tier rather than silently defaulting, so a
+    // free user asking for 10 recipes gets 6 (not 5).
+    resultCount:
+      requestedCount == null
+        ? DEFAULT_RESULT_COUNT
+        : Math.min(requestedCount, maxResultCount),
     allergens: normalizedStringList(saved?.allergens, {
       maxItems: 20,
       maxLength: 60,
@@ -550,6 +600,14 @@ function buildSearchQueries(inputs, limits) {
   if (inputs.energyPreference === "hearty") preferenceParts.push("hearty filling");
   if (inputs.energyPreference === "balanced") preferenceParts.push("balanced");
   if (inputs.mealType) preferenceParts.push(inputs.mealType);
+  if (inputs.skillLevel === "beginner") preferenceParts.push("easy");
+  else if (inputs.skillLevel === "advanced") preferenceParts.push("advanced");
+  if (inputs.cookingMethod) {
+    preferenceParts.push(inputs.cookingMethod.replace(/_/g, " "));
+  }
+  if (inputs.maxIngredients != null) {
+    preferenceParts.push(`under ${inputs.maxIngredients} ingredients`);
+  }
   if (inputs.maxCaloriesPerServing != null) {
     preferenceParts.push(`under ${inputs.maxCaloriesPerServing} calories per serving`);
   }
@@ -1055,6 +1113,17 @@ function scoreCandidates(recipes, inputs) {
   return recipes.map((recipe, index) => {
     const ingredients = ingredientMatches(recipe, inputs);
     const dislikes = dislikedIngredientPenalty(recipe, inputs);
+    // Ingredient count is a preference, not a hard constraint: recipes that
+    // exceed the user's stated maximum get a capped soft penalty so strong
+    // recipes stay viable instead of disappearing from results.
+    const ingredientCountPenalty =
+      inputs.maxIngredients != null
+        ? Math.min(
+            0.1,
+            Math.max(0, recipe.ingredients.length - inputs.maxIngredients) *
+              0.02
+          )
+        : 0;
     const breakdown = {
       cuisine: cuisineScore(recipe, inputs),
       energy: energyScore(recipe, inputs.energyPreference),
@@ -1063,6 +1132,7 @@ function scoreCandidates(recipes, inputs) {
       time: timeScore(recipe, inputs.maxPrepMinutes),
       quality: qualityScore(recipe),
       dislikedIngredientPenalty: dislikes.dislikedIngredientPenalty,
+      ingredientCountPenalty,
     };
     const baseScore = inputs.requestedIngredients.length
       ? breakdown.cuisine * 0.18 +
@@ -1076,7 +1146,10 @@ function scoreCandidates(recipes, inputs) {
         breakdown.ingredients * 0.32 +
         breakdown.time * 0.15 +
         breakdown.quality * 0.1;
-    const score = Math.max(0, baseScore - dislikes.dislikedIngredientPenalty);
+    const score = Math.max(
+      0,
+      baseScore - dislikes.dislikedIngredientPenalty - ingredientCountPenalty
+    );
     return {
       ...recipe,
       ...ingredients,
@@ -1219,6 +1292,7 @@ export async function recommendRecipes(
     limits: requestedLimits,
     estimateMeta,
     estimationEnabled = false,
+    maxResultCount = MAX_RESULT_COUNT,
   } = {}
 ) {
   if (typeof search !== "function") {
@@ -1235,7 +1309,7 @@ export async function recommendRecipes(
   }
 
   const limits = normalizeLimits(requestedLimits);
-  const inputs = normalizeInputs(overrides, recipeContext);
+  const inputs = normalizeInputs(overrides, recipeContext, { maxResultCount });
   const warnings = [];
   const constraintRules = createConstraintRules(inputs, warnings);
   const queries = buildSearchQueries(inputs, limits);
@@ -1366,6 +1440,9 @@ export async function recommendRecipes(
           maxCaloriesPerServing: inputs.maxCaloriesPerServing,
           maxPrepMinutes: inputs.maxPrepMinutes,
           mealType: inputs.mealType || null,
+          skillLevel: inputs.skillLevel,
+          cookingMethod: inputs.cookingMethod,
+          maxIngredients: inputs.maxIngredients,
           servings: inputs.servings ?? null,
           inventoryItemCount: inputs.inventory.length,
           selectedIngredients: inputs.selectedIngredients,

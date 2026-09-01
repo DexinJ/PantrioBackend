@@ -57,6 +57,7 @@ import {
   resolveRoundToolPolicy,
   sanitizeRecipeContext,
 } from "../chat/recipeRequest.js";
+import { PROPOSE_ADD_MISSING_INGREDIENTS_TO_SHOPPING_LIST_TOOL } from "../chat/tools.js";
 import { runToolCalls } from "../chat/toolRunner.js"; // ✅ HYBRID: enable server-side tools
 import { trimWorkingMessagesToFit } from "../chat/messageTrimmer.js";
 
@@ -510,11 +511,19 @@ export function attachChatGateway(
       let maxTokensForThisRound = plan.maxCompletionTokens;
       let quotaReservation = null;
       const toolPolicy = state.toolsLockedAfterIsolatedAction
-        ? {
-            tools: [],
-            toolChoice: undefined,
-            parallelToolCalls: undefined,
-          }
+        ? state.recipeFollowUpAvailable && !state.recipeFollowUpUsed
+          ? {
+              tools: [PROPOSE_ADD_MISSING_INGREDIENTS_TO_SHOPPING_LIST_TOOL].filter(
+                Boolean
+              ),
+              toolChoice: "auto",
+              parallelToolCalls: false,
+            }
+          : {
+              tools: [],
+              toolChoice: undefined,
+              parallelToolCalls: undefined,
+            }
         : resolveRoundToolPolicy({
             intent: state.intent,
             round: state.round || 0,
@@ -801,6 +810,15 @@ export function attachChatGateway(
       state.awaitingTools = true;
       state.acceptingClientToolResults = false;
       state.toolCalls = one.toolCalls || [];
+      if (
+        state.recipeFollowUpAvailable &&
+        state.toolCalls.some(
+          (call) =>
+            call?.function?.name === "proposeAddMissingIngredientsToShoppingList"
+        )
+      ) {
+        state.recipeFollowUpUsed = true;
+      }
       const recipeRecommendationCall = state.toolCalls.find(
         (call) => call?.function?.name === "recommendRecipes"
       );
@@ -817,9 +835,9 @@ export function attachChatGateway(
       }
       if (recipeRecommendationCall) {
         // A recommendation result must be formatted next, never followed by a
-        // second search or a fridge mutation tool, even if intent inference
-        // missed an unusual recipe phrasing on the first round.
+        // second search. One shopping-list follow-up is allowed after it.
         state.intent = "recipe_recommendation";
+        state.recipeFollowUpAvailable = true;
       }
       state.collectedToolMsgs = [];
       state.clientToolCallIds = new Set();
@@ -1345,6 +1363,8 @@ export function attachChatGateway(
         dailyLimit,
         round: 0,
         toolsLockedAfterIsolatedAction: false,
+        recipeFollowUpAvailable: false,
+        recipeFollowUpUsed: false,
 
         awaitingTools: false,
         acceptingClientToolResults: false,

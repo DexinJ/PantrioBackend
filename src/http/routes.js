@@ -26,6 +26,9 @@ import {
 } from "../config/policy.js";
 import {
   RecipeRecommendationError,
+  FREE_MAX_RESULT_COUNT,
+  SUBSCRIBER_MAX_RESULT_COUNT,
+  SUBSCRIBER_RECIPE_LIMITS,
   recommendRecipes as runRecipeRecommendations,
 } from "../chat/recipeRecommendations.js";
 import { fetchPublicTextPage } from "../chat/safeWebFetch.js";
@@ -365,6 +368,7 @@ export function createRecipeRecommendationHandler({
   sanitizeRecipeContextFn = sanitizeRecipeContext,
   estimateMeta = estimateAndApplyRecipeMetadata,
   estimationEnabled = recipeEstimationEnabled(),
+  resolveEntitlementFn,
 } = {}) {
   if (typeof recommendRecipesFn !== "function") {
     throw new TypeError("recommendRecipesFn must be a function");
@@ -381,6 +385,22 @@ export function createRecipeRecommendationHandler({
   if (typeof estimateMeta !== "function") {
     throw new TypeError("estimateMeta must be a function");
   }
+  const resolveEntitlement =
+    typeof resolveEntitlementFn === "function"
+      ? resolveEntitlementFn
+      : async (req) => {
+          try {
+            const db = await getDb();
+            const subscription = await getUserSubscription(
+              db,
+              req?.authenticatedUser?.uid
+            );
+            const { active } = resolveSubscriptionAccess(subscription);
+            return { active };
+          } catch {
+            return { active: false };
+          }
+        };
 
   return async function recipeRecommendationHandler(req, res) {
     if (!req.authenticatedUser?.uid) {
@@ -408,12 +428,17 @@ export function createRecipeRecommendationHandler({
     const abortScope = createRecipeRequestAbortScope(req, res);
     try {
       const safeRecipeContext = sanitizeRecipeContextFn(recipeContext);
+      const { active } = await resolveEntitlement(req);
       const result = await recommendRecipesFn(overrides, safeRecipeContext, {
         search,
         fetchPage,
         signal: abortScope.signal,
         estimateMeta,
         estimationEnabled,
+        limits: active ? SUBSCRIBER_RECIPE_LIMITS : undefined,
+        maxResultCount: active
+          ? SUBSCRIBER_MAX_RESULT_COUNT
+          : FREE_MAX_RESULT_COUNT,
       });
       if (abortScope.signal.aborted || res.headersSent) return;
       return res.json(result);

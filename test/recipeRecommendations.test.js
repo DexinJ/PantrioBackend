@@ -623,3 +623,62 @@ test("honors cancellation even when an injected search ignores the signal", asyn
       error instanceof RecipeRecommendationError && error.code === "ABORTED"
   );
 });
+
+test("maxResultCount caps the requested result count", async () => {
+  const urls = Array.from(
+    { length: 12 },
+    (_, index) => `https://cap.example/r${index}`
+  );
+  const result = await recommendRecipes(
+    { resultCount: 10 },
+    {},
+    {
+      maxResultCount: 6,
+      search: async () => ({
+        results: urls.map((link) => ({ title: link, link })),
+      }),
+      fetchPage: async (url) =>
+        fetchedPage(url, {
+          name: `Recipe ${new URL(url).pathname}`,
+          totalTime: "PT30M",
+          nutrition: { calories: "400 calories" },
+          recipeIngredient: ["1 cup vegetables"],
+        }),
+      limits: { maxSearchQueries: 2, searchResultsPerQuery: 12, maxPages: 12 },
+    }
+  );
+
+  assert.equal(result.recipes.length, 6);
+});
+
+test("skill, cooking method, and ingredient count shape the search queries", async () => {
+  const queries = [];
+  const url = "https://queries.example/air-fryer";
+  await recommendRecipes(
+    {
+      skillLevel: "beginner",
+      cookingMethod: "air_fryer",
+      maxIngredients: 5,
+      resultCount: 1,
+    },
+    {},
+    {
+      search: async (args) => {
+        queries.push(args.query);
+        return { results: [{ title: "Air Fryer Chicken", link: url }] };
+      },
+      fetchPage: async () =>
+        fetchedPage(url, {
+          name: "Air Fryer Chicken",
+          totalTime: "PT25M",
+          nutrition: { calories: "320 calories" },
+          recipeIngredient: ["chicken", "salt", "pepper", "oil", "paprika"],
+        }),
+    }
+  );
+
+  const joined = queries.join(" ");
+  assert.match(joined, /\beasy\b/i);
+  assert.match(joined, /\bair fryer\b/i);
+  assert.match(joined, /under 5 ingredients/i);
+});

@@ -99,6 +99,7 @@ test("recipe recommendation handler forwards the parity payload and dependencies
   const handler = createRecipeRecommendationHandler({
     search,
     fetchPage,
+    resolveEntitlementFn: async () => ({ active: false }),
     recommendRecipesFn: async (...args) => {
       received = args;
       return expected;
@@ -122,8 +123,43 @@ test("recipe recommendation handler forwards the parity payload and dependencies
   assert.equal(received[2].fetchPage, fetchPage);
   assert.equal(received[2].signal instanceof AbortSignal, true);
   assert.equal(received[2].signal.aborted, false);
+  assert.equal(received[2].maxResultCount, 6);
+  assert.equal(received[2].limits, undefined);
   assert.equal(req.listenerCount("aborted"), 0);
   assert.equal(res.listenerCount("close"), 0);
+});
+
+test("recipe recommendation handler raises the budget for entitled subscribers", async () => {
+  const expected = { recipes: [{ title: "Dinner" }], warnings: [] };
+  let received;
+  const handler = createRecipeRecommendationHandler({
+    search: async () => ({ results: [] }),
+    fetchPage: async () => ({ text: "", url: "https://example.com" }),
+    resolveEntitlementFn: async () => ({ active: true }),
+    recommendRecipesFn: async (...args) => {
+      received = args;
+      return expected;
+    },
+  });
+  const req = request({
+    body: { overrides: {}, recipeContext: {} },
+  });
+  const res = response();
+
+  await handler(req, res);
+
+  assert.equal(res.statusCode, 200);
+  assert.equal(received[2].maxResultCount, 10);
+  assert.deepEqual(received[2].limits, {
+    maxSearchQueries: 3,
+    searchResultsPerQuery: 8,
+    maxPages: 10,
+    fetchConcurrency: 3,
+    pageTimeoutMs: 10_000,
+    pageMaxBytes: 512 * 1024,
+    overallTimeoutMs: 25_000,
+    maxRecipesPerPage: 6,
+  });
 });
 
 test("recipe recommendation handler rejects unauthenticated and malformed payloads", async () => {
@@ -187,6 +223,7 @@ test("disconnecting a recipe recommendation aborts engine work without a respons
   const handler = createRecipeRecommendationHandler({
     search: async () => ({ results: [] }),
     fetchPage: async () => ({ text: "", url: "https://example.com" }),
+    resolveEntitlementFn: async () => ({ active: false }),
     recommendRecipesFn: async (_overrides, _context, { signal }) => {
       receivedSignal = signal;
       await new Promise((_resolve, reject) => {

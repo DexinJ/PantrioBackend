@@ -697,7 +697,7 @@ test("routes a mixed tool batch so the client receives only client-owned calls o
   );
 });
 
-test("recipe intent forces one isolated server recommendation and disables continuation tools", async (t) => {
+test("recipe intent forces one recommendation, then allows exactly one shopping-list follow-up", async (t) => {
   const db = await openDb(t);
   const rounds = [];
   const serverCallsSeen = [];
@@ -783,8 +783,12 @@ test("recipe intent forces one isolated server recommendation and disables conti
     function: { name: "recommendRecipes" },
   });
   assert.equal(rounds[0].parallelToolCalls, false);
-  assert.deepEqual(rounds[1].tools, []);
-  assert.equal(rounds[1].toolChoice, undefined);
+  assert.deepEqual(
+    rounds[1].tools.map(({ function: tool }) => tool.name),
+    ["proposeAddMissingIngredientsToShoppingList"]
+  );
+  assert.equal(rounds[1].toolChoice, "auto");
+  assert.equal(rounds[1].parallelToolCalls, false);
   assert.deepEqual(serverCallsSeen, ["recommendRecipes"]);
   assert.deepEqual(serverContext.inventory, [
     { name: "spinach", quantity: "1 bag" },
@@ -801,6 +805,112 @@ test("recipe intent forces one isolated server recommendation and disables conti
       .sort(),
     ["recipe-call", "unsafe-extra-call"]
   );
+});
+
+test("recipe follow-up is allowed once, then tools are locked", async (t) => {
+  const db = await openDb(t);
+  const rounds = [];
+  const ws = connect(t, {
+    getDbFn: async () => db,
+    verifySignedTokenFn: async () => ({ uid: "recipe-followup-user" }),
+    verifyActiveTokenFn: async () => ({ uid: "recipe-followup-user" }),
+    streamOpenAIOnceFn: async (options) => {
+      rounds.push(options);
+      if (rounds.length === 1) {
+        return {
+          ok: true,
+          needsTools: true,
+          toolCalls: [
+            {
+              id: "recipe-call",
+              type: "function",
+              function: { name: "recommendRecipes", arguments: "{}" },
+            },
+          ],
+          usage: { total_tokens: 10 },
+        };
+      }
+      if (rounds.length === 2) {
+        return {
+          ok: true,
+          needsTools: true,
+          toolCalls: [
+            {
+              id: "follow-up-call",
+              type: "function",
+              function: {
+                name: "proposeAddMissingIngredientsToShoppingList",
+                arguments: '{"items":[{"name":"soy sauce"}]}',
+              },
+            },
+          ],
+          usage: { total_tokens: 10 },
+        };
+      }
+      return {
+        ok: true,
+        needsTools: false,
+        toolCalls: [],
+        usage: { total_tokens: 10 },
+      };
+    },
+  });
+
+  ws.emit(
+    "message",
+    Buffer.from(
+      JSON.stringify({
+        type: "start",
+        requestId: "recipe-followup",
+        token: "valid-token",
+        intent: "recipe_recommendation",
+        messages: [{ role: "user", content: "Suggest dinner" }],
+      })
+    )
+  );
+
+  await waitFor(() =>
+    ws.sent.some(
+      ({ type, requestId }) =>
+        type === "tool_calls" && requestId === "recipe-followup"
+    )
+  );
+
+  const followUpFrame = ws.sent.find(
+    ({ type, requestId }) =>
+      type === "tool_calls" && requestId === "recipe-followup"
+  );
+  assert.deepEqual(
+    followUpFrame.toolCalls.map(({ id }) => id),
+    ["follow-up-call"]
+  );
+
+  ws.emit(
+    "message",
+    Buffer.from(
+      JSON.stringify({
+        type: "tool_results",
+        requestId: "recipe-followup",
+        results: [
+          {
+            tool_call_id: "follow-up-call",
+            content: JSON.stringify({ ok: true, proposalShown: true }),
+          },
+        ],
+      })
+    )
+  );
+
+  await waitFor(() =>
+    ws.sent.some(
+      ({ type, requestId }) =>
+        type === "done" && requestId === "recipe-followup"
+    )
+  );
+
+  assert.equal(rounds.length, 3);
+  assert.deepEqual(rounds[2].tools, []);
+  assert.equal(rounds[2].toolChoice, undefined);
 });
 
 test("preference proposals isolate one confirmation from mutation tools", async (t) => {
