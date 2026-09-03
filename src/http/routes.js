@@ -28,9 +28,13 @@ import {
   RecipeRecommendationError,
   FREE_MAX_RESULT_COUNT,
   SUBSCRIBER_MAX_RESULT_COUNT,
-  SUBSCRIBER_RECIPE_LIMITS,
   recommendRecipes as runRecipeRecommendations,
 } from "../chat/recipeRecommendations.js";
+import { compactRecipeResultsForChat } from "../chat/recipeCompact.js";
+import {
+  getRecentRecipeUrls,
+  recordRecipeUrls,
+} from "../chat/recipeHistoryStore.js";
 import { fetchPublicTextPage } from "../chat/safeWebFetch.js";
 import { TOOLS } from "../chat/tools.js";
 import {
@@ -142,7 +146,6 @@ const uploadAudio = multer({
     fileSize: MAX_AUDIO_FILE_SIZE,
     files: 1,
     fields: 0,
-    parts: 1,
   },
   fileFilter: (_req, file, callback) => {
     if (!file?.mimetype) {
@@ -369,6 +372,7 @@ export function createRecipeRecommendationHandler({
   estimateMeta = estimateAndApplyRecipeMetadata,
   estimationEnabled = recipeEstimationEnabled(),
   resolveEntitlementFn,
+  getDbFn = getDb,
 } = {}) {
   if (typeof recommendRecipesFn !== "function") {
     throw new TypeError("recommendRecipesFn must be a function");
@@ -428,6 +432,14 @@ export function createRecipeRecommendationHandler({
     const abortScope = createRecipeRequestAbortScope(req, res);
     try {
       const safeRecipeContext = sanitizeRecipeContextFn(recipeContext);
+      const db = await getDbFn();
+      const recentRecipeUrls = await getRecentRecipeUrls(db, {
+        ownerType: "user",
+        ownerKey: req.authenticatedUser.uid,
+      });
+      if (recentRecipeUrls.length > 0) {
+        safeRecipeContext.excludeRecipeUrls = recentRecipeUrls;
+      }
       const { active } = await resolveEntitlement(req);
       const result = await recommendRecipesFn(overrides, safeRecipeContext, {
         search,
@@ -435,13 +447,28 @@ export function createRecipeRecommendationHandler({
         signal: abortScope.signal,
         estimateMeta,
         estimationEnabled,
-        limits: active ? SUBSCRIBER_RECIPE_LIMITS : undefined,
         maxResultCount: active
           ? SUBSCRIBER_MAX_RESULT_COUNT
           : FREE_MAX_RESULT_COUNT,
       });
       if (abortScope.signal.aborted || res.headersSent) return;
-      return res.json(result);
+      if (Array.isArray(result?.recipes) && result.recipes.length > 0) {
+        try {
+          await recordRecipeUrls(
+            db,
+            { ownerType: "user", ownerKey: req.authenticatedUser.uid },
+            result.recipes
+          );
+        } catch (error) {
+          logErrorMetadata("[POST /api/recipes/recommend] history", error);
+        }
+      }
+      if (abortScope.signal.aborted || res.headersSent) return;
+      return res.json(
+        body?.compactForChat === true
+          ? compactRecipeResultsForChat(result)
+          : result
+      );
     } catch (error) {
       if (abortScope.signal.aborted || res.headersSent) return;
       logErrorMetadata("[POST /api/recipes/recommend]", error);

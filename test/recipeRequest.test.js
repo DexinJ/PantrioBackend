@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 
 import {
+  detectRecipeFollowUp,
   normalizeChatIntent,
   resolveRoundToolPolicy,
   sanitizeRecipeContext,
@@ -96,6 +97,7 @@ test("invalid recipe context fails closed to bounded defaults", () => {
   assert.deepEqual(sanitizeRecipeContext(["not", "an", "object"]), {
     inventory: [],
     selectedIngredients: [],
+    excludeRecipeUrls: [],
     preferences: {
       schemaVersion: 1,
       explicit: {
@@ -114,6 +116,88 @@ test("invalid recipe context fails closed to bounded defaults", () => {
       personalization: { enabled: true, learnFromActivity: false },
     },
   });
+});
+
+test("recipe context sanitization bounds and cleans excludeRecipeUrls", () => {
+  const urls = Array.from(
+    { length: 120 },
+    (_, index) => `https://history.example/r${index}`
+  );
+  const context = sanitizeRecipeContext({
+    inventory: [],
+    selectedIngredients: [],
+    excludeRecipeUrls: [
+      "ftp://blocked.example/file",
+      "https://user:pass@history.example/creds",
+      "https://history.example/ok#section",
+      ...urls,
+    ],
+  });
+
+  assert.equal(context.excludeRecipeUrls.length, 100);
+  assert.ok(context.excludeRecipeUrls.every((url) => url.startsWith("https://")));
+  assert.ok(
+    context.excludeRecipeUrls.every(
+      (url) => !/@/.test(url) && !url.includes("#")
+    )
+  );
+  assert.ok(
+    context.excludeRecipeUrls.includes("https://history.example/ok")
+  );
+});
+
+test("conversation-aware follow-up detection covers short and non-English meal asks", () => {
+  const recipeAnswer = {
+    role: "assistant",
+    content: "Here are the recipes I found: Chicken Stir Fry...",
+  };
+  const plainAnswer = {
+    role: "assistant",
+    content: "I added milk to your fridge.",
+  };
+
+  assert.equal(
+    detectRecipeFollowUp({ text: "breakfast" }),
+    true
+  );
+  assert.equal(
+    detectRecipeFollowUp({ text: "make me breakfast", language: "en" }),
+    true
+  );
+  assert.equal(
+    detectRecipeFollowUp({ text: "早餐", language: "zh" }),
+    true
+  );
+  assert.equal(
+    detectRecipeFollowUp({
+      text: "more",
+      history: [recipeAnswer],
+    }),
+    true
+  );
+  assert.equal(
+    detectRecipeFollowUp({
+      text: "换一个",
+      history: [{ role: "assistant", content: "推荐了几个食谱" }],
+      language: "zh",
+    }),
+    true
+  );
+  assert.equal(
+    detectRecipeFollowUp({
+      text: "more",
+      history: [plainAnswer],
+    }),
+    false
+  );
+  assert.equal(
+    detectRecipeFollowUp({ text: "more" }),
+    false
+  );
+  assert.equal(
+    detectRecipeFollowUp({ text: "update the fridge" }),
+    false
+  );
 });
 
 test("round policy forces exactly one recipe tool call and removes tools from continuation", () => {

@@ -105,7 +105,7 @@ test("parses and normalizes nested Recipe JSON-LD without evaluating markup", ()
   assert.equal(parseIsoDurationMinutes("not a duration"), null);
 });
 
-test("applies trusted exclusions and current calorie cap before personalized ranking", async () => {
+test("hard-excludes trusted ingredients while soft-ranking calorie and time caps", async () => {
   const urls = [
     "https://thai.example/light",
     "https://american.example/burger",
@@ -215,7 +215,11 @@ test("applies trusted exclusions and current calorie cap before personalized ran
 
   assert.deepEqual(
     result.recipes.map(({ title }) => title),
-    ["Thai Basil Chicken"]
+    [
+      "Thai Basil Chicken",
+      "Thai Green Vegetable Curry",
+      "Broccoli Tofu Bowl",
+    ]
   );
   assert.deepEqual(result.recipes[0].usedIngredients, [
     "chicken breast",
@@ -227,10 +231,6 @@ test("applies trusted exclusions and current calorie cap before personalized ran
   assert.match(result.recipes[0].whyRecommended, /Asian preference/i);
   assert.deepEqual(result.meta.filtered, {
     excludedIngredient: 1,
-    overCalorieLimit: 1,
-    caloriesUnknown: 1,
-    overTimeLimit: 1,
-    timeUnknown: 0,
   });
   assert.equal(result.meta.applied.maxCaloriesPerServing, 500);
   assert.deepEqual(result.meta.applied.cuisines, ["Asian"]);
@@ -296,7 +296,7 @@ test("bounds network work, deduplicates URLs, and diversifies equal-scoring sour
   );
 
   assert.ok(searches <= 2);
-  assert.ok(fetches <= 8);
+  assert.ok(fetches <= 12);
   assert.ok(peakFetches <= 3);
   assert.equal(result.recipes.length, 6);
   assert.notEqual(
@@ -536,7 +536,7 @@ test("softly demotes disliked ingredients while keeping the recipe eligible", as
   assert.equal(result.meta.applied.dislikedIngredientCount, 1);
 });
 
-test("treats maxPrepMinutes as a hard verified total-time ceiling", async () => {
+test("softly demotes recipes over or missing the requested prep-time ceiling", async () => {
   const withinUrl = "https://time.example/within";
   const overUrl = "https://time.example/over";
   const unknownUrl = "https://time.example/unknown";
@@ -582,15 +582,13 @@ test("treats maxPrepMinutes as a hard verified total-time ceiling", async () => 
 
   assert.deepEqual(
     result.recipes.map(({ title }) => title),
-    ["Quick Vegetables"]
+    ["Quick Vegetables", "Slow Vegetables", "Unknown-Time Vegetables"]
   );
   assert.deepEqual(result.meta.filtered, {
     excludedIngredient: 0,
-    overCalorieLimit: 0,
-    caloriesUnknown: 0,
-    overTimeLimit: 1,
-    timeUnknown: 1,
   });
+  assert.ok(result.recipes[0].score > result.recipes[1].score);
+  assert.ok(result.recipes[1].score > result.recipes[2].score);
   assert.equal(result.meta.applied.maxPrepMinutes, 30);
 });
 
@@ -681,4 +679,135 @@ test("skill, cooking method, and ingredient count shape the search queries", asy
   assert.match(joined, /\beasy\b/i);
   assert.match(joined, /\bair fryer\b/i);
   assert.match(joined, /under 5 ingredients/i);
+});
+
+test("meal type filters proven mismatches but keeps unknown-category fallbacks", async () => {
+  const breakfastUrl = "https://meal.example/muffins";
+  const dinnerUrl = "https://meal.example/chicken-dinner";
+  const unknownUrl = "https://meal.example/spinach-omelette";
+  const pages = new Map([
+    [
+      breakfastUrl,
+      fetchedPage(breakfastUrl, {
+        name: "Blueberry Muffins",
+        recipeCategory: ["Breakfast"],
+        totalTime: "PT25M",
+        nutrition: { calories: "300 calories" },
+        recipeIngredient: ["flour", "blueberries"],
+      }),
+    ],
+    [
+      dinnerUrl,
+      fetchedPage(dinnerUrl, {
+        name: "Chicken Dinner",
+        recipeCategory: ["Dinner", "Main Course"],
+        totalTime: "PT45M",
+        nutrition: { calories: "600 calories" },
+        recipeIngredient: ["chicken", "potatoes"],
+      }),
+    ],
+    [
+      unknownUrl,
+      fetchedPage(unknownUrl, {
+        name: "Spinach Omelette",
+        totalTime: "PT15M",
+        nutrition: { calories: "250 calories" },
+        recipeIngredient: ["eggs", "spinach"],
+      }),
+    ],
+  ]);
+
+  const result = await recommendRecipes(
+    { mealType: "breakfast", resultCount: 2 },
+    {},
+    {
+      search: async () => ({
+        results: [breakfastUrl, dinnerUrl, unknownUrl].map((link) => ({
+          link,
+        })),
+      }),
+      fetchPage: async (url) => pages.get(url),
+    }
+  );
+
+  const titles = result.recipes.map(({ title }) => title);
+  assert.ok(titles.includes("Blueberry Muffins"));
+  assert.ok(!titles.includes("Chicken Dinner"));
+  assert.ok(titles.includes("Spinach Omelette"));
+  assert.equal(result.meta.applied.mealType, "breakfast");
+});
+
+test("recently shown recipes are excluded when new ones exist and reused with a penalty otherwise", async () => {
+  const firstUrl = "https://seen.example/first";
+  const secondUrl = "https://seen.example/second";
+  const makePage = (url, name) =>
+    fetchedPage(url, {
+      name,
+      totalTime: "PT20M",
+      nutrition: { calories: "350 calories" },
+      recipeIngredient: ["chicken", "rice"],
+    });
+  const searchAndFetch = {
+    search: async () => ({
+      results: [firstUrl, secondUrl].map((link) => ({ link })),
+    }),
+    fetchPage: async (url) => makePage(url, url.endsWith("first") ? "First Recipe" : "Second Recipe"),
+  };
+
+  const fresh = await recommendRecipes(
+    { resultCount: 1 },
+    { excludeRecipeUrls: [firstUrl] },
+    searchAndFetch
+  );
+  assert.equal(fresh.recipes[0].title, "Second Recipe");
+  assert.equal(fresh.meta.seenCandidatesExcluded, 1);
+  assert.equal(fresh.meta.recentlyShownReused, 0);
+
+  const reused = await recommendRecipes(
+    { resultCount: 2 },
+    { excludeRecipeUrls: [firstUrl, secondUrl] },
+    searchAndFetch
+  );
+  assert.equal(reused.recipes.length, 2);
+  assert.equal(reused.meta.recentlyShownReused, 2);
+  assert.ok(
+    reused.warnings.some(({ code }) => code === "RECENTLY_SHOWN_REUSED")
+  );
+});
+
+test("widening searches continue until enough parseable candidates exist", async () => {
+  const urls = Array.from(
+    { length: 7 },
+    (_, index) => `https://widen.example/r${index}`
+  );
+  const pages = new Map(
+    urls.map((url, index) => [
+      url,
+      fetchedPage(url, {
+        name: `Recipe ${index}`,
+        totalTime: "PT20M",
+        nutrition: { calories: "300 calories" },
+        recipeIngredient: ["chicken", "rice"],
+      }),
+    ])
+  );
+  let searches = 0;
+  const result = await recommendRecipes(
+    { resultCount: 5 },
+    {},
+    {
+      search: async () => {
+        searches += 1;
+        if (searches <= 2) return { results: urls.slice(0, 2).map((link) => ({ link })) };
+        return { results: urls.slice(2).map((link) => ({ link })) };
+      },
+      fetchPage: async (url) => pages.get(url),
+    }
+  );
+
+  assert.ok(searches >= 4);
+  assert.ok(searches <= 8);
+  assert.ok(result.meta.pagesFetched >= 7);
+  assert.equal(result.meta.candidatesParsed, 7);
+  assert.equal(result.recipes.length, 5);
 });

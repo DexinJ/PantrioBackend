@@ -147,7 +147,7 @@ test("estimateAndApplyRecipeMetadata mutates recipes and reports applied count",
   assert.equal(recipes[0].timeConfidence, "ai_estimated");
 });
 
-test("estimated metadata flows through constraints and ranking with hard caps", async () => {
+test("estimated metadata enriches ranking while calorie and time caps stay soft", async () => {
   const urls = [
     "https://est.example/tofu-bowl",
     "https://est.example/heavy-curry",
@@ -231,7 +231,7 @@ test("estimated metadata flows through constraints and ranking with hard caps", 
 
   assert.deepEqual(
     result.recipes.map(({ title }) => title),
-    ["Tofu Bowl", "Mystery Soup"]
+    ["Tofu Bowl", "Rich Curry", "Mystery Soup", "Heavy Curry"]
   );
   assert.equal(result.recipes[0].caloriesPerServing, 350);
   assert.equal(result.recipes[0].nutritionConfidence, "ai_estimated");
@@ -240,12 +240,6 @@ test("estimated metadata flows through constraints and ranking with hard caps", 
   assert.equal(result.meta.estimationFailedCount, 1);
   assert.deepEqual(result.meta.filtered, {
     excludedIngredient: 0,
-    overCalorieLimit: 1,
-    caloriesUnknown: 0,
-    caloriesUnknownSoft: 1,
-    overTimeLimit: 1,
-    timeUnknown: 0,
-    timeUnknownSoft: 1,
   });
   assert.ok(
     result.warnings.some(
@@ -254,7 +248,7 @@ test("estimated metadata flows through constraints and ranking with hard caps", 
   );
 });
 
-test("estimation is skipped when disabled or when no dependency is provided", async () => {
+test("estimation is skipped when disabled or missing, leaving metadata soft", async () => {
   const url = "https://est.example/no-estimate";
   let estimateCalls = 0;
 
@@ -278,9 +272,9 @@ test("estimation is skipped when disabled or when no dependency is provided", as
     }
   );
   assert.equal(estimateCalls, 0);
-  assert.equal(disabled.recipes.length, 0);
-  assert.equal(disabled.meta.filtered.timeUnknown, 1);
-  assert.equal("timeUnknownSoft" in disabled.meta.filtered, false);
+  assert.equal(disabled.recipes.length, 1);
+  assert.equal(disabled.recipes[0].title, "No Metadata Meal");
+  assert.deepEqual(disabled.meta.filtered, { excludedIngredient: 0 });
 
   const noDependency = await recommendRecipes(
     { maxPrepMinutes: 30, resultCount: 3 },
@@ -297,7 +291,8 @@ test("estimation is skipped when disabled or when no dependency is provided", as
         }),
     }
   );
-  assert.equal(noDependency.recipes.length, 0);
-  assert.equal(noDependency.meta.filtered.timeUnknown, 1);
+  assert.equal(noDependency.recipes.length, 1);
+  assert.equal(noDependency.recipes[0].title, "No Metadata Meal");
+  assert.deepEqual(noDependency.meta.filtered, { excludedIngredient: 0 });
   assert.equal(noDependency.meta.estimatedCount, 0);
 });

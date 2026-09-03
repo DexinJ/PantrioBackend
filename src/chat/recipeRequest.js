@@ -7,6 +7,48 @@ const RECIPE_INTENT = "recipe_recommendation";
 const MAX_INVENTORY_ITEMS = 100;
 const MAX_SELECTED_INGREDIENTS = 30;
 
+const FOLLOW_UP_MEAL_TERMS = {
+  en: [
+    "breakfast",
+    "brunch",
+    "lunch",
+    "dinner",
+    "supper",
+    "snack",
+    "dessert",
+    "meal",
+    "recipe",
+    "recipes",
+    "dish",
+    "dishes",
+  ],
+  zh: [
+    "早餐",
+    "午饭",
+    "午餐",
+    "晚饭",
+    "晚餐",
+    "甜点",
+    "点心",
+    "零食",
+    "食谱",
+    "菜",
+  ],
+};
+
+const FOLLOW_UP_VARIATION_TERMS = {
+  en: [
+    "more",
+    "another",
+    "other",
+    "else",
+    "different",
+    "new ideas",
+    "next",
+  ],
+  zh: ["更多", "别的", "其他", "其他的", "换", "再", "新"],
+};
+
 function cleanString(value, maxLength = 120) {
   return typeof value === "string"
     ? value.trim().slice(0, maxLength)
@@ -22,6 +64,35 @@ function cleanStringArray(value, maxItems = 30) {
     if (!cleaned || seen.has(key)) continue;
     seen.add(key);
     result.push(cleaned);
+    if (result.length >= maxItems) break;
+  }
+  return result;
+}
+
+function cleanUrlArray(value, maxItems = 100) {
+  const seen = new Set();
+  const result = [];
+  for (const entry of Array.isArray(value) ? value.slice(0, maxItems * 4) : []) {
+    const raw = typeof entry === "string" ? entry.trim().slice(0, 2_000) : "";
+    if (!raw) continue;
+    let url;
+    try {
+      url = new URL(raw);
+    } catch {
+      continue;
+    }
+    if (
+      !new Set(["http:", "https:"]).has(url.protocol) ||
+      url.username ||
+      url.password
+    ) {
+      continue;
+    }
+    url.hash = "";
+    const key = url.href;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    result.push(url.href);
     if (result.length >= maxItems) break;
   }
   return result;
@@ -55,6 +126,47 @@ export function normalizeChatIntent(value) {
   return value === RECIPE_INTENT ? RECIPE_INTENT : "chat";
 }
 
+function assistantTextOf(message) {
+  if (!message) return "";
+  if (typeof message?.content === "string") return message.content;
+  if (Array.isArray(message?.content)) {
+    return message.content
+      .map((part) => part?.text || "")
+      .join(" ")
+      .trim();
+  }
+  return "";
+}
+
+// Conversation-aware fallback for clients whose regex missed a follow-up
+// (e.g., "breakfast", "make me breakfast", or non-English meal words). A
+// variation phrase only counts when the previous assistant turn was a recipe
+// answer, so ordinary chat is not hijacked.
+export function detectRecipeFollowUp({
+  text = "",
+  history = [],
+  language = "en",
+} = {}) {
+  const normalized = String(text || "").trim().toLowerCase();
+  if (!normalized) return false;
+  const termSet = language?.toLowerCase().startsWith("zh")
+    ? FOLLOW_UP_MEAL_TERMS.zh
+    : FOLLOW_UP_MEAL_TERMS.en;
+  if (termSet.some((term) => normalized.includes(term))) return true;
+
+  const priorAssistant = [...(Array.isArray(history) ? history : [])]
+    .reverse()
+    .find((message) => message?.role === "assistant");
+  const priorText = assistantTextOf(priorAssistant).toLowerCase();
+  const wasRecipeAnswer =
+    /recipe|recommend|suggest|idea|推荐|食谱|做法/i.test(priorText);
+  if (!wasRecipeAnswer) return false;
+  const variationSet = language?.toLowerCase().startsWith("zh")
+    ? FOLLOW_UP_VARIATION_TERMS.zh
+    : FOLLOW_UP_VARIATION_TERMS.en;
+  return variationSet.some((term) => normalized.includes(term));
+}
+
 export function sanitizeRecipeContext(value) {
   const source = value && typeof value === "object" && !Array.isArray(value)
     ? value
@@ -86,6 +198,7 @@ export function sanitizeRecipeContext(value) {
       source.selectedIngredients,
       MAX_SELECTED_INGREDIENTS
     ),
+    excludeRecipeUrls: cleanUrlArray(source.excludeRecipeUrls, 100),
     preferences: {
       schemaVersion: 1,
       explicit: {

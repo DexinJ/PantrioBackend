@@ -205,6 +205,11 @@ async function purgeLocalAccountData(db, deletion, { nowFn }) {
         WHERE owner_type = 'user' AND owner_key = ?`,
       [uid]
     );
+    await db.run(
+      `DELETE FROM recipe_history
+        WHERE owner_type = 'user' AND owner_key = ?`,
+      [uid]
+    );
     await db.run("DELETE FROM users WHERE uid = ?", [uid]);
     return markLocalDataDeleted(db, uid, { nowMs: nowFn() });
   } catch (error) {

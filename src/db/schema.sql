@@ -159,8 +159,22 @@ CREATE TABLE IF NOT EXISTS usage_daily (
   UNIQUE(owner_type, owner_key, day_key)
 );
 
+-- Recipes previously returned to a user so repeat requests can avoid them
+-- (re-admitted with a penalty only when few new recipes are available).
+CREATE TABLE IF NOT EXISTS recipe_history (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  owner_type TEXT NOT NULL CHECK(owner_type IN ('user','trial')),
+  owner_key TEXT NOT NULL,
+  url TEXT NOT NULL,
+  title TEXT,
+  created_at INTEGER NOT NULL,
+  UNIQUE(owner_type, owner_key, url)
+);
+
 CREATE INDEX IF NOT EXISTS idx_conversations_owner ON conversations(owner_type, owner_key, created_at);
 CREATE INDEX IF NOT EXISTS idx_messages_conv ON messages(conversation_id, created_at);
+CREATE INDEX IF NOT EXISTS idx_recipe_history_owner
+  ON recipe_history(owner_type, owner_key, created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_apple_subscriptions_user ON apple_subscriptions(firebase_uid, verified_at);
 CREATE INDEX IF NOT EXISTS idx_apple_subscriptions_user_environment
   ON apple_subscriptions(firebase_uid, environment, verified_at DESC);
@@ -202,6 +216,16 @@ END;
 
 CREATE TRIGGER IF NOT EXISTS prevent_deleted_user_conversation_insert
 BEFORE INSERT ON conversations
+WHEN NEW.owner_type = 'user' AND EXISTS (
+  SELECT 1 FROM account_deletions
+   WHERE firebase_uid = NEW.owner_key
+)
+BEGIN
+  SELECT RAISE(ABORT, 'ACCOUNT_DELETION_BLOCKED');
+END;
+
+CREATE TRIGGER IF NOT EXISTS prevent_deleted_user_recipe_history_insert
+BEFORE INSERT ON recipe_history
 WHEN NEW.owner_type = 'user' AND EXISTS (
   SELECT 1 FROM account_deletions
    WHERE firebase_uid = NEW.owner_key

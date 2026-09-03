@@ -14,39 +14,26 @@ const COOKING_METHODS = new Set([
 ]);
 const MAX_RESULT_COUNT = 10;
 const DEFAULT_RESULT_COUNT = 5;
-const DEFAULT_LIMITS = Object.freeze({
-  maxSearchQueries: 2,
-  searchResultsPerQuery: 6,
-  maxPages: 8,
-  fetchConcurrency: 3,
-  pageTimeoutMs: 8_000,
-  pageMaxBytes: 384 * 1024,
-  overallTimeoutMs: 20_000,
-  maxRecipesPerPage: 4,
-});
-const LIMIT_CEILINGS = Object.freeze({
-  maxSearchQueries: 2,
+// Search work is not charged against the user's token quota, so there is no
+// entitlement-specific search budget. These limits are server safety rails
+// (latency/load) only; entitlement now controls just the result-count cap.
+const SAFETY_LIMITS = Object.freeze({
+  maxSearchQueries: 8,
   searchResultsPerQuery: 10,
-  maxPages: 10,
+  maxPages: 24,
   fetchConcurrency: 3,
-  pageTimeoutMs: 12_000,
+  pageTimeoutMs: 10_000,
   pageMaxBytes: 512 * 1024,
   overallTimeoutMs: 30_000,
   maxRecipesPerPage: 6,
 });
+const DEFAULT_LIMITS = SAFETY_LIMITS;
+const LIMIT_CEILINGS = SAFETY_LIMITS;
 
-// Subscriber entitlement raises the search budget and result cap. Free users
-// keep the conservative defaults above; ceilings still bound everything.
-export const SUBSCRIBER_RECIPE_LIMITS = Object.freeze({
-  maxSearchQueries: 3,
-  searchResultsPerQuery: 8,
-  maxPages: 10,
-  fetchConcurrency: 3,
-  pageTimeoutMs: 10_000,
-  pageMaxBytes: 512 * 1024,
-  overallTimeoutMs: 25_000,
-  maxRecipesPerPage: 6,
-});
+// Kept as a stable export for callers that historically differentiated
+// entitlement budgets. Subscribers and free users now share one budget;
+// only SUBSCRIBER_MAX_RESULT_COUNT / FREE_MAX_RESULT_COUNT differ.
+export const SUBSCRIBER_RECIPE_LIMITS = Object.freeze({ ...SAFETY_LIMITS });
 export const SUBSCRIBER_MAX_RESULT_COUNT = 10;
 export const FREE_MAX_RESULT_COUNT = 6;
 
@@ -470,9 +457,23 @@ function normalizeInputs(
     [...selectedIngredients, ...normalizeInventory(recipeContext)],
     { maxItems: 80, maxLength: 100 }
   );
+  const excludedUrls = new Set();
+  for (const entry of Array.isArray(recipeContext?.excludeRecipeUrls)
+    ? recipeContext.excludeRecipeUrls.slice(0, 100)
+    : []) {
+    if (typeof entry !== "string") continue;
+    try {
+      const url = new URL(entry);
+      if (!new Set(["http:", "https:"]).has(url.protocol)) continue;
+    } catch {
+      continue;
+    }
+    excludedUrls.add(canonicalUrl(entry));
+  }
 
   return {
     inventory,
+    excludedUrls,
     selectedIngredients,
     mustUseIngredients,
     requestedIngredients,
@@ -759,7 +760,14 @@ function canonicalUrl(value) {
   }
 }
 
-async function searchForPages(search, queries, limits, deadline, warnings) {
+async function searchForPages(
+  search,
+  queries,
+  limits,
+  deadline,
+  warnings,
+  { exclude = new Set() } = {}
+) {
   const unique = new Map();
   let failedSearches = 0;
   for (const query of queries) {
@@ -779,7 +787,7 @@ async function searchForPages(search, queries, limits, deadline, warnings) {
         limits.searchResultsPerQuery
       )) {
         const key = canonicalUrl(result.link);
-        if (!unique.has(key)) unique.set(key, result);
+        if (!unique.has(key) && !exclude.has(key)) unique.set(key, result);
         if (unique.size >= limits.maxPages) break;
       }
     } catch (error) {
@@ -868,56 +876,20 @@ function findConstraintConflict(recipe, rules) {
 function applyHardConstraints(
   recipes,
   inputs,
-  rules,
-  { keepUnknownWhenEstimated = false } = {}
+  rules
 ) {
   const stats = {
     excludedIngredient: 0,
-    overCalorieLimit: 0,
-    caloriesUnknown: 0,
-    overTimeLimit: 0,
-    timeUnknown: 0,
   };
-  if (keepUnknownWhenEstimated) {
-    stats.caloriesUnknownSoft = 0;
-    stats.timeUnknownSoft = 0;
-  }
   const accepted = [];
   for (const recipe of recipes) {
     if (findConstraintConflict(recipe, rules)) {
       stats.excludedIngredient += 1;
       continue;
     }
-    if (inputs.maxCaloriesPerServing != null) {
-      if (recipe.caloriesPerServing == null) {
-        if (keepUnknownWhenEstimated) {
-          stats.caloriesUnknownSoft += 1;
-        } else {
-          stats.caloriesUnknown += 1;
-          continue;
-        }
-      } else if (recipe.caloriesPerServing > inputs.maxCaloriesPerServing) {
-        stats.overCalorieLimit += 1;
-        continue;
-      }
-    }
-    // maxPrepMinutes is the public contract's total-time ceiling. As with an
-    // explicit calorie cap, unverified timing cannot be claimed to fit. When
-    // AI estimation is active, recipes that could not be estimated are kept
-    // with a soft penalty and warnings instead of being dropped.
-    if (inputs.maxPrepMinutes != null) {
-      if (recipe.totalMinutes == null) {
-        if (keepUnknownWhenEstimated) {
-          stats.timeUnknownSoft += 1;
-        } else {
-          stats.timeUnknown += 1;
-          continue;
-        }
-      } else if (recipe.totalMinutes > inputs.maxPrepMinutes) {
-        stats.overTimeLimit += 1;
-        continue;
-      }
-    }
+    // Calorie and prep-time ceilings are preferences, not safety constraints:
+    // they are applied as soft penalties in scoreCandidates so that recipes
+    // with missing publisher metadata (or slightly over the cap) stay viable.
     accepted.push(recipe);
   }
   return { recipes: accepted, stats };
@@ -981,6 +953,78 @@ function energyScore(recipe, energyPreference) {
   if (calories >= 350 && calories <= 650) return 1;
   if (calories >= 250 && calories <= 800) return 0.6;
   return 0.2;
+}
+
+const MEAL_TYPE_BUCKETS = Object.freeze({
+  breakfast: ["breakfast", "brunch"],
+  lunch: ["lunch"],
+  dinner: ["dinner", "supper", "main course", "main"],
+  snack: ["snack"],
+  dessert: ["dessert"],
+});
+
+function canonicalMealType(value) {
+  if (value == null) return null;
+  const normalized = normalizeText(value);
+  if (!normalized) return null;
+  for (const [bucket, terms] of Object.entries(MEAL_TYPE_BUCKETS)) {
+    if (
+      bucket === normalized ||
+      terms.some((term) => normalizeText(term) === normalized)
+    ) {
+      return bucket;
+    }
+  }
+  return null;
+}
+
+// Uses publisher-provided recipeCategory when present, with a conservative
+// title/description fallback so recipes without structured meal data remain
+// viable instead of vanishing from small result pools.
+function mealTypeSignal(recipe, bucket) {
+  if (!bucket) return { matched: true, known: true };
+  const terms = MEAL_TYPE_BUCKETS[bucket] || [];
+  const matchesText = (text) => {
+    const haystack = new Set(termTokens(text));
+    return terms.some((term) => {
+      const words = termTokens(term);
+      return words.length > 0 && words.every((word) => haystack.has(word));
+    });
+  };
+  const categoryText = Array.isArray(recipe.mealTypes)
+    ? recipe.mealTypes.join(" ")
+    : String(recipe.mealTypes || "");
+  if (categoryText.trim() && matchesText(categoryText)) {
+    return { matched: true, known: true };
+  }
+  if (categoryText.trim()) return { matched: false, known: true };
+  const titleText = `${recipe.title || ""} ${recipe.description || ""}`;
+  if (matchesText(titleText)) return { matched: true, known: true };
+  return { matched: false, known: false };
+}
+
+function mealTypeScore(recipe, bucket) {
+  if (!bucket) return 0.5;
+  const signal = mealTypeSignal(recipe, bucket);
+  if (signal.matched) return 1;
+  return signal.known ? 0.05 : 0.35;
+}
+
+function calorieLimitPenalty(recipe, maxCaloriesPerServing) {
+  if (maxCaloriesPerServing == null) return 0;
+  if (recipe.caloriesPerServing == null) return 0.08;
+  if (recipe.caloriesPerServing <= maxCaloriesPerServing) return 0;
+  const over = (recipe.caloriesPerServing - maxCaloriesPerServing) /
+    maxCaloriesPerServing;
+  return Math.min(0.2, over * 0.1);
+}
+
+function timeLimitPenalty(recipe, maxPrepMinutes) {
+  if (maxPrepMinutes == null) return 0;
+  if (recipe.totalMinutes == null) return 0.08;
+  if (recipe.totalMinutes <= maxPrepMinutes) return 0;
+  const over = (recipe.totalMinutes - maxPrepMinutes) / maxPrepMinutes;
+  return Math.min(0.2, over * 0.1);
 }
 
 function matchItemsToRecipe(recipe, items) {
@@ -1110,6 +1154,7 @@ function buildWhyRecommended(
 }
 
 function scoreCandidates(recipes, inputs) {
+  const mealTypeBucket = canonicalMealType(inputs.mealType);
   return recipes.map((recipe, index) => {
     const ingredients = ingredientMatches(recipe, inputs);
     const dislikes = dislikedIngredientPenalty(recipe, inputs);
@@ -1124,13 +1169,21 @@ function scoreCandidates(recipes, inputs) {
               0.02
           )
         : 0;
+    const calorieLimit = calorieLimitPenalty(
+      recipe,
+      inputs.maxCaloriesPerServing
+    );
+    const timeLimit = timeLimitPenalty(recipe, inputs.maxPrepMinutes);
     const breakdown = {
       cuisine: cuisineScore(recipe, inputs),
       energy: energyScore(recipe, inputs.energyPreference),
       ingredients: ingredients.score,
       requestedIngredients: ingredients.requestedScore,
       time: timeScore(recipe, inputs.maxPrepMinutes),
+      mealType: mealTypeScore(recipe, mealTypeBucket),
       quality: qualityScore(recipe),
+      calorieLimit,
+      timeLimit,
       dislikedIngredientPenalty: dislikes.dislikedIngredientPenalty,
       ingredientCountPenalty,
     };
@@ -1140,15 +1193,21 @@ function scoreCandidates(recipes, inputs) {
         breakdown.ingredients * 0.17 +
         breakdown.requestedIngredients * 0.35 +
         breakdown.time * 0.1 +
+        breakdown.mealType * 0.15 +
         breakdown.quality * 0.1
       : breakdown.cuisine * 0.28 +
         breakdown.energy * 0.15 +
         breakdown.ingredients * 0.32 +
         breakdown.time * 0.15 +
+        breakdown.mealType * 0.15 +
         breakdown.quality * 0.1;
     const score = Math.max(
       0,
-      baseScore - dislikes.dislikedIngredientPenalty - ingredientCountPenalty
+      baseScore -
+        dislikes.dislikedIngredientPenalty -
+        ingredientCountPenalty -
+        calorieLimit -
+        timeLimit
     );
     return {
       ...recipe,
@@ -1223,11 +1282,82 @@ function primaryCuisine(recipe) {
   return normalizeText(recipe.cuisines[0] || "unknown");
 }
 
+function buildQueryPlan(inputs, maxQueries) {
+  const base = buildSearchQueries(inputs, {
+    maxSearchQueries: Math.min(2, maxQueries),
+  });
+  const plan = [...base];
+  const pushQuery = (parts) => {
+    const query = clip(parts.filter((part) => part).join(" "), 300);
+    if (!query || plan.includes(query)) return;
+    plan.push(query);
+  };
+  const cuisine = inputs.requestedCuisines[0] || inputs.savedCuisines[0] || "";
+  const meal = inputs.mealType || "";
+  pushQuery([meal, "recipes", cuisine]);
+  if (inputs.energyPreference !== "any") {
+    pushQuery([inputs.energyPreference, meal || "easy", "recipes"]);
+  }
+  for (const item of inputs.inventory.slice(0, 2)) {
+    pushQuery([item, meal ? `${meal} recipe ideas` : "recipe ideas"]);
+  }
+  pushQuery(meal ? [`best ${meal} recipes`] : ["quick easy meal ideas"]);
+  return plan.slice(0, maxQueries);
+}
+
+function ingredientTokenSet(recipe) {
+  const tokens = new Set();
+  for (const ingredient of recipe.ingredients || []) {
+    for (const token of termTokens(ingredient)) tokens.add(token);
+  }
+  return tokens;
+}
+
+function maxIngredientOverlap(recipe, selected) {
+  let best = 0;
+  const candidateTokens = ingredientTokenSet(recipe);
+  if (candidateTokens.size === 0) return 0;
+  for (const chosen of selected) {
+    const chosenTokens =
+      chosen._tokenSet || ingredientTokenSet(chosen);
+    let intersection = 0;
+    for (const token of candidateTokens) {
+      if (chosenTokens.has(token)) intersection += 1;
+    }
+    const union = candidateTokens.size + chosenTokens.size - intersection;
+    const jaccard = union > 0 ? intersection / union : 0;
+    if (jaccard > best) best = jaccard;
+  }
+  return best;
+}
+
+function hashString(value) {
+  let hash = 0;
+  for (let i = 0; i < value.length; i += 1) {
+    hash = (hash * 31 + value.charCodeAt(i)) | 0;
+  }
+  return Math.abs(hash);
+}
+
+// Recipes whose publisher metadata proves they are the wrong meal type are
+// dropped only when enough other candidates remain; recipes with unknown meal
+// metadata (score 0.35) are always kept as low-score fallbacks.
+function filterMealTypeMismatches(recipes, inputs) {
+  const bucket = canonicalMealType(inputs.mealType);
+  if (!bucket) return recipes;
+  const matches = recipes.filter(
+    (recipe) => (recipe.scoreBreakdown?.mealType ?? 0.35) >= 0.3
+  );
+  const minimum = Math.min(inputs.resultCount, recipes.length);
+  return matches.length >= minimum ? matches : recipes;
+}
+
 function selectDiverse(candidates, count) {
   const remaining = [...candidates];
   const selected = [];
   const domains = new Map();
   const cuisines = new Map();
+  const dayBucket = Math.floor(Date.now() / 86_400_000);
   while (remaining.length > 0 && selected.length < count) {
     let bestIndex = 0;
     let bestAdjusted = -Infinity;
@@ -1235,7 +1365,16 @@ function selectDiverse(candidates, count) {
       const recipe = remaining[index];
       const domainCount = domains.get(recipeDomain(recipe)) || 0;
       const cuisineCount = cuisines.get(primaryCuisine(recipe)) || 0;
-      const adjusted = recipe.score - domainCount * 0.1 - cuisineCount * 0.035;
+      const overlap = maxIngredientOverlap(recipe, selected);
+      const jitter =
+        (hashString(`${recipe.url}|${dayBucket}`) % 200 - 100) / 100_000;
+      const adjusted =
+        recipe.score -
+        (recipe._reused ? 0.2 : 0) -
+        overlap * 0.25 -
+        domainCount * 0.1 -
+        cuisineCount * 0.035 +
+        jitter;
       if (
         adjusted > bestAdjusted ||
         (adjusted === bestAdjusted && recipe._index < remaining[bestIndex]._index)
@@ -1245,6 +1384,7 @@ function selectDiverse(candidates, count) {
       }
     }
     const [chosen] = remaining.splice(bestIndex, 1);
+    chosen._tokenSet = ingredientTokenSet(chosen);
     selected.push(chosen);
     domains.set(recipeDomain(chosen), (domains.get(recipeDomain(chosen)) || 0) + 1);
     cuisines.set(
@@ -1256,11 +1396,13 @@ function selectDiverse(candidates, count) {
 }
 
 function publicRecipe(recipe) {
-  const { _index, ...output } = recipe;
+  const { _index, _tokenSet, _reused, ...output } = recipe;
   return {
     ...output,
-    ingredients: output.ingredients.slice(0, 30),
-    instructions: output.instructions.slice(0, 12).map((step) => clip(step, 300)),
+    ingredients: (output.ingredients || []).slice(0, 30),
+    instructions: (output.instructions || [])
+      .slice(0, 12)
+      .map((step) => clip(step, 300)),
     usedIngredients: output.usedIngredients.slice(0, 20),
     missingIngredients: output.missingIngredients.slice(0, 30),
     matchedRequestedIngredients: output.matchedRequestedIngredients.slice(0, 40),
@@ -1312,19 +1454,57 @@ export async function recommendRecipes(
   const inputs = normalizeInputs(overrides, recipeContext, { maxResultCount });
   const warnings = [];
   const constraintRules = createConstraintRules(inputs, warnings);
-  const queries = buildSearchQueries(inputs, limits);
   const deadline = createLinkedDeadline(signal, limits.overallTimeoutMs);
 
   try {
     assertNotAborted(deadline);
-    const pages = await searchForPages(search, queries, limits, deadline, warnings);
-    const fetched = await fetchRecipePages(
-      fetchPage,
-      pages,
-      limits,
-      deadline
-    );
-    if (fetched.failedPages > 0) {
+    const queryPlan = buildQueryPlan(inputs, limits.maxSearchQueries);
+    const seenUrls = new Set();
+    const aggregate = {
+      pages: [],
+      recipes: [],
+      failedPages: 0,
+      truncatedPages: 0,
+      malformedScripts: 0,
+      fetchedPages: 0,
+    };
+    let searchesRun = 0;
+    for (let offset = 0; offset < queryPlan.length; offset += 2) {
+      assertNotAborted(deadline);
+      const waveQueries = queryPlan.slice(offset, offset + 2);
+      searchesRun += waveQueries.length;
+      const wavePages = await searchForPages(
+        search,
+        waveQueries,
+        limits,
+        deadline,
+        warnings,
+        { exclude: seenUrls }
+      );
+      if (wavePages.length === 0) break;
+      for (const page of wavePages) {
+        seenUrls.add(canonicalUrl(page.link));
+        aggregate.pages.push(page);
+      }
+      const fetched = await fetchRecipePages(
+        fetchPage,
+        wavePages,
+        limits,
+        deadline
+      );
+      aggregate.recipes.push(...fetched.recipes);
+      aggregate.failedPages += fetched.failedPages;
+      aggregate.truncatedPages += fetched.truncatedPages;
+      aggregate.malformedScripts += fetched.malformedScripts;
+      aggregate.fetchedPages += fetched.fetchedPages;
+      const usable = applyHardConstraints(
+        aggregate.recipes,
+        inputs,
+        constraintRules
+      ).recipes.length;
+      if (usable >= inputs.resultCount) break;
+    }
+    if (aggregate.failedPages > 0) {
       pushWarning(
         warnings,
         warning(
@@ -1333,7 +1513,7 @@ export async function recommendRecipes(
         )
       );
     }
-    if (fetched.truncatedPages > 0) {
+    if (aggregate.truncatedPages > 0) {
       pushWarning(
         warnings,
         warning(
@@ -1342,7 +1522,7 @@ export async function recommendRecipes(
         )
       );
     }
-    if (fetched.malformedScripts > 0) {
+    if (aggregate.malformedScripts > 0) {
       pushWarning(
         warnings,
         warning(
@@ -1353,14 +1533,15 @@ export async function recommendRecipes(
     }
 
     // Best-effort metadata estimation: fill missing calories/time with AI
-    // estimates labeled as such, so hard caps filter on the estimate instead
-    // of silently discarding every recipe with incomplete publisher data.
+    // estimates labeled as such. Calorie/time caps are soft penalties, so
+    // estimation only improves displayed metadata and ranking, never decides
+    // whether a recipe may be considered at all.
     const estimationActive =
       estimationEnabled && typeof estimateMeta === "function";
     let estimatedCount = 0;
     let estimationFailedCount = 0;
     if (estimationActive) {
-      const missingMetadata = fetched.recipes.filter(
+      const missingMetadata = aggregate.recipes.filter(
         (recipe) =>
           recipe.caloriesPerServing == null || recipe.totalMinutes == null
       );
@@ -1397,23 +1578,45 @@ export async function recommendRecipes(
     }
 
     const constrained = applyHardConstraints(
-      fetched.recipes,
+      aggregate.recipes,
       inputs,
-      constraintRules,
-      { keepUnknownWhenEstimated: estimationActive }
+      constraintRules
     );
     const deduped = dedupeCandidates(scoreCandidates(constrained.recipes, inputs));
-    const selected = selectDiverse(deduped, inputs.resultCount).map(publicRecipe);
+    const seenCandidates = deduped.filter((recipe) =>
+      inputs.excludedUrls.has(canonicalUrl(recipe.url))
+    );
+    const flagged = deduped.map((recipe) =>
+      inputs.excludedUrls.has(canonicalUrl(recipe.url))
+        ? { ...recipe, _reused: true }
+        : recipe
+    );
+    let pool = flagged.filter((recipe) => !recipe._reused);
+    if (pool.length < inputs.resultCount) pool = flagged;
+    const mealFiltered = filterMealTypeMismatches(pool, inputs);
+    if (mealFiltered.length >= Math.min(inputs.resultCount, pool.length)) {
+      pool = mealFiltered;
+    }
+    const selectedRaw = selectDiverse(pool, inputs.resultCount);
+    const reusedInResults = selectedRaw.filter((recipe) => recipe._reused).length;
+    const selected = selectedRaw.map(publicRecipe);
     if (selected.length === 0) {
       pushWarning(
         warnings,
         warning(
           "NO_MATCHING_RECIPES",
-          inputs.maxCaloriesPerServing != null ||
-            inputs.maxPrepMinutes != null ||
-            constraintRules.length > 0
-            ? "No fetched recipes had enough verified data to satisfy every hard constraint."
+          constraintRules.length > 0
+            ? "Every fetched recipe contained an excluded ingredient, allergen, or dietary conflict."
             : "No structured recipes could be extracted from the fetched pages."
+        )
+      );
+    }
+    if (reusedInResults > 0) {
+      pushWarning(
+        warnings,
+        warning(
+          "RECENTLY_SHOWN_REUSED",
+          "Few new recipes were found, so some recently shown recipes were included with lower priority."
         )
       );
     }
@@ -1422,14 +1625,18 @@ export async function recommendRecipes(
       recipes: selected,
       warnings: warnings.slice(0, 12),
       meta: {
-        queryCount: queries.length,
-        pagesConsidered: pages.length,
-        pagesFetched: fetched.fetchedPages,
-        candidatesParsed: fetched.recipes.length,
+        queryCount: queryPlan.length,
+        queriesRun: searchesRun,
+        pagesConsidered: aggregate.pages.length,
+        pagesFetched: aggregate.fetchedPages,
+        candidatesParsed: aggregate.recipes.length,
         candidatesAfterHardConstraints: constrained.recipes.length,
         returnedCount: selected.length,
         estimatedCount,
         estimationFailedCount,
+        seenUrlsProvided: inputs.excludedUrls.size,
+        seenCandidatesExcluded: seenCandidates.length,
+        recentlyShownReused: reusedInResults,
         filtered: constrained.stats,
         applied: {
           cuisines:

@@ -53,6 +53,7 @@ import {
 import { streamOpenAIOnce } from "../chat/openaiStream.js";
 import { resolveChatModel } from "../chat/modelPolicy.js";
 import {
+  detectRecipeFollowUp,
   normalizeChatIntent,
   resolveRoundToolPolicy,
   sanitizeRecipeContext,
@@ -60,6 +61,15 @@ import {
 import { PROPOSE_ADD_MISSING_INGREDIENTS_TO_SHOPPING_LIST_TOOL } from "../chat/tools.js";
 import { runToolCalls } from "../chat/toolRunner.js"; // ✅ HYBRID: enable server-side tools
 import { trimWorkingMessagesToFit } from "../chat/messageTrimmer.js";
+import {
+  FREE_MAX_RESULT_COUNT,
+  SUBSCRIBER_MAX_RESULT_COUNT,
+} from "../chat/recipeRecommendations.js";
+import { compactRecipeResultsForChat } from "../chat/recipeCompact.js";
+import {
+  getRecentRecipeUrls,
+  recordRecipeUrls,
+} from "../chat/recipeHistoryStore.js";
 
 let activeChatRequests = 0;
 const activeChatRequestsByUser = new Map();
@@ -303,6 +313,17 @@ async function withAbortDeadline({
     clearTimeout(timeout);
     parentSignal?.removeEventListener("abort", forwardAbort);
   }
+}
+
+function textOfMessage(message) {
+  if (typeof message?.content === "string") return message.content;
+  if (Array.isArray(message?.content)) {
+    return message.content
+      .map((part) => part?.text || "")
+      .join(" ")
+      .trim();
+  }
+  return "";
 }
 
 export function attachChatGateway(
@@ -891,12 +912,51 @@ export function attachChatGateway(
                 ownerType: state.ownerType,
                 ownerKey: state.ownerKey,
                 recipeContext: state.recipeContext,
+                recipeMaxResultCount: state.isSubscribed
+                  ? SUBSCRIBER_MAX_RESULT_COUNT
+                  : FREE_MAX_RESULT_COUNT,
               }),
           });
           if (active.get(requestId) !== state) return;
-          state.collectedToolMsgs.push(
-            ...(Array.isArray(serverToolMsgs) ? serverToolMsgs : [])
-          );
+          const enrichedToolMsgs = [];
+          for (const toolMsg of Array.isArray(serverToolMsgs)
+            ? serverToolMsgs
+            : []) {
+            const call = state.toolCalls.find(
+              (entry) => entry?.id === toolMsg?.tool_call_id
+            );
+            const parsed = safeJsonParse(toolMsg?.content);
+            const toolResult = parsed.ok ? parsed.value : null;
+            if (
+              call?.function?.name === "recommendRecipes" &&
+              toolResult &&
+              Array.isArray(toolResult.recipes)
+            ) {
+              if (state.db && state.ownerKey) {
+                try {
+                  await recordRecipeUrls(
+                    state.db,
+                    { ownerType: state.ownerType, ownerKey: state.ownerKey },
+                    toolResult.recipes
+                  );
+                } catch (error) {
+                  console.warn(
+                    "[recipeHistory]",
+                    error?.message || error
+                  );
+                }
+              }
+              enrichedToolMsgs.push({
+                ...toolMsg,
+                content: JSON.stringify(
+                  compactRecipeResultsForChat(toolResult)
+                ),
+              });
+              continue;
+            }
+            enrichedToolMsgs.push(toolMsg);
+          }
+          state.collectedToolMsgs.push(...enrichedToolMsgs);
         } catch (e) {
           if (active.get(requestId) !== state) throw e;
           send(ws, {
@@ -1276,8 +1336,27 @@ export function attachChatGateway(
         });
         return;
       }
-      const intent = normalizeChatIntent(msg.intent);
+      const normalizedIntent = normalizeChatIntent(msg.intent);
+      const lastUserMessage = [...(Array.isArray(messages) ? messages : [])]
+        .reverse()
+        .find((message) => message?.role === "user");
+      const detectedFollowUp = detectRecipeFollowUp({
+        text: lastUserMessage ? textOfMessage(lastUserMessage) : "",
+        history: Array.isArray(messages) ? messages.slice(0, -1) : [],
+        language,
+      });
+      const intent =
+        normalizedIntent === "recipe_recommendation" || detectedFollowUp
+          ? "recipe_recommendation"
+          : "chat";
       const recipeContext = sanitizeRecipeContext(msg.recipeContext);
+      const recentRecipeUrls = await getRecentRecipeUrls(db, {
+        ownerType,
+        ownerKey,
+      });
+      if (recentRecipeUrls.length > 0) {
+        recipeContext.excludeRecipeUrls = recentRecipeUrls;
+      }
 
       // SQLite-backed token budget enforcement (trial)
       // const db = await getDb();

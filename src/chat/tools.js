@@ -9,7 +9,10 @@ import {
   SafeWebFetchError,
   fetchPublicTextPage,
 } from "./safeWebFetch.js";
-import { recommendRecipes as runRecipeRecommendations } from "./recipeRecommendations.js";
+import {
+  FREE_MAX_RESULT_COUNT,
+  recommendRecipes as runRecipeRecommendations,
+} from "./recipeRecommendations.js";
 import {
   estimateAndApplyRecipeMetadata,
   recipeEstimationEnabled,
@@ -140,6 +143,10 @@ export function createRecommendRecipesTool({
       signal: ctx?.signal,
       estimateMeta,
       estimationEnabled,
+      maxResultCount:
+        ctx?.recipeMaxResultCount == null
+          ? FREE_MAX_RESULT_COUNT
+          : ctx.recipeMaxResultCount,
     });
   };
 }
@@ -289,7 +296,7 @@ export const RECOMMEND_RECIPES_TOOL = {
   function: {
     name: "recommendRecipes",
     description:
-      "Find and rank real recipes using the user's trusted fridge inventory and saved recipe preferences. Use this for recipe ideas, meal ideas, or 'what can I cook?' requests. Call it once per user request. Put only constraints stated for the current request in the arguments; saved defaults and fridge items are supplied separately by the app.",
+      "Find and rank real recipes using the user's trusted fridge inventory and saved recipe preferences. Use this for recipe ideas, meal ideas, or 'what can I cook?' requests. Call it once per user request. A follow-up after a previous recipe answer is a NEW request: pass only constraints from the latest user message. Recipes shown recently are re-admitted with low priority only when few new options exist. Put only constraints stated for the current request in the arguments; saved defaults and fridge items are supplied separately by the app.",
     parameters: {
       type: "object",
       properties: {

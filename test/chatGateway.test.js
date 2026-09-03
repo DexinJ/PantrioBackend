@@ -798,6 +798,14 @@ test("recipe intent forces one recommendation, then allows exactly one shopping-
     ws.sent.some(({ type }) => type === "tool_calls"),
     false
   );
+  const recipeToolMessage = rounds[1].messages.find(
+    (message) =>
+      message?.role === "tool" && message?.tool_call_id === "recipe-call"
+  );
+  const compacted = JSON.parse(recipeToolMessage.content);
+  assert.equal(compacted.recipes[0].title, "Test recipe");
+  assert.equal("instructions" in compacted.recipes[0], false);
+  assert.equal("ingredients" in compacted.recipes[0], false);
   assert.deepEqual(
     rounds[1].messages
       .filter(({ role }) => role === "tool")

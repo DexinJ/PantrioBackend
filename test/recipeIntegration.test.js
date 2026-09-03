@@ -38,6 +38,10 @@ function response() {
   return res;
 }
 
+function memoryDb() {
+  return { all: async () => [], run: async () => ({}) };
+}
+
 test("recommendRecipes tool passes trusted context and bounded network dependencies", async () => {
   const controller = new AbortController();
   const overrides = { preferredCuisines: ["Thai"] };
@@ -65,6 +69,7 @@ test("recommendRecipes tool passes trusted context and bounded network dependenc
   assert.equal(received[2].search, search);
   assert.equal(received[2].fetchPage, fetchPage);
   assert.equal(received[2].signal, controller.signal);
+  assert.equal(received[2].maxResultCount, 6);
   assert.equal(typeof TOOLS.recommendRecipes, "function");
 });
 
@@ -99,6 +104,7 @@ test("recipe recommendation handler forwards the parity payload and dependencies
   const handler = createRecipeRecommendationHandler({
     search,
     fetchPage,
+    getDbFn: async () => memoryDb(),
     resolveEntitlementFn: async () => ({ active: false }),
     recommendRecipesFn: async (...args) => {
       received = args;
@@ -129,12 +135,13 @@ test("recipe recommendation handler forwards the parity payload and dependencies
   assert.equal(res.listenerCount("close"), 0);
 });
 
-test("recipe recommendation handler raises the budget for entitled subscribers", async () => {
+test("recipe recommendation handler caps results by entitlement with a shared search budget", async () => {
   const expected = { recipes: [{ title: "Dinner" }], warnings: [] };
   let received;
   const handler = createRecipeRecommendationHandler({
     search: async () => ({ results: [] }),
     fetchPage: async () => ({ text: "", url: "https://example.com" }),
+    getDbFn: async () => memoryDb(),
     resolveEntitlementFn: async () => ({ active: true }),
     recommendRecipesFn: async (...args) => {
       received = args;
@@ -150,16 +157,7 @@ test("recipe recommendation handler raises the budget for entitled subscribers",
 
   assert.equal(res.statusCode, 200);
   assert.equal(received[2].maxResultCount, 10);
-  assert.deepEqual(received[2].limits, {
-    maxSearchQueries: 3,
-    searchResultsPerQuery: 8,
-    maxPages: 10,
-    fetchConcurrency: 3,
-    pageTimeoutMs: 10_000,
-    pageMaxBytes: 512 * 1024,
-    overallTimeoutMs: 25_000,
-    maxRecipesPerPage: 6,
-  });
+  assert.equal(received[2].limits, undefined);
 });
 
 test("recipe recommendation handler rejects unauthenticated and malformed payloads", async () => {
@@ -167,6 +165,7 @@ test("recipe recommendation handler rejects unauthenticated and malformed payloa
   const handler = createRecipeRecommendationHandler({
     search: async () => ({ results: [] }),
     fetchPage: async () => ({ text: "", url: "https://example.com" }),
+    getDbFn: async () => memoryDb(),
     recommendRecipesFn: async () => {
       calls += 1;
       return { recipes: [] };
@@ -199,6 +198,7 @@ test("recipe recommendation handler maps engine timeouts without leaking details
   const handler = createRecipeRecommendationHandler({
     search: async () => ({ results: [] }),
     fetchPage: async () => ({ text: "", url: "https://example.com" }),
+    getDbFn: async () => memoryDb(),
     recommendRecipesFn: async () => {
       throw new RecipeRecommendationError("TIMEOUT", "private timeout detail");
     },
@@ -223,6 +223,7 @@ test("disconnecting a recipe recommendation aborts engine work without a respons
   const handler = createRecipeRecommendationHandler({
     search: async () => ({ results: [] }),
     fetchPage: async () => ({ text: "", url: "https://example.com" }),
+    getDbFn: async () => memoryDb(),
     resolveEntitlementFn: async () => ({ active: false }),
     recommendRecipesFn: async (_overrides, _context, { signal }) => {
       receivedSignal = signal;
