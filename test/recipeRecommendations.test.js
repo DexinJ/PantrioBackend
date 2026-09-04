@@ -335,7 +335,7 @@ test("keeps unknown nutrition with an explicit warning when no calorie cap appli
   );
 });
 
-test("prioritizes selected and must-use ingredients without treating them as exclusions", async () => {
+test("must-use ingredients gate the pool when possible and fall back with a penalty otherwise", async () => {
   const requestedUrl = "https://vegetables.example/zucchini-ginger";
   const otherUrl = "https://japanese.example/chicken";
   const pages = new Map([
@@ -386,23 +386,31 @@ test("prioritizes selected and must-use ingredients without treating them as exc
     }
   );
 
-  assert.match(queries[0], /^using zucchini ginger\b/i);
+  assert.match(queries[0], /^using ginger zucchini\b/i);
   assert.deepEqual(
     result.recipes.map(({ title }) => title),
     ["Zucchini Ginger Skillet", "Japanese Chicken"]
   );
   assert.deepEqual(result.recipes[0].matchedRequestedIngredients, [
-    "zucchini",
     "ginger",
+    "zucchini",
   ]);
   assert.deepEqual(result.recipes[1].unmatchedRequestedIngredients, [
-    "zucchini",
     "ginger",
+    "zucchini",
   ]);
   assert.deepEqual(result.meta.applied.requestedIngredients, [
-    "zucchini",
     "ginger",
+    "zucchini",
   ]);
+  assert.equal(result.meta.requestedFallbackUsed, true);
+  assert.equal(result.meta.candidatesMissingRequested, 1);
+  assert.ok(
+    result.warnings.some(
+      ({ code }) => code === "REQUESTED_INGREDIENT_FALLBACK"
+    )
+  );
+  assert.equal(result.recipes[1].scoreBreakdown.missingRequestedPenalty, 0.25);
   assert.equal(result.meta.applied.maxCaloriesPerServing, 2_500);
   assert.equal(result.meta.applied.maxPrepMinutes, 480);
   assert.equal(result.meta.applied.servings, 12);
@@ -805,9 +813,191 @@ test("widening searches continue until enough parseable candidates exist", async
     }
   );
 
-  assert.ok(searches >= 4);
+  assert.ok(searches >= 3);
   assert.ok(searches <= 8);
   assert.ok(result.meta.pagesFetched >= 7);
   assert.equal(result.meta.candidatesParsed, 7);
   assert.equal(result.recipes.length, 5);
+});
+
+test("must-use ingredients drop non-matching recipes when the pool is large enough", async () => {
+  const urls = Array.from(
+    { length: 5 },
+    (_, index) => `https://gate.example/r${index}`
+  );
+  const chickenTitles = ["Chicken Stir Fry", "Chicken Curry", "Roast Chicken"];
+  const pages = new Map(
+    urls.map((url, index) => [
+      url,
+      fetchedPage(url, {
+        name: index < 3 ? chickenTitles[index] : `Beef Dish ${index}`,
+        totalTime: "PT25M",
+        nutrition: { calories: "400 calories" },
+        recipeIngredient:
+          index < 3 ? ["chicken", "rice"] : ["beef", "potatoes"],
+      }),
+    ])
+  );
+  const queries = [];
+
+  const result = await recommendRecipes(
+    { mustUseIngredients: ["chicken"], resultCount: 3 },
+    { inventory: ["chicken", "eggs", "milk", "beef"] },
+    {
+      search: async ({ query }) => {
+        queries.push(query);
+        return { results: urls.map((link) => ({ link })) };
+      },
+      fetchPage: async (url) => pages.get(url),
+    }
+  );
+
+  assert.deepEqual(
+    result.recipes.map(({ title }) => title).sort(),
+    chickenTitles.slice().sort()
+  );
+  assert.equal(result.meta.requestedFallbackUsed, false);
+  assert.equal(result.meta.candidatesMissingRequested, 2);
+  assert.equal(result.meta.requiredIngredientCount, 1);
+  assert.match(queries[0], /^using chicken\b/i);
+  assert.doesNotMatch(queries[0], /eggs|milk|beef/i);
+  assert.match(queries[1], /featuring chicken/i);
+  assert.match(queries[1], /with eggs milk beef/i);
+});
+
+test("a single UI-selected fridge item is treated as a required ingredient", async () => {
+  const chickenA = "https://single.example/chicken-a";
+  const chickenB = "https://single.example/chicken-b";
+  const eggBake = "https://single.example/egg-bake";
+  const pages = new Map([
+    [
+      chickenA,
+      fetchedPage(chickenA, {
+        name: "Chicken Skillet A",
+        recipeIngredient: ["chicken", "spinach"],
+      }),
+    ],
+    [
+      chickenB,
+      fetchedPage(chickenB, {
+        name: "Chicken Skillet B",
+        recipeIngredient: ["chicken", "rice"],
+      }),
+    ],
+    [
+      eggBake,
+      fetchedPage(eggBake, {
+        name: "Egg Bake",
+        recipeIngredient: ["eggs", "milk", "spinach"],
+      }),
+    ],
+  ]);
+
+  const result = await recommendRecipes(
+    { resultCount: 2 },
+    {
+      selectedIngredients: ["chicken"],
+      inventory: ["chicken", "eggs", "milk", "spinach"],
+    },
+    {
+      search: async () => ({
+        results: [chickenA, chickenB, eggBake].map((link) => ({ link })),
+      }),
+      fetchPage: async (url) => pages.get(url),
+    }
+  );
+
+  const titles = result.recipes.map(({ title }) => title);
+  assert.ok(titles.every((title) => title.startsWith("Chicken Skillet")));
+  assert.equal(result.meta.candidatesMissingRequested, 1);
+  assert.equal(result.meta.requestedFallbackUsed, false);
+});
+
+test("multi-selected fridge items stay a soft as-many-as-practical preference", async () => {
+  const coveredUrl = "https://multi.example/chicken-rice";
+  const uncoveredUrl = "https://multi.example/beef-stew";
+  const pages = new Map([
+    [
+      coveredUrl,
+      fetchedPage(coveredUrl, {
+        name: "Chicken Rice Bowl",
+        recipeIngredient: ["chicken", "rice", "onion"],
+      }),
+    ],
+    [
+      uncoveredUrl,
+      fetchedPage(uncoveredUrl, {
+        name: "Beef Stew",
+        recipeIngredient: ["beef", "potatoes", "carrots"],
+      }),
+    ],
+  ]);
+
+  const result = await recommendRecipes(
+    { resultCount: 1 },
+    {
+      selectedIngredients: ["chicken", "rice", "egg"],
+      inventory: ["chicken", "rice", "egg"],
+    },
+    {
+      search: async () => ({
+        results: [coveredUrl, uncoveredUrl].map((link) => ({ link })),
+      }),
+      fetchPage: async (url) => pages.get(url),
+    }
+  );
+
+  assert.equal(result.recipes[0].title, "Chicken Rice Bowl");
+  assert.equal(result.meta.requiredIngredientCount, 0);
+  assert.equal(result.meta.requestedFallbackUsed, false);
+  assert.equal(result.meta.candidatesMissingRequested, 0);
+});
+
+test("widening keeps searching until enough recipes contain the requested ingredient", async () => {
+  const beefUrls = [
+    "https://widen-request.example/beef-1",
+    "https://widen-request.example/beef-2",
+  ];
+  const chickenUrls = [
+    "https://widen-request.example/chicken-1",
+    "https://widen-request.example/chicken-2",
+    "https://widen-request.example/chicken-3",
+  ];
+  const pages = new Map([
+    ...beefUrls.map((url, index) => [
+      url,
+      fetchedPage(url, {
+        name: `Beef Dish ${index}`,
+        recipeIngredient: ["beef", "potatoes"],
+      }),
+    ]),
+    ...chickenUrls.map((url, index) => [
+      url,
+      fetchedPage(url, {
+        name: `Chicken Dish ${index}`,
+        recipeIngredient: ["chicken", "rice"],
+      }),
+    ]),
+  ]);
+  let searches = 0;
+  const queries = [];
+
+  const result = await recommendRecipes(
+    { mustUseIngredients: ["chicken"], resultCount: 3 },
+    {},
+    {
+      search: async ({ query }) => {
+        searches += 1;
+        queries.push(query);
+        const results = searches <= 2 ? beefUrls : chickenUrls;
+        return { results: results.map((link) => ({ link })) };
+      },
+      fetchPage: async (url) => pages.get(url),
+    }
+  );
+
+  assert.ok(searches >= 4);
+  assert.ok(result.recipes.every((recipe) => recipe.title.startsWith("Chicken")));
+  assert.equal(result.recipes.length, 3);
+  assert.ok(queries.some((query) => /chicken/i.test(query)));
 });

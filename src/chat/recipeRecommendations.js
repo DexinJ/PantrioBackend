@@ -450,7 +450,7 @@ function normalizeInputs(
     maxLength: 100,
   });
   const requestedIngredients = normalizedStringList(
-    [...selectedIngredients, ...mustUseIngredients],
+    [...mustUseIngredients, ...selectedIngredients],
     { maxItems: 40, maxLength: 100 }
   );
   const inventory = normalizedStringList(
@@ -628,10 +628,8 @@ function buildSearchQueries(inputs, limits) {
         ? `using ${requestedIngredients.join(" ")}`
         : "",
       ...preferenceParts,
-      inventory.length
-        ? `${requestedIngredients.length ? "with" : "using"} ${inventory
-            .slice(0, 5)
-            .join(" ")}`
+      !requestedIngredients.length && inventory.length
+        ? `using ${inventory.slice(0, 5).join(" ")}`
         : "",
       "recipe nutrition ingredients",
     ]
@@ -1155,9 +1153,13 @@ function buildWhyRecommended(
 
 function scoreCandidates(recipes, inputs) {
   const mealTypeBucket = canonicalMealType(inputs.mealType);
+  const required = effectiveRequiredIngredients(inputs);
   return recipes.map((recipe, index) => {
     const ingredients = ingredientMatches(recipe, inputs);
     const dislikes = dislikedIngredientPenalty(recipe, inputs);
+    const requiredScore = requiredCoverage(recipe, required).score;
+    const missingRequestedPenalty =
+      required.length > 0 ? (1 - requiredScore) * 0.25 : 0;
     // Ingredient count is a preference, not a hard constraint: recipes that
     // exceed the user's stated maximum get a capped soft penalty so strong
     // recipes stay viable instead of disappearing from results.
@@ -1184,6 +1186,7 @@ function scoreCandidates(recipes, inputs) {
       quality: qualityScore(recipe),
       calorieLimit,
       timeLimit,
+      missingRequestedPenalty,
       dislikedIngredientPenalty: dislikes.dislikedIngredientPenalty,
       ingredientCountPenalty,
     };
@@ -1207,7 +1210,8 @@ function scoreCandidates(recipes, inputs) {
         dislikes.dislikedIngredientPenalty -
         ingredientCountPenalty -
         calorieLimit -
-        timeLimit
+        timeLimit -
+        missingRequestedPenalty
     );
     return {
       ...recipe,
@@ -1294,12 +1298,23 @@ function buildQueryPlan(inputs, maxQueries) {
   };
   const cuisine = inputs.requestedCuisines[0] || inputs.savedCuisines[0] || "";
   const meal = inputs.mealType || "";
-  pushQuery([meal, "recipes", cuisine]);
+  const requestedFocus = inputs.requestedIngredients.slice(0, 2);
+
+  // Widening should chase what the user explicitly asked for first; fridge
+  // items only drive widening when no ingredient was requested.
+  if (requestedFocus.length > 0) {
+    for (const item of requestedFocus) {
+      pushQuery([item, meal ? `${meal} recipe ideas` : "recipe ideas"]);
+    }
+  }
+  if (meal || cuisine) pushQuery([meal, "recipes", cuisine]);
   if (inputs.energyPreference !== "any") {
     pushQuery([inputs.energyPreference, meal || "easy", "recipes"]);
   }
-  for (const item of inputs.inventory.slice(0, 2)) {
-    pushQuery([item, meal ? `${meal} recipe ideas` : "recipe ideas"]);
+  if (requestedFocus.length === 0) {
+    for (const item of inputs.inventory.slice(0, 2)) {
+      pushQuery([item, meal ? `${meal} recipe ideas` : "recipe ideas"]);
+    }
   }
   pushQuery(meal ? [`best ${meal} recipes`] : ["quick easy meal ideas"]);
   return plan.slice(0, maxQueries);
@@ -1350,6 +1365,57 @@ function filterMealTypeMismatches(recipes, inputs) {
   );
   const minimum = Math.min(inputs.resultCount, recipes.length);
   return matches.length >= minimum ? matches : recipes;
+}
+
+// Ingredients the user explicitly asked to use: typed must-use ingredients
+// always qualify; a single UI-selected fridge item is treated the same way.
+// Multi-item UI selections stay a soft "as many as practical" preference.
+function effectiveRequiredIngredients(inputs) {
+  if (inputs.mustUseIngredients.length > 0) return inputs.mustUseIngredients;
+  if (inputs.selectedIngredients.length === 1) return inputs.selectedIngredients;
+  return [];
+}
+
+function requiredCoverage(recipe, required) {
+  if (required.length === 0) return { matched: 0, score: 1 };
+  const matched = matchItemsToRecipe(recipe, required).matched.length;
+  return { matched, score: matched / required.length };
+}
+
+function filterMissingRequested(recipes, inputs) {
+  const required = effectiveRequiredIngredients(inputs);
+  if (required.length === 0) {
+    return {
+      pool: recipes,
+      required,
+      usedFallback: false,
+      missingDropped: 0,
+      missingTotal: 0,
+    };
+  }
+  const matches = [];
+  let missingTotal = 0;
+  for (const recipe of recipes) {
+    if (requiredCoverage(recipe, required).score >= 1) matches.push(recipe);
+    else missingTotal += 1;
+  }
+  const minimum = Math.min(inputs.resultCount, recipes.length);
+  if (matches.length >= minimum) {
+    return {
+      pool: matches,
+      required,
+      usedFallback: false,
+      missingDropped: missingTotal,
+      missingTotal,
+    };
+  }
+  return {
+    pool: recipes,
+    required,
+    usedFallback: true,
+    missingDropped: 0,
+    missingTotal,
+  };
 }
 
 function selectDiverse(candidates, count) {
@@ -1497,12 +1563,19 @@ export async function recommendRecipes(
       aggregate.truncatedPages += fetched.truncatedPages;
       aggregate.malformedScripts += fetched.malformedScripts;
       aggregate.fetchedPages += fetched.fetchedPages;
-      const usable = applyHardConstraints(
+      const constrainedWave = applyHardConstraints(
         aggregate.recipes,
         inputs,
         constraintRules
-      ).recipes.length;
-      if (usable >= inputs.resultCount) break;
+      );
+      const required = effectiveRequiredIngredients(inputs);
+      const usableRequired =
+        required.length > 0
+          ? constrainedWave.recipes.filter(
+              (recipe) => requiredCoverage(recipe, required).score >= 1
+            ).length
+          : constrainedWave.recipes.length;
+      if (usableRequired >= inputs.resultCount) break;
     }
     if (aggregate.failedPages > 0) {
       pushWarning(
@@ -1597,8 +1670,17 @@ export async function recommendRecipes(
     if (mealFiltered.length >= Math.min(inputs.resultCount, pool.length)) {
       pool = mealFiltered;
     }
+    const requestedGate = filterMissingRequested(pool, inputs);
+    pool = requestedGate.pool;
     const selectedRaw = selectDiverse(pool, inputs.resultCount);
     const reusedInResults = selectedRaw.filter((recipe) => recipe._reused).length;
+    const missingRequestedInResults =
+      requestedGate.required.length > 0
+        ? selectedRaw.filter(
+            (recipe) =>
+              requiredCoverage(recipe, requestedGate.required).score < 1
+          ).length
+        : 0;
     const selected = selectedRaw.map(publicRecipe);
     if (selected.length === 0) {
       pushWarning(
@@ -1620,6 +1702,18 @@ export async function recommendRecipes(
         )
       );
     }
+    if (missingRequestedInResults > 0) {
+      const requiredLabel = requestedGate.required.join(", ");
+      pushWarning(
+        warnings,
+        warning(
+          "REQUESTED_INGREDIENT_FALLBACK",
+          `Few recipes using ${requiredLabel} were found; some suggestions may not include ${
+            requestedGate.required.length === 1 ? "it" : "them"
+          }.`
+        )
+      );
+    }
 
     return {
       recipes: selected,
@@ -1637,6 +1731,10 @@ export async function recommendRecipes(
         seenUrlsProvided: inputs.excludedUrls.size,
         seenCandidatesExcluded: seenCandidates.length,
         recentlyShownReused: reusedInResults,
+        requiredIngredientCount: requestedGate.required.length,
+        candidatesMissingRequested: requestedGate.missingTotal,
+        requestedFallbackUsed: requestedGate.usedFallback,
+        missingRequestedInResults,
         filtered: constrained.stats,
         applied: {
           cuisines:
