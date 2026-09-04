@@ -849,8 +849,14 @@ export function attachChatGateway(
       const fridgeProposalCall = state.toolCalls.find(
         (call) => call?.function?.name === "proposeAddAllToFridge"
       );
+      const bulkEditProposalCall = state.toolCalls.find(
+        (call) => call?.function?.name === "proposeBulkFridgeUpdate"
+      );
       const isolatedToolCall =
-        recipeRecommendationCall || preferenceProposalCall || fridgeProposalCall;
+        recipeRecommendationCall ||
+        preferenceProposalCall ||
+        fridgeProposalCall ||
+        bulkEditProposalCall;
       if (isolatedToolCall) {
         state.toolsLockedAfterIsolatedAction = true;
       }
@@ -880,7 +886,7 @@ export function attachChatGateway(
                 ok: false,
                 skipped: true,
                 reason:
-                  "Recipe and preference actions are isolated from other tool actions.",
+                  "Confirmation actions are isolated from other tool actions.",
               }),
             }))
         );

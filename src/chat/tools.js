@@ -26,6 +26,7 @@ export const PRESET_CATEGORIES = [
   "Pantry",
 
   // urgency
+  "Expired",
   "Eat first",
   "Use soon",
   "Lasts a while",
@@ -54,7 +55,13 @@ export const PRESET_CATEGORIES = [
 
 // ✅ Enums split by type so we can enforce "one storage + one urgency"
 export const PRESET_STORAGE_CATEGORIES = ["Fridge", "Freezer", "Pantry"];
-export const PRESET_URGENCY_CATEGORIES = ["Eat first", "Use soon", "Lasts a while", "Long keeper"];
+export const PRESET_URGENCY_CATEGORIES = [
+  "Expired",
+  "Eat first",
+  "Use soon",
+  "Lasts a while",
+  "Long keeper",
+];
 
 // (optional) other buckets, still allowed as extras
 export const PRESET_FOOD_TYPE_CATEGORIES = [
@@ -68,7 +75,6 @@ export const PRESET_FOOD_TYPE_CATEGORIES = [
   "Snacks",
   "Bakery",
   "Frozen",
-  "Other",
 ];
 export const PRESET_STATE_CATEGORIES = ["Opened", "Unopened", "Raw", "Cooked", "Cut", "Whole"];
 // ✅ CHANGED: add these helpers
@@ -285,10 +291,11 @@ const CATEGORY_SCHEMA = {
   additionalProperties: false,
 };
 
-const EXPIRES_AT_SCHEMA = {
-  type: "string",
+const EXPIRES_IN_DAYS_SCHEMA = {
+  type: "integer",
+  minimum: 1,
   description:
-    "REQUIRED. Expiration date/time for this item. Prefer ISO date 'YYYY-MM-DD' (e.g., '2026-02-01'). If user gives relative time like 'in 5 days', convert to an ISO date string.",
+    "Whole-day shelf-life estimate from today (e.g. raw chicken 2, milk 7, frozen meat 180). Always express expiry this way; never pass calendar dates. The app converts this to an expiration date when the change is applied.",
 };
 
 export const RECOMMEND_RECIPES_TOOL = {
@@ -499,7 +506,7 @@ export const OPENAI_TOOLS = [
     function: {
       name: "addFridgeItem",
       description:
-        "Add an item to the fridge (mutates state). You MUST include categories with exactly 1 storage, exactly 1 urgency, and exactly 1 food_type. state is optional. Predict an expiration date based on food_type and storage and include expiresAt (YYYY-MM-DD). Never invent categories.",
+        "Add an item to the fridge (mutates state). You MUST include categories with exactly 1 storage, exactly 1 urgency, and exactly 1 food_type. state is optional. Estimate shelf life in whole days with expiresInDays based on food_type, storage, and state. Never invent categories.",
       parameters: {
         type: "object",
         properties: {
@@ -509,9 +516,9 @@ export const OPENAI_TOOLS = [
             description: "Amount/size (e.g., '2 cartons', '1L'). Default '1'.",
           },
           categories: CATEGORY_SCHEMA,
-          expiresAt: EXPIRES_AT_SCHEMA,
+          expiresInDays: EXPIRES_IN_DAYS_SCHEMA,
         },
-        required: ["name", "categories", "expiresAt"],
+        required: ["name", "categories"],
         additionalProperties: false,
       },
     },
@@ -636,7 +643,7 @@ export const OPENAI_TOOLS = [
     function: {
       name: "proposeAddAllToFridge",
       description:
-        "UI-only (no state changes): after the user attaches a fridge image, or explicitly asks to add a clearly listed batch, show one 'Add all to fridge' confirmation card for the extracted items. Never use this for recipe ingredients, recipe results, meal ideas, or ordinary bullet lists. Each item MUST include categories with exactly 1 storage, exactly 1 urgency, exactly 1 food_type, and exactly 1 expiresAt (YYYY-MM-DD). state is optional. Predict the expiration date for each item based on food_type and storage. Never invent categories.",
+        "UI-only (no state changes): after the user attaches a fridge image, or explicitly asks to add a clearly listed batch, show one 'Add all to fridge' confirmation card for the extracted items. Never use this for recipe ingredients, recipe results, meal ideas, or ordinary bullet lists. Each item MUST include categories with exactly 1 storage, exactly 1 urgency, and exactly 1 food_type; state is optional. Estimate shelf life in whole days with expiresInDays based on food_type, storage, and state. Never invent categories.",
       parameters: {
         type: "object",
         properties: {
@@ -650,9 +657,9 @@ export const OPENAI_TOOLS = [
                 name: { type: "string", description: "Item name." },
                 quantity: { type: "string", description: "Optional amount/size." },
                 categories: CATEGORY_SCHEMA,
-                expiresAt: EXPIRES_AT_SCHEMA,
+                expiresInDays: EXPIRES_IN_DAYS_SCHEMA,
               },
-              required: ["name", "categories", "expiresAt"],
+              required: ["name", "categories"],
               additionalProperties: false,
             },
           },
@@ -705,7 +712,7 @@ export const OPENAI_TOOLS = [
     function: {
       name: "updateFridgeItem",
       description:
-        "Edit a single fridge item: rename it, change its quantity, categories, or expiry. Resolve the item by id when available, otherwise by exact name. For changes to several items, use proposeBulkFridgeUpdate instead.",
+        "Edit a single fridge item: rename it, change its quantity, categories, or expiry (expiry is a whole-day estimate in expiresInDays). Resolve the item by id when available, otherwise by exact name. For changes to several items, use proposeBulkFridgeUpdate instead.",
       parameters: {
         type: "object",
         properties: {
@@ -717,17 +724,7 @@ export const OPENAI_TOOLS = [
               name: { type: "string", description: "New item name." },
               quantity: { type: "string", description: "New amount/size." },
               categories: CATEGORY_SCHEMA,
-              expiresInDays: {
-                type: "integer",
-                minimum: 1,
-                description:
-                  "Whole-day shelf life estimate from today; prefer this over an absolute date.",
-              },
-              expiresAt: {
-                type: "string",
-                description:
-                  "Absolute expiration date (YYYY-MM-DD) only when the user states one.",
-              },
+              expiresInDays: EXPIRES_IN_DAYS_SCHEMA,
             },
             additionalProperties: false,
           },
@@ -743,7 +740,7 @@ export const OPENAI_TOOLS = [
     function: {
       name: "proposeBulkFridgeUpdate",
       description:
-        "Show one confirmation card for multiple fridge changes (rename, quantity, categories, expiry, or removal). Resolve each entry by id when available, otherwise by exact name. Nothing is changed until the user confirms on the card.",
+        "Show one confirmation card for multiple fridge changes (rename, quantity, categories, expiry in whole-day expiresInDays, or removal). Resolve each entry by id when available, otherwise by exact name. Nothing is changed until the user confirms on the card.",
       parameters: {
         type: "object",
         properties: {
@@ -762,8 +759,7 @@ export const OPENAI_TOOLS = [
                     name: { type: "string" },
                     quantity: { type: "string" },
                     categories: CATEGORY_SCHEMA,
-                    expiresInDays: { type: "integer", minimum: 1 },
-                    expiresAt: { type: "string" },
+                    expiresInDays: EXPIRES_IN_DAYS_SCHEMA,
                   },
                   additionalProperties: false,
                 },
