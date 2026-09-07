@@ -206,7 +206,8 @@ test("hard-excludes trusted ingredients while soft-ranking calorie and time caps
     }
   );
 
-  assert.ok(searchCalls.length <= 2);
+  assert.ok(searchCalls.length >= 2);
+  assert.ok(searchCalls.length <= 8);
   assert.match(searchCalls[0].args.query, /Asian/i);
   assert.match(searchCalls[0].args.query, /under 500 calories per serving/i);
   assert.ok(searchCalls[0].context.signal instanceof AbortSignal);
@@ -262,7 +263,7 @@ test("bounds network work, deduplicates URLs, and diversifies equal-scoring sour
   let peakFetches = 0;
 
   const result = await recommendRecipes(
-    { resultCount: 6 },
+    { resultCount: 4 },
     {},
     {
       search: async () => {
@@ -295,10 +296,11 @@ test("bounds network work, deduplicates URLs, and diversifies equal-scoring sour
     }
   );
 
-  assert.ok(searches <= 2);
+  assert.ok(searches >= 2);
+  assert.ok(searches <= 8);
   assert.ok(fetches <= 12);
   assert.ok(peakFetches <= 3);
-  assert.equal(result.recipes.length, 6);
+  assert.equal(result.recipes.length, 4);
   assert.notEqual(
     new URL(result.recipes[0].url).hostname,
     new URL(result.recipes[1].url).hostname
@@ -335,7 +337,7 @@ test("keeps unknown nutrition with an explicit warning when no calorie cap appli
   );
 });
 
-test("must-use ingredients gate the pool when possible and fall back with a penalty otherwise", async () => {
+test("must-use ingredients gate the pool and never fall back to non-matching recipes", async () => {
   const requestedUrl = "https://vegetables.example/zucchini-ginger";
   const otherUrl = "https://japanese.example/chicken";
   const pages = new Map([
@@ -389,13 +391,9 @@ test("must-use ingredients gate the pool when possible and fall back with a pena
   assert.match(queries[0], /^using ginger zucchini\b/i);
   assert.deepEqual(
     result.recipes.map(({ title }) => title),
-    ["Zucchini Ginger Skillet", "Japanese Chicken"]
+    ["Zucchini Ginger Skillet"]
   );
   assert.deepEqual(result.recipes[0].matchedRequestedIngredients, [
-    "ginger",
-    "zucchini",
-  ]);
-  assert.deepEqual(result.recipes[1].unmatchedRequestedIngredients, [
     "ginger",
     "zucchini",
   ]);
@@ -403,14 +401,7 @@ test("must-use ingredients gate the pool when possible and fall back with a pena
     "ginger",
     "zucchini",
   ]);
-  assert.equal(result.meta.requestedFallbackUsed, true);
   assert.equal(result.meta.candidatesMissingRequested, 1);
-  assert.ok(
-    result.warnings.some(
-      ({ code }) => code === "REQUESTED_INGREDIENT_FALLBACK"
-    )
-  );
-  assert.equal(result.recipes[1].scoreBreakdown.missingRequestedPenalty, 0.25);
   assert.equal(result.meta.applied.maxCaloriesPerServing, 2_500);
   assert.equal(result.meta.applied.maxPrepMinutes, 480);
   assert.equal(result.meta.applied.servings, 12);
@@ -630,7 +621,7 @@ test("honors cancellation even when an injected search ignores the signal", asyn
   );
 });
 
-test("maxResultCount caps the requested result count", async () => {
+test("result count is capped at four", async () => {
   const urls = Array.from(
     { length: 12 },
     (_, index) => `https://cap.example/r${index}`
@@ -654,7 +645,7 @@ test("maxResultCount caps the requested result count", async () => {
     }
   );
 
-  assert.equal(result.recipes.length, 6);
+  assert.equal(result.recipes.length, 4);
 });
 
 test("skill, cooking method, and ingredient count shape the search queries", async () => {
@@ -745,7 +736,7 @@ test("meal type filters proven mismatches but keeps unknown-category fallbacks",
   assert.equal(result.meta.applied.mealType, "breakfast");
 });
 
-test("recently shown recipes are excluded when new ones exist and reused with a penalty otherwise", async () => {
+test("recipe history exclusions are ignored so repeats across requests are allowed", async () => {
   const firstUrl = "https://seen.example/first";
   const secondUrl = "https://seen.example/second";
   const makePage = (url, name) =>
@@ -762,25 +753,14 @@ test("recently shown recipes are excluded when new ones exist and reused with a 
     fetchPage: async (url) => makePage(url, url.endsWith("first") ? "First Recipe" : "Second Recipe"),
   };
 
-  const fresh = await recommendRecipes(
+  const result = await recommendRecipes(
     { resultCount: 1 },
     { excludeRecipeUrls: [firstUrl] },
     searchAndFetch
   );
-  assert.equal(fresh.recipes[0].title, "Second Recipe");
-  assert.equal(fresh.meta.seenCandidatesExcluded, 1);
-  assert.equal(fresh.meta.recentlyShownReused, 0);
-
-  const reused = await recommendRecipes(
-    { resultCount: 2 },
-    { excludeRecipeUrls: [firstUrl, secondUrl] },
-    searchAndFetch
-  );
-  assert.equal(reused.recipes.length, 2);
-  assert.equal(reused.meta.recentlyShownReused, 2);
-  assert.ok(
-    reused.warnings.some(({ code }) => code === "RECENTLY_SHOWN_REUSED")
-  );
+  assert.equal(result.recipes[0].title, "First Recipe");
+  assert.equal(result.meta.seenUrlsProvided, undefined);
+  assert.equal(result.meta.recentlyShownReused, undefined);
 });
 
 test("widening searches continue until enough parseable candidates exist", async () => {
@@ -817,7 +797,7 @@ test("widening searches continue until enough parseable candidates exist", async
   assert.ok(searches <= 8);
   assert.ok(result.meta.pagesFetched >= 7);
   assert.equal(result.meta.candidatesParsed, 7);
-  assert.equal(result.recipes.length, 5);
+  assert.equal(result.recipes.length, 4);
 });
 
 test("must-use ingredients drop non-matching recipes when the pool is large enough", async () => {
@@ -856,7 +836,6 @@ test("must-use ingredients drop non-matching recipes when the pool is large enou
     result.recipes.map(({ title }) => title).sort(),
     chickenTitles.slice().sort()
   );
-  assert.equal(result.meta.requestedFallbackUsed, false);
   assert.equal(result.meta.candidatesMissingRequested, 2);
   assert.equal(result.meta.requiredIngredientCount, 1);
   assert.match(queries[0], /^using chicken\b/i);
@@ -910,7 +889,6 @@ test("a single UI-selected fridge item is treated as a required ingredient", asy
   const titles = result.recipes.map(({ title }) => title);
   assert.ok(titles.every((title) => title.startsWith("Chicken Skillet")));
   assert.equal(result.meta.candidatesMissingRequested, 1);
-  assert.equal(result.meta.requestedFallbackUsed, false);
 });
 
 test("multi-selected fridge items stay a soft as-many-as-practical preference", async () => {
@@ -949,7 +927,6 @@ test("multi-selected fridge items stay a soft as-many-as-practical preference", 
 
   assert.equal(result.recipes[0].title, "Chicken Rice Bowl");
   assert.equal(result.meta.requiredIngredientCount, 0);
-  assert.equal(result.meta.requestedFallbackUsed, false);
   assert.equal(result.meta.candidatesMissingRequested, 0);
 });
 

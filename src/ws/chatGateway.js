@@ -66,10 +66,6 @@ import {
   SUBSCRIBER_MAX_RESULT_COUNT,
 } from "../chat/recipeRecommendations.js";
 import { compactRecipeResultsForChat } from "../chat/recipeCompact.js";
-import {
-  getRecentRecipeUrls,
-  recordRecipeUrls,
-} from "../chat/recipeHistoryStore.js";
 
 let activeChatRequests = 0;
 const activeChatRequestsByUser = new Map();
@@ -938,20 +934,6 @@ export function attachChatGateway(
               toolResult &&
               Array.isArray(toolResult.recipes)
             ) {
-              if (state.db && state.ownerKey) {
-                try {
-                  await recordRecipeUrls(
-                    state.db,
-                    { ownerType: state.ownerType, ownerKey: state.ownerKey },
-                    toolResult.recipes
-                  );
-                } catch (error) {
-                  console.warn(
-                    "[recipeHistory]",
-                    error?.message || error
-                  );
-                }
-              }
               enrichedToolMsgs.push({
                 ...toolMsg,
                 content: JSON.stringify(
@@ -1356,13 +1338,6 @@ export function attachChatGateway(
           ? "recipe_recommendation"
           : "chat";
       const recipeContext = sanitizeRecipeContext(msg.recipeContext);
-      const recentRecipeUrls = await getRecentRecipeUrls(db, {
-        ownerType,
-        ownerKey,
-      });
-      if (recentRecipeUrls.length > 0) {
-        recipeContext.excludeRecipeUrls = recentRecipeUrls;
-      }
 
       // SQLite-backed token budget enforcement (trial)
       // const db = await getDb();

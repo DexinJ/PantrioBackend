@@ -12,8 +12,12 @@ const COOKING_METHODS = new Set([
   "stovetop",
   "oven",
 ]);
-const MAX_RESULT_COUNT = 10;
-const DEFAULT_RESULT_COUNT = 5;
+const MAX_RESULT_COUNT = 4;
+const DEFAULT_RESULT_COUNT = 4;
+// How many viable candidates to gather before picking the final short list.
+// Selection returns at most MAX_RESULT_COUNT, but search keeps going until
+// roughly this many required/viable recipes are available (or the budget ends).
+const CANDIDATE_POOL_TARGET = 10;
 // Search work is not charged against the user's token quota, so there is no
 // entitlement-specific search budget. These limits are server safety rails
 // (latency/load) only; entitlement now controls just the result-count cap.
@@ -31,11 +35,10 @@ const DEFAULT_LIMITS = SAFETY_LIMITS;
 const LIMIT_CEILINGS = SAFETY_LIMITS;
 
 // Kept as a stable export for callers that historically differentiated
-// entitlement budgets. Subscribers and free users now share one budget;
-// only SUBSCRIBER_MAX_RESULT_COUNT / FREE_MAX_RESULT_COUNT differ.
+// entitlement budgets. The short list is capped at 4 for every entitlement.
 export const SUBSCRIBER_RECIPE_LIMITS = Object.freeze({ ...SAFETY_LIMITS });
-export const SUBSCRIBER_MAX_RESULT_COUNT = 10;
-export const FREE_MAX_RESULT_COUNT = 6;
+export const SUBSCRIBER_MAX_RESULT_COUNT = MAX_RESULT_COUNT;
+export const FREE_MAX_RESULT_COUNT = MAX_RESULT_COUNT;
 
 const TERM_STOP_WORDS = new Set([
   "a",
@@ -457,23 +460,8 @@ function normalizeInputs(
     [...selectedIngredients, ...normalizeInventory(recipeContext)],
     { maxItems: 80, maxLength: 100 }
   );
-  const excludedUrls = new Set();
-  for (const entry of Array.isArray(recipeContext?.excludeRecipeUrls)
-    ? recipeContext.excludeRecipeUrls.slice(0, 100)
-    : []) {
-    if (typeof entry !== "string") continue;
-    try {
-      const url = new URL(entry);
-      if (!new Set(["http:", "https:"]).has(url.protocol)) continue;
-    } catch {
-      continue;
-    }
-    excludedUrls.add(canonicalUrl(entry));
-  }
-
   return {
     inventory,
-    excludedUrls,
     selectedIngredients,
     mustUseIngredients,
     requestedIngredients,
@@ -497,8 +485,7 @@ function normalizeInputs(
       (personalizationEnabled
         ? boundedInteger(saved?.defaultServings, { min: 1, max: 12 })
         : null),
-    // Clamp to the entitlement tier rather than silently defaulting, so a
-    // free user asking for 10 recipes gets 6 (not 5).
+    // Clamp to the product cap (3-4) rather than silently defaulting.
     resultCount:
       requestedCount == null
         ? DEFAULT_RESULT_COUNT
@@ -1044,11 +1031,10 @@ function ingredientMatches(recipe, inputs) {
   const inventoryMatch = matchItemsToRecipe(recipe, inputs.inventory);
   const used = [];
   used.push(...inventoryMatch.matched);
-  const relevantIngredients = recipe.ingredients.filter(
-    (ingredient) =>
-      ![...PANTRY_STAPLES].some((staple) => termMatchesIngredient(staple, ingredient))
-  );
-  const denominator = Math.max(1, Math.min(10, relevantIngredients.length));
+  // Fridge affinity is measured against the items the user actually has, not
+  // the recipe's ingredient count, so a recipe that uses 3 of 5 fridge items
+  // outranks one that only uses the single required target.
+  const inventorySize = Math.max(1, Math.min(10, inputs.inventory.length));
   const requestedMatch = matchItemsToRecipe(recipe, inputs.requestedIngredients);
   const selectedMatch = matchItemsToRecipe(recipe, inputs.selectedIngredients);
   const mustUseMatch = matchItemsToRecipe(recipe, inputs.mustUseIngredients);
@@ -1069,7 +1055,10 @@ function ingredientMatches(recipe, inputs) {
         (_ingredient, index) => !inventoryMatch.matchedIngredientIndexes.has(index)
       )
       .slice(0, 30),
-    score: Math.min(1, used.length / denominator),
+    score:
+      inputs.inventory.length > 0
+        ? Math.min(1, used.length / inventorySize)
+        : 0.5,
     requestedScore,
     matchedRequestedIngredients: requestedMatch.matched.slice(0, 40),
     unmatchedRequestedIngredients: inputs.requestedIngredients
@@ -1193,8 +1182,8 @@ function scoreCandidates(recipes, inputs) {
     const baseScore = inputs.requestedIngredients.length
       ? breakdown.cuisine * 0.18 +
         breakdown.energy * 0.1 +
-        breakdown.ingredients * 0.17 +
-        breakdown.requestedIngredients * 0.35 +
+        breakdown.ingredients * 0.24 +
+        breakdown.requestedIngredients * 0.28 +
         breakdown.time * 0.1 +
         breakdown.mealType * 0.15 +
         breakdown.quality * 0.1
@@ -1388,7 +1377,6 @@ function filterMissingRequested(recipes, inputs) {
     return {
       pool: recipes,
       required,
-      usedFallback: false,
       missingDropped: 0,
       missingTotal: 0,
     };
@@ -1399,21 +1387,12 @@ function filterMissingRequested(recipes, inputs) {
     if (requiredCoverage(recipe, required).score >= 1) matches.push(recipe);
     else missingTotal += 1;
   }
-  const minimum = Math.min(inputs.resultCount, recipes.length);
-  if (matches.length >= minimum) {
-    return {
-      pool: matches,
-      required,
-      usedFallback: false,
-      missingDropped: missingTotal,
-      missingTotal,
-    };
-  }
+  // The requested/target ingredient is a hard requirement: never pad the
+  // short list with recipes that omit it, even when few matches exist.
   return {
-    pool: recipes,
+    pool: matches,
     required,
-    usedFallback: true,
-    missingDropped: 0,
+    missingDropped: missingTotal,
     missingTotal,
   };
 }
@@ -1436,7 +1415,6 @@ function selectDiverse(candidates, count) {
         (hashString(`${recipe.url}|${dayBucket}`) % 200 - 100) / 100_000;
       const adjusted =
         recipe.score -
-        (recipe._reused ? 0.2 : 0) -
         overlap * 0.25 -
         domainCount * 0.1 -
         cuisineCount * 0.035 +
@@ -1462,7 +1440,7 @@ function selectDiverse(candidates, count) {
 }
 
 function publicRecipe(recipe) {
-  const { _index, _tokenSet, _reused, ...output } = recipe;
+  const { _index, _tokenSet, ...output } = recipe;
   return {
     ...output,
     ingredients: (output.ingredients || []).slice(0, 30),
@@ -1575,7 +1553,7 @@ export async function recommendRecipes(
               (recipe) => requiredCoverage(recipe, required).score >= 1
             ).length
           : constrainedWave.recipes.length;
-      if (usableRequired >= inputs.resultCount) break;
+      if (usableRequired >= CANDIDATE_POOL_TARGET) break;
     }
     if (aggregate.failedPages > 0) {
       pushWarning(
@@ -1656,16 +1634,7 @@ export async function recommendRecipes(
       constraintRules
     );
     const deduped = dedupeCandidates(scoreCandidates(constrained.recipes, inputs));
-    const seenCandidates = deduped.filter((recipe) =>
-      inputs.excludedUrls.has(canonicalUrl(recipe.url))
-    );
-    const flagged = deduped.map((recipe) =>
-      inputs.excludedUrls.has(canonicalUrl(recipe.url))
-        ? { ...recipe, _reused: true }
-        : recipe
-    );
-    let pool = flagged.filter((recipe) => !recipe._reused);
-    if (pool.length < inputs.resultCount) pool = flagged;
+    let pool = deduped;
     const mealFiltered = filterMealTypeMismatches(pool, inputs);
     if (mealFiltered.length >= Math.min(inputs.resultCount, pool.length)) {
       pool = mealFiltered;
@@ -1673,16 +1642,21 @@ export async function recommendRecipes(
     const requestedGate = filterMissingRequested(pool, inputs);
     pool = requestedGate.pool;
     const selectedRaw = selectDiverse(pool, inputs.resultCount);
-    const reusedInResults = selectedRaw.filter((recipe) => recipe._reused).length;
-    const missingRequestedInResults =
-      requestedGate.required.length > 0
-        ? selectedRaw.filter(
-            (recipe) =>
-              requiredCoverage(recipe, requestedGate.required).score < 1
-          ).length
-        : 0;
     const selected = selectedRaw.map(publicRecipe);
-    if (selected.length === 0) {
+    if (
+      requestedGate.required.length > 0 &&
+      requestedGate.pool.length === 0 &&
+      requestedGate.missingTotal > 0
+    ) {
+      pushWarning(
+        warnings,
+        warning(
+          "NO_TARGET_INGREDIENT",
+          `No recipes containing ${requestedGate.required.join(", ")} were found.`
+        )
+      );
+    }
+    if (selected.length === 0 && requestedGate.required.length === 0) {
       pushWarning(
         warnings,
         warning(
@@ -1690,27 +1664,6 @@ export async function recommendRecipes(
           constraintRules.length > 0
             ? "Every fetched recipe contained an excluded ingredient, allergen, or dietary conflict."
             : "No structured recipes could be extracted from the fetched pages."
-        )
-      );
-    }
-    if (reusedInResults > 0) {
-      pushWarning(
-        warnings,
-        warning(
-          "RECENTLY_SHOWN_REUSED",
-          "Few new recipes were found, so some recently shown recipes were included with lower priority."
-        )
-      );
-    }
-    if (missingRequestedInResults > 0) {
-      const requiredLabel = requestedGate.required.join(", ");
-      pushWarning(
-        warnings,
-        warning(
-          "REQUESTED_INGREDIENT_FALLBACK",
-          `Few recipes using ${requiredLabel} were found; some suggestions may not include ${
-            requestedGate.required.length === 1 ? "it" : "them"
-          }.`
         )
       );
     }
@@ -1725,16 +1678,12 @@ export async function recommendRecipes(
         pagesFetched: aggregate.fetchedPages,
         candidatesParsed: aggregate.recipes.length,
         candidatesAfterHardConstraints: constrained.recipes.length,
+        candidatePoolTarget: CANDIDATE_POOL_TARGET,
         returnedCount: selected.length,
         estimatedCount,
         estimationFailedCount,
-        seenUrlsProvided: inputs.excludedUrls.size,
-        seenCandidatesExcluded: seenCandidates.length,
-        recentlyShownReused: reusedInResults,
         requiredIngredientCount: requestedGate.required.length,
         candidatesMissingRequested: requestedGate.missingTotal,
-        requestedFallbackUsed: requestedGate.usedFallback,
-        missingRequestedInResults,
         filtered: constrained.stats,
         applied: {
           cuisines:

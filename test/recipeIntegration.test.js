@@ -69,7 +69,7 @@ test("recommendRecipes tool passes trusted context and bounded network dependenc
   assert.equal(received[2].search, search);
   assert.equal(received[2].fetchPage, fetchPage);
   assert.equal(received[2].signal, controller.signal);
-  assert.equal(received[2].maxResultCount, 6);
+  assert.equal(received[2].maxResultCount, 4);
   assert.equal(typeof TOOLS.recommendRecipes, "function");
 });
 
@@ -129,7 +129,7 @@ test("recipe recommendation handler forwards the parity payload and dependencies
   assert.equal(received[2].fetchPage, fetchPage);
   assert.equal(received[2].signal instanceof AbortSignal, true);
   assert.equal(received[2].signal.aborted, false);
-  assert.equal(received[2].maxResultCount, 6);
+  assert.equal(received[2].maxResultCount, 4);
   assert.equal(received[2].limits, undefined);
   assert.equal(req.listenerCount("aborted"), 0);
   assert.equal(res.listenerCount("close"), 0);
@@ -156,7 +156,7 @@ test("recipe recommendation handler caps results by entitlement with a shared se
   await handler(req, res);
 
   assert.equal(res.statusCode, 200);
-  assert.equal(received[2].maxResultCount, 10);
+  assert.equal(received[2].maxResultCount, 4);
   assert.equal(received[2].limits, undefined);
 });
 

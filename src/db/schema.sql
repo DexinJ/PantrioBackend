@@ -159,8 +159,8 @@ CREATE TABLE IF NOT EXISTS usage_daily (
   UNIQUE(owner_type, owner_key, day_key)
 );
 
--- Recipes previously returned to a user so repeat requests can avoid them
--- (re-admitted with a penalty only when few new recipes are available).
+-- Legacy table kept for schema stability. Recipe history is no longer read
+-- or written; every request searches fresh and repeats are allowed.
 CREATE TABLE IF NOT EXISTS recipe_history (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   owner_type TEXT NOT NULL CHECK(owner_type IN ('user','trial')),

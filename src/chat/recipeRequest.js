@@ -69,35 +69,6 @@ function cleanStringArray(value, maxItems = 30) {
   return result;
 }
 
-function cleanUrlArray(value, maxItems = 100) {
-  const seen = new Set();
-  const result = [];
-  for (const entry of Array.isArray(value) ? value.slice(0, maxItems * 4) : []) {
-    const raw = typeof entry === "string" ? entry.trim().slice(0, 2_000) : "";
-    if (!raw) continue;
-    let url;
-    try {
-      url = new URL(raw);
-    } catch {
-      continue;
-    }
-    if (
-      !new Set(["http:", "https:"]).has(url.protocol) ||
-      url.username ||
-      url.password
-    ) {
-      continue;
-    }
-    url.hash = "";
-    const key = url.href;
-    if (seen.has(key)) continue;
-    seen.add(key);
-    result.push(url.href);
-    if (result.length >= maxItems) break;
-  }
-  return result;
-}
-
 function cleanNullableInteger(value, min, max) {
   if (value === null) return null;
   const numeric = Number(value);
@@ -198,7 +169,6 @@ export function sanitizeRecipeContext(value) {
       source.selectedIngredients,
       MAX_SELECTED_INGREDIENTS
     ),
-    excludeRecipeUrls: cleanUrlArray(source.excludeRecipeUrls, 100),
     preferences: {
       schemaVersion: 1,
       explicit: {

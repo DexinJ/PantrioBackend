@@ -303,7 +303,7 @@ export const RECOMMEND_RECIPES_TOOL = {
   function: {
     name: "recommendRecipes",
     description:
-      "Find and rank real recipes using the user's trusted fridge inventory and saved recipe preferences. Use this for recipe ideas, meal ideas, or 'what can I cook?' requests. Call it once per user request. A follow-up after a previous recipe answer is a NEW request: pass only constraints from the latest user message. Recipes shown recently are re-admitted with low priority only when few new options exist. Put only constraints stated for the current request in the arguments; saved defaults and fridge items are supplied separately by the app.",
+      "Find and rank real recipes using the user's trusted fridge inventory and saved recipe preferences. Search fresh on every request and never avoid a recipe because it was shown before. Use this for recipe ideas, meal ideas, or 'what can I cook?' requests. Call it once per user request. A follow-up after a previous recipe answer is a NEW request: pass only constraints from the latest user message. If the user names an ingredient to use (or a single fridge item is selected), only return recipes that contain it. Put only constraints stated for the current request in the arguments; saved defaults and fridge items are supplied separately by the app.",
     parameters: {
       type: "object",
       properties: {
@@ -395,9 +395,9 @@ export const RECOMMEND_RECIPES_TOOL = {
         resultCount: {
           type: "integer",
           minimum: 1,
-          maximum: 10,
+          maximum: 4,
           description:
-            "Number of recipe suggestions requested (1-10, entitlement-gated). Default is 5.",
+            "Number of recipe suggestions requested (1-4; default 4).",
         },
       },
       additionalProperties: false,

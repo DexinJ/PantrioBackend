@@ -97,7 +97,6 @@ test("invalid recipe context fails closed to bounded defaults", () => {
   assert.deepEqual(sanitizeRecipeContext(["not", "an", "object"]), {
     inventory: [],
     selectedIngredients: [],
-    excludeRecipeUrls: [],
     preferences: {
       schemaVersion: 1,
       explicit: {
@@ -118,32 +117,14 @@ test("invalid recipe context fails closed to bounded defaults", () => {
   });
 });
 
-test("recipe context sanitization bounds and cleans excludeRecipeUrls", () => {
-  const urls = Array.from(
-    { length: 120 },
-    (_, index) => `https://history.example/r${index}`
-  );
+test("recipe context sanitization drops legacy excludeRecipeUrls", () => {
   const context = sanitizeRecipeContext({
     inventory: [],
     selectedIngredients: [],
-    excludeRecipeUrls: [
-      "ftp://blocked.example/file",
-      "https://user:pass@history.example/creds",
-      "https://history.example/ok#section",
-      ...urls,
-    ],
+    excludeRecipeUrls: ["https://history.example/ok"],
   });
 
-  assert.equal(context.excludeRecipeUrls.length, 100);
-  assert.ok(context.excludeRecipeUrls.every((url) => url.startsWith("https://")));
-  assert.ok(
-    context.excludeRecipeUrls.every(
-      (url) => !/@/.test(url) && !url.includes("#")
-    )
-  );
-  assert.ok(
-    context.excludeRecipeUrls.includes("https://history.example/ok")
-  );
+  assert.equal("excludeRecipeUrls" in context, false);
 });
 
 test("conversation-aware follow-up detection covers short and non-English meal asks", () => {

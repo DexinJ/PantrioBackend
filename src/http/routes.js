@@ -31,10 +31,6 @@ import {
   recommendRecipes as runRecipeRecommendations,
 } from "../chat/recipeRecommendations.js";
 import { compactRecipeResultsForChat } from "../chat/recipeCompact.js";
-import {
-  getRecentRecipeUrls,
-  recordRecipeUrls,
-} from "../chat/recipeHistoryStore.js";
 import { fetchPublicTextPage } from "../chat/safeWebFetch.js";
 import { TOOLS } from "../chat/tools.js";
 import {
@@ -432,14 +428,6 @@ export function createRecipeRecommendationHandler({
     const abortScope = createRecipeRequestAbortScope(req, res);
     try {
       const safeRecipeContext = sanitizeRecipeContextFn(recipeContext);
-      const db = await getDbFn();
-      const recentRecipeUrls = await getRecentRecipeUrls(db, {
-        ownerType: "user",
-        ownerKey: req.authenticatedUser.uid,
-      });
-      if (recentRecipeUrls.length > 0) {
-        safeRecipeContext.excludeRecipeUrls = recentRecipeUrls;
-      }
       const { active } = await resolveEntitlement(req);
       const result = await recommendRecipesFn(overrides, safeRecipeContext, {
         search,
@@ -451,18 +439,6 @@ export function createRecipeRecommendationHandler({
           ? SUBSCRIBER_MAX_RESULT_COUNT
           : FREE_MAX_RESULT_COUNT,
       });
-      if (abortScope.signal.aborted || res.headersSent) return;
-      if (Array.isArray(result?.recipes) && result.recipes.length > 0) {
-        try {
-          await recordRecipeUrls(
-            db,
-            { ownerType: "user", ownerKey: req.authenticatedUser.uid },
-            result.recipes
-          );
-        } catch (error) {
-          logErrorMetadata("[POST /api/recipes/recommend] history", error);
-        }
-      }
       if (abortScope.signal.aborted || res.headersSent) return;
       return res.json(
         body?.compactForChat === true
