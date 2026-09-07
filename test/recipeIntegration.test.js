@@ -131,8 +131,44 @@ test("recipe recommendation handler forwards the parity payload and dependencies
   assert.equal(received[2].signal.aborted, false);
   assert.equal(received[2].maxResultCount, 4);
   assert.equal(received[2].limits, undefined);
+  assert.equal(received[2].ideationEnabled, false);
+  assert.equal(typeof received[2].ideate, "function");
   assert.equal(req.listenerCount("aborted"), 0);
   assert.equal(res.listenerCount("close"), 0);
+});
+
+test("recipe recommendation handler forwards the ideation dependency and flag", async () => {
+  const expected = { recipes: [{ title: "Dinner" }], warnings: [] };
+  let received;
+  const ideate = async () => ({
+    ideas: [
+      {
+        dish: "Yogurt chicken",
+        query: "yogurt chicken recipe",
+        coreIngredients: ["chicken", "yogurt"],
+      },
+    ],
+  });
+  const handler = createRecipeRecommendationHandler({
+    search: async () => ({ results: [] }),
+    fetchPage: async () => ({ text: "", url: "https://example.com" }),
+    getDbFn: async () => memoryDb(),
+    resolveEntitlementFn: async () => ({ active: false }),
+    ideate,
+    ideationEnabled: true,
+    recommendRecipesFn: async (...args) => {
+      received = args;
+      return expected;
+    },
+  });
+  const req = request({ body: { overrides: {}, recipeContext: {} } });
+  const res = response();
+
+  await handler(req, res);
+
+  assert.equal(res.statusCode, 200);
+  assert.equal(received[2].ideate, ideate);
+  assert.equal(received[2].ideationEnabled, true);
 });
 
 test("recipe recommendation handler caps results by entitlement with a shared search budget", async () => {

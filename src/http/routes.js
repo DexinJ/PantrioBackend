@@ -37,6 +37,10 @@ import {
   estimateAndApplyRecipeMetadata,
   recipeEstimationEnabled,
 } from "../chat/recipeEstimation.js";
+import {
+  generateRecipeIdeas as runRecipeIdeation,
+  recipeIdeationEnabled,
+} from "../chat/recipeIdeation.js";
 import { sanitizeRecipeContext } from "../chat/recipeRequest.js";
 import {
   SubscriptionStatusValidationError,
@@ -367,6 +371,8 @@ export function createRecipeRecommendationHandler({
   sanitizeRecipeContextFn = sanitizeRecipeContext,
   estimateMeta = estimateAndApplyRecipeMetadata,
   estimationEnabled = recipeEstimationEnabled(),
+  ideate = runRecipeIdeation,
+  ideationEnabled = recipeIdeationEnabled(),
   resolveEntitlementFn,
   getDbFn = getDb,
 } = {}) {
@@ -384,6 +390,9 @@ export function createRecipeRecommendationHandler({
   }
   if (typeof estimateMeta !== "function") {
     throw new TypeError("estimateMeta must be a function");
+  }
+  if (typeof ideate !== "function") {
+    throw new TypeError("ideate must be a function");
   }
   const resolveEntitlement =
     typeof resolveEntitlementFn === "function"
@@ -435,6 +444,8 @@ export function createRecipeRecommendationHandler({
         signal: abortScope.signal,
         estimateMeta,
         estimationEnabled,
+        ideate,
+        ideationEnabled,
         maxResultCount: active
           ? SUBSCRIBER_MAX_RESULT_COUNT
           : FREE_MAX_RESULT_COUNT,

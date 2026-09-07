@@ -14,6 +14,8 @@ const COOKING_METHODS = new Set([
 ]);
 const MAX_RESULT_COUNT = 4;
 const DEFAULT_RESULT_COUNT = 4;
+const MAX_IDEATION_IDEAS = 5;
+const IDEA_MATCH_WEIGHT = 0.25;
 // How many viable candidates to gather before picking the final short list.
 // Selection returns at most MAX_RESULT_COUNT, but search keeps going until
 // roughly this many required/viable recipes are available (or the budget ends).
@@ -1107,9 +1109,13 @@ function buildWhyRecommended(
   recipe,
   inputs,
   usedIngredients,
-  matchedRequestedIngredients
+  matchedRequestedIngredients,
+  ideaMatch = null
 ) {
   const reasons = [];
+  if (ideaMatch && ideaMatch.dish && ideaMatch.matched > 0) {
+    reasons.push(`backs your fridge idea: ${ideaMatch.dish}`);
+  }
   if (matchedRequestedIngredients.length > 0) {
     reasons.push(
       `Uses ${matchedRequestedIngredients.slice(0, 3).join(", ")} as requested`
@@ -1140,7 +1146,47 @@ function buildWhyRecommended(
   return `${sentence[0].toUpperCase()}${sentence.slice(1)}.`;
 }
 
-function scoreCandidates(recipes, inputs) {
+function ideaCoreOverlap(recipe, idea) {
+  const ingredients = Array.isArray(recipe.ingredients) ? recipe.ingredients : [];
+  let matched = 0;
+  for (const core of idea.coreIngredients || []) {
+    if (ingredients.some((ingredient) => termMatchesIngredient(core, ingredient))) {
+      matched += 1;
+    }
+  }
+  const total = Math.max(1, (idea.coreIngredients || []).length);
+  return { matched, total, fraction: matched / total };
+}
+
+// An idea is "backed" only when a real recipe contains a meaningful share of
+// its core ingredients: at least 2 for multi-ingredient ideas, or the single
+// core ingredient for one-ingredient ideas. Partial overlap (e.g. a smoothie
+// that merely shares yogurt) must never be presented as backing a
+// "yogurt chicken" idea.
+function ideaQualifies(overlap) {
+  const required = Math.min(2, overlap.total);
+  return overlap.matched >= required;
+}
+
+// Best qualifying idea match across the candidate list. Recipes not backing
+// any idea score 0.
+function bestIdeaMatch(recipe, ideas) {
+  if (!Array.isArray(ideas) || ideas.length === 0) {
+    return { score: 0, matched: 0, dish: null, query: null };
+  }
+  let best = { score: 0, matched: 0, dish: null, query: null };
+  for (const idea of ideas) {
+    const overlap = ideaCoreOverlap(recipe, idea);
+    if (overlap.matched === 0 || !ideaQualifies(overlap)) continue;
+    const score = overlap.fraction;
+    if (score > best.score) {
+      best = { score, matched: overlap.matched, dish: idea.dish, query: idea.query };
+    }
+  }
+  return best;
+}
+
+function scoreCandidates(recipes, inputs, ideas = []) {
   const mealTypeBucket = canonicalMealType(inputs.mealType);
   const required = effectiveRequiredIngredients(inputs);
   return recipes.map((recipe, index) => {
@@ -1165,6 +1211,8 @@ function scoreCandidates(recipes, inputs) {
       inputs.maxCaloriesPerServing
     );
     const timeLimit = timeLimitPenalty(recipe, inputs.maxPrepMinutes);
+    const ideaMatch = bestIdeaMatch(recipe, ideas);
+    const hasIdeas = Array.isArray(ideas) && ideas.length > 0;
     const breakdown = {
       cuisine: cuisineScore(recipe, inputs),
       energy: energyScore(recipe, inputs.energyPreference),
@@ -1179,6 +1227,8 @@ function scoreCandidates(recipes, inputs) {
       dislikedIngredientPenalty: dislikes.dislikedIngredientPenalty,
       ingredientCountPenalty,
     };
+    if (hasIdeas) breakdown.ideaMatch = ideaMatch.score;
+    const ideaBonus = hasIdeas ? (breakdown.ideaMatch ?? 0) * IDEA_MATCH_WEIGHT : 0;
     const baseScore = inputs.requestedIngredients.length
       ? breakdown.cuisine * 0.18 +
         breakdown.energy * 0.1 +
@@ -1186,12 +1236,14 @@ function scoreCandidates(recipes, inputs) {
         breakdown.requestedIngredients * 0.28 +
         breakdown.time * 0.1 +
         breakdown.mealType * 0.15 +
+        ideaBonus +
         breakdown.quality * 0.1
       : breakdown.cuisine * 0.28 +
         breakdown.energy * 0.15 +
         breakdown.ingredients * 0.32 +
         breakdown.time * 0.15 +
         breakdown.mealType * 0.15 +
+        ideaBonus +
         breakdown.quality * 0.1;
     const score = Math.max(
       0,
@@ -1210,11 +1262,19 @@ function scoreCandidates(recipes, inputs) {
       scoreBreakdown: Object.fromEntries(
         Object.entries(breakdown).map(([key, value]) => [key, rounded(value)])
       ),
+      ...(hasIdeas
+        ? {
+            ideaMatch: rounded(ideaMatch.score),
+            ideaDish: ideaMatch.dish,
+            ideaQuery: ideaMatch.query,
+          }
+        : {}),
       whyRecommended: buildWhyRecommended(
         recipe,
         inputs,
         ingredients.usedIngredients,
-        ingredients.matchedRequestedIngredients
+        ingredients.matchedRequestedIngredients,
+        ideaMatch
       ),
       _index: index,
     };
@@ -1309,6 +1369,49 @@ function buildQueryPlan(inputs, maxQueries) {
   return plan.slice(0, maxQueries);
 }
 
+// Validates and bounds LLM-generated dish ideas before they shape any query.
+// An idea is only usable when it has a display name, a concrete search query,
+// and at least one canonical-English core ingredient to verify against.
+function normalizeIdeaPlan(ideas) {
+  if (!Array.isArray(ideas)) return [];
+  const plan = [];
+  const seenQueries = new Set();
+  for (const entry of ideas) {
+    if (!entry || typeof entry !== "object" || Array.isArray(entry)) continue;
+    const dish = clip(entry.dish, 100);
+    const query = clip(entry.query, 200);
+    if (!dish || !query) continue;
+    const key = normalizeText(query);
+    if (!key || seenQueries.has(key)) continue;
+    seenQueries.add(key);
+    const coreIngredients = normalizedStringList(entry.coreIngredients, {
+      maxItems: 4,
+      maxLength: 60,
+    });
+    if (coreIngredients.length === 0) continue;
+    plan.push({ dish, query, coreIngredients });
+    if (plan.length >= MAX_IDEATION_IDEAS) break;
+  }
+  return plan;
+}
+
+// Idea-driven queries always come first; legacy widening fills the remaining
+// budget so the engine never searches less than it would without ideation.
+function buildIdeaQueryPlan(ideaPlan, legacyPlan, maxQueries) {
+  if (!Array.isArray(ideaPlan) || ideaPlan.length === 0) return legacyPlan;
+  const plan = [];
+  for (const idea of ideaPlan) {
+    const query = clip(idea.query, 300);
+    if (query && !plan.includes(query)) plan.push(query);
+    if (plan.length >= maxQueries) break;
+  }
+  for (const query of Array.isArray(legacyPlan) ? legacyPlan : []) {
+    if (plan.length >= maxQueries) break;
+    if (!plan.includes(query)) plan.push(query);
+  }
+  return plan.slice(0, maxQueries);
+}
+
 function ingredientTokenSet(recipe) {
   const tokens = new Set();
   for (const ingredient of recipe.ingredients || []) {
@@ -1397,6 +1500,30 @@ function filterMissingRequested(recipes, inputs) {
   };
 }
 
+// Idea verification is a preference, never a hard exclusion: when the user
+// named a meal type, any recipe that fully backs a generated idea wins the
+// pool outright (fewer, correct results beat padding with the wrong meal).
+// Without a meal type, the pool narrows only when enough verified matches
+// exist. Otherwise the full pool is kept so the request never regresses to an
+// empty answer.
+function applyIdeaVerification(recipes, ideaPlan, inputs) {
+  if (!Array.isArray(ideaPlan) || ideaPlan.length === 0) {
+    return { pool: recipes, verified: 0, fallback: true };
+  }
+  const verified = recipes.filter(
+    (recipe) => Number(recipe?.ideaMatch ?? 0) >= 0.5
+  );
+  const minimum = Math.min(inputs.resultCount, recipes.length);
+  const mealBucket = canonicalMealType(inputs.mealType);
+  if (mealBucket && verified.length > 0) {
+    return { pool: verified, verified: verified.length, fallback: false };
+  }
+  if (verified.length >= minimum) {
+    return { pool: verified, verified: verified.length, fallback: false };
+  }
+  return { pool: recipes, verified: verified.length, fallback: true };
+}
+
 function selectDiverse(candidates, count) {
   const remaining = [...candidates];
   const selected = [];
@@ -1478,6 +1605,8 @@ export async function recommendRecipes(
     limits: requestedLimits,
     estimateMeta,
     estimationEnabled = false,
+    ideate,
+    ideationEnabled = false,
     maxResultCount = MAX_RESULT_COUNT,
   } = {}
 ) {
@@ -1502,7 +1631,25 @@ export async function recommendRecipes(
 
   try {
     assertNotAborted(deadline);
-    const queryPlan = buildQueryPlan(inputs, limits.maxSearchQueries);
+    let ideaPlan = null;
+    if (ideationEnabled && typeof ideate === "function") {
+      const ideaResult = await awaitAbortable(
+        () => Promise.resolve(ideate(inputs, { signal: deadline.signal })),
+        deadline
+      ).catch((error) => {
+        if (deadline.signal.aborted) throw error;
+        return null;
+      });
+      const normalized =
+        ideaResult && Array.isArray(ideaResult.ideas)
+          ? normalizeIdeaPlan(ideaResult.ideas)
+          : [];
+      if (normalized.length > 0) ideaPlan = normalized;
+    }
+    const legacyPlan = buildQueryPlan(inputs, limits.maxSearchQueries);
+    const queryPlan = ideaPlan
+      ? buildIdeaQueryPlan(ideaPlan, legacyPlan, limits.maxSearchQueries)
+      : legacyPlan;
     const seenUrls = new Set();
     const aggregate = {
       pages: [],
@@ -1633,39 +1780,60 @@ export async function recommendRecipes(
       inputs,
       constraintRules
     );
-    const deduped = dedupeCandidates(scoreCandidates(constrained.recipes, inputs));
+    const deduped = dedupeCandidates(
+      scoreCandidates(constrained.recipes, inputs, ideaPlan || [])
+    );
     let pool = deduped;
     const mealFiltered = filterMealTypeMismatches(pool, inputs);
     if (mealFiltered.length >= Math.min(inputs.resultCount, pool.length)) {
       pool = mealFiltered;
     }
+    const preGatePool = pool;
     const requestedGate = filterMissingRequested(pool, inputs);
     pool = requestedGate.pool;
-    const selectedRaw = selectDiverse(pool, inputs.resultCount);
-    const selected = selectedRaw.map(publicRecipe);
+    let ideaRelaxedRequired = false;
     if (
+      ideaPlan &&
+      ideaPlan.length > 0 &&
       requestedGate.required.length > 0 &&
       requestedGate.pool.length === 0 &&
       requestedGate.missingTotal > 0
     ) {
-      pushWarning(
-        warnings,
-        warning(
-          "NO_TARGET_INGREDIENT",
-          `No recipes containing ${requestedGate.required.join(", ")} were found.`
-        )
-      );
+      // The requested ingredient could not be matched against any real
+      // ingredient list (for example a Chinese dish name the English token
+      // pipeline cannot compare). When a generated idea's canonical core
+      // ingredients DO match real recipes, those recipes satisfy the user's
+      // intent and keep the request from returning empty.
+      const relaxed = applyIdeaVerification(preGatePool, ideaPlan, inputs);
+      if (relaxed.pool.length > 0) {
+        pool = relaxed.pool;
+        ideaRelaxedRequired = true;
+      }
     }
-    if (selected.length === 0 && requestedGate.required.length === 0) {
-      pushWarning(
-        warnings,
-        warning(
-          "NO_MATCHING_RECIPES",
-          constraintRules.length > 0
-            ? "Every fetched recipe contained an excluded ingredient, allergen, or dietary conflict."
-            : "No structured recipes could be extracted from the fetched pages."
-        )
-      );
+    const ideaGate = applyIdeaVerification(pool, ideaPlan, inputs);
+    pool = ideaGate.pool;
+    const selectedRaw = selectDiverse(pool, inputs.resultCount);
+    const selected = selectedRaw.map(publicRecipe);
+    if (selected.length === 0) {
+      if (requestedGate.required.length > 0) {
+        pushWarning(
+          warnings,
+          warning(
+            "NO_TARGET_INGREDIENT",
+            `No recipes containing ${requestedGate.required.join(", ")} were found.`
+          )
+        );
+      } else {
+        pushWarning(
+          warnings,
+          warning(
+            "NO_MATCHING_RECIPES",
+            constraintRules.length > 0
+              ? "Every fetched recipe contained an excluded ingredient, allergen, or dietary conflict."
+              : "No structured recipes could be extracted from the fetched pages."
+          )
+        );
+      }
     }
 
     return {
@@ -1680,6 +1848,17 @@ export async function recommendRecipes(
         candidatesAfterHardConstraints: constrained.recipes.length,
         candidatePoolTarget: CANDIDATE_POOL_TARGET,
         returnedCount: selected.length,
+        ...(ideationEnabled || ideaPlan
+          ? {
+              ideation: {
+                enabled: ideationEnabled && typeof ideate === "function",
+                ideaCount: ideaPlan ? ideaPlan.length : 0,
+                ideaVerifiedCount: ideaGate.verified,
+                ideaFallbackUsed: ideaGate.fallback === true,
+                ideaRelaxedRequired,
+              },
+            }
+          : {}),
         estimatedCount,
         estimationFailedCount,
         requiredIngredientCount: requestedGate.required.length,

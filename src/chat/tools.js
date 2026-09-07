@@ -17,6 +17,10 @@ import {
   estimateAndApplyRecipeMetadata,
   recipeEstimationEnabled,
 } from "./recipeEstimation.js";
+import {
+  generateRecipeIdeas as runRecipeIdeation,
+  recipeIdeationEnabled,
+} from "./recipeIdeation.js";
 
 // ✅ Single source of truth for what GPT is allowed to send
 export const PRESET_CATEGORIES = [
@@ -128,6 +132,8 @@ export function createRecommendRecipesTool({
   fetchPage = fetchPublicTextPage,
   estimateMeta = estimateAndApplyRecipeMetadata,
   estimationEnabled = recipeEstimationEnabled(),
+  ideate = runRecipeIdeation,
+  ideationEnabled = recipeIdeationEnabled(),
 } = {}) {
   if (typeof recommendRecipesFn !== "function") {
     throw new TypeError("recommendRecipesFn must be a function");
@@ -141,6 +147,9 @@ export function createRecommendRecipesTool({
   if (typeof estimateMeta !== "function") {
     throw new TypeError("estimateMeta must be a function");
   }
+  if (typeof ideate !== "function") {
+    throw new TypeError("ideate must be a function");
+  }
 
   return async function recommendRecipesTool(args, ctx) {
     return recommendRecipesFn(args, ctx?.recipeContext || {}, {
@@ -149,6 +158,8 @@ export function createRecommendRecipesTool({
       signal: ctx?.signal,
       estimateMeta,
       estimationEnabled,
+      ideate,
+      ideationEnabled,
       maxResultCount:
         ctx?.recipeMaxResultCount == null
           ? FREE_MAX_RESULT_COUNT

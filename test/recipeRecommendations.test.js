@@ -978,3 +978,161 @@ test("widening keeps searching until enough recipes contain the requested ingred
   assert.equal(result.recipes.length, 3);
   assert.ok(queries.some((query) => /chicken/i.test(query)));
 });
+
+test("idea-driven queries run first and idea-backed recipes are verified", async () => {
+  const queries = [];
+  const chickenUrl = "https://idea.example/yogurt-chicken";
+  const smoothieUrl = "https://idea.example/smoothie";
+
+  const result = await recommendRecipes(
+    { mealType: "dinner", resultCount: 2 },
+    { inventory: ["strawberry", "yogurt", "chicken breast"] },
+    {
+      ideationEnabled: true,
+      ideate: async () => ({
+        ideas: [
+          {
+            dish: "Yogurt marinated chicken",
+            query: "yogurt marinated chicken recipe",
+            coreIngredients: ["chicken", "yogurt"],
+          },
+        ],
+      }),
+      search: async ({ query }) => {
+        queries.push(query);
+        const link = /yogurt marinated chicken/i.test(query)
+          ? chickenUrl
+          : smoothieUrl;
+        return { results: [{ title: query, link }] };
+      },
+      fetchPage: async (url) =>
+        url === chickenUrl
+          ? fetchedPage(url, {
+              name: "Yogurt Marinated Chicken",
+              recipeCategory: "Dinner",
+              totalTime: "PT30M",
+              nutrition: { calories: "450 calories" },
+              recipeIngredient: [
+                "chicken breast",
+                "plain yogurt",
+                "garlic",
+                "lemon",
+              ],
+            })
+          : fetchedPage(url, {
+              name: "Strawberry Yogurt Smoothie",
+              recipeCategory: "Breakfast",
+              totalTime: "PT5M",
+              nutrition: { calories: "220 calories" },
+              recipeIngredient: ["strawberries", "yogurt", "honey", "milk"],
+            }),
+    }
+  );
+
+  assert.match(queries[0], /yogurt marinated chicken/i);
+  assert.equal(result.meta.ideation.ideaCount, 1);
+  assert.equal(result.meta.ideation.ideaVerifiedCount, 1);
+  assert.equal(result.meta.ideation.enabled, true);
+  assert.equal(result.recipes.length, 1);
+  assert.match(result.recipes[0].title, /Chicken/i);
+  assert.equal(result.recipes[0].ideaMatch, 1);
+  assert.equal(result.recipes[0].ideaDish, "Yogurt marinated chicken");
+});
+
+test("ideation falls back to the full pool when no recipe verifies an idea", async () => {
+  const url = "https://fallback.example/vegetable-rice";
+  let ideateCalls = 0;
+  const result = await recommendRecipes(
+    { mealType: "dinner", resultCount: 1 },
+    { inventory: ["rice"] },
+    {
+      ideationEnabled: true,
+      ideate: async () => {
+        ideateCalls += 1;
+        return {
+          ideas: [
+            {
+              dish: "Chicken soup",
+              query: "chicken soup recipe",
+              coreIngredients: ["chicken"],
+            },
+          ],
+        };
+      },
+      search: async () => ({ results: [{ link: url }] }),
+      fetchPage: async () =>
+        fetchedPage(url, {
+          name: "Vegetable Rice",
+          recipeIngredient: ["rice", "vegetables"],
+        }),
+    }
+  );
+
+  assert.equal(ideateCalls, 1);
+  assert.equal(result.meta.ideation.ideaCount, 1);
+  assert.equal(result.meta.ideation.ideaVerifiedCount, 0);
+  assert.equal(result.meta.ideation.ideaFallbackUsed, true);
+  assert.equal(result.recipes.length, 1);
+  assert.match(result.recipes[0].title, /Vegetable Rice/i);
+});
+
+test("ideation is not invoked when disabled", async () => {
+  let ideateCalls = 0;
+  const url = "https://disabled.example/plain";
+  const result = await recommendRecipes(
+    { resultCount: 1 },
+    {},
+    {
+      ideate: async () => {
+        ideateCalls += 1;
+        return { ideas: [] };
+      },
+      search: async () => ({ results: [{ link: url }] }),
+      fetchPage: async () =>
+        fetchedPage(url, {
+          name: "Plain Dish",
+          recipeIngredient: ["rice"],
+        }),
+    }
+  );
+
+  assert.equal(ideateCalls, 0);
+  assert.equal("ideation" in result.meta, false);
+  assert.equal("ideaMatch" in result.recipes[0], false);
+  assert.equal(result.recipes.length, 1);
+});
+
+test("idea-backed recipes satisfy a required ingredient the token matcher cannot verify (Chinese)", async () => {
+  const url = "https://relax.example/tomato-egg";
+  const result = await recommendRecipes(
+    { mealType: "dinner", mustUseIngredients: ["番茄"], resultCount: 2 },
+    {},
+    {
+      ideationEnabled: true,
+      ideate: async () => ({
+        ideas: [
+          {
+            dish: "Tomato egg stir fry",
+            query: "tomato egg stir fry recipe",
+            coreIngredients: ["tomato", "egg"],
+          },
+        ],
+      }),
+      search: async () => ({ results: [{ link: url }] }),
+      fetchPage: async () =>
+        fetchedPage(url, {
+          name: "Tomato Egg Stir Fry",
+          recipeCategory: "Dinner",
+          totalTime: "PT15M",
+          nutrition: { calories: "320 calories" },
+          recipeIngredient: ["egg", "tomato", "scallion", "oil"],
+        }),
+    }
+  );
+
+  assert.equal(result.recipes.length, 1);
+  assert.match(result.recipes[0].title, /Tomato Egg Stir Fry/i);
+  assert.equal(result.meta.ideation.ideaRelaxedRequired, true);
+  assert.equal(result.meta.ideation.ideaVerifiedCount, 1);
+  assert.ok(!result.warnings.some(({ code }) => code === "NO_TARGET_INGREDIENT"));
+});
