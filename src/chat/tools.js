@@ -13,6 +13,7 @@ import {
   FREE_MAX_RESULT_COUNT,
   recommendRecipes as runRecipeRecommendations,
 } from "./recipeRecommendations.js";
+import { searchRecipesWithDish } from "./recipeDishSearch.js";
 import {
   estimateAndApplyRecipeMetadata,
   recipeEstimationEnabled,
@@ -152,7 +153,8 @@ export function createRecommendRecipesTool({
   }
 
   return async function recommendRecipesTool(args, ctx) {
-    return recommendRecipesFn(args, ctx?.recipeContext || {}, {
+    const recipeContext = ctx?.recipeContext || {};
+    const dependencies = {
       search: search || TOOLS.webSearch,
       fetchPage,
       signal: ctx?.signal,
@@ -164,7 +166,13 @@ export function createRecommendRecipesTool({
         ctx?.recipeMaxResultCount == null
           ? FREE_MAX_RESULT_COUNT
           : ctx.recipeMaxResultCount,
-    });
+    };
+    // A named dish goes through the dish pipeline; everything else keeps using
+    // the inventory engine unchanged.
+    if (typeof args?.dishQuery === "string" && args.dishQuery.trim()) {
+      return searchRecipesWithDish(args, recipeContext, dependencies);
+    }
+    return recommendRecipesFn(args, recipeContext, dependencies);
   };
 }
 
@@ -318,6 +326,11 @@ export const RECOMMEND_RECIPES_TOOL = {
     parameters: {
       type: "object",
       properties: {
+        dishQuery: {
+          type: ["string", "null"],
+          description:
+            "The dish the user named, written in the user's own language exactly as they said it (for example 'tomato egg stir fry', '番茄炒蛋'). Set this whenever the user names a dish. Never translate it and never duplicate it into mustUseIngredients. Null when the user listed ingredients instead of naming a dish.",
+        },
         preferredCuisines: {
           type: "array",
           items: { type: "string" },
@@ -457,6 +470,22 @@ export const PROPOSE_RECIPE_PREFERENCE_UPDATE_TOOL = {
         },
       },
       required: ["patch"],
+      additionalProperties: false,
+    },
+  },
+};
+
+// Read-only fridge reader. Exported so recipe mode can offer it alongside the
+// recommendation tool: the model checks what the user actually has before it
+// searches, instead of the app inlining the inventory into the prompt.
+export const GET_FRIDGE_CONTENTS_TOOL = {
+  type: "function",
+  function: {
+    name: "getFridgeContents",
+    description: "Read-only: get all fridge items.",
+    parameters: {
+      type: "object",
+      properties: {},
       additionalProperties: false,
     },
   },
@@ -623,18 +652,7 @@ export const OPENAI_TOOLS = [
     },
   },
 
-  {
-    type: "function",
-    function: {
-      name: "getFridgeContents",
-      description: "Read-only: get all fridge items.",
-      parameters: {
-        type: "object",
-        properties: {},
-        additionalProperties: false,
-      },
-    },
-  },
+  GET_FRIDGE_CONTENTS_TOOL,
 
   {
     type: "function",

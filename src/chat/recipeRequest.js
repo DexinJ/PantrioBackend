@@ -1,4 +1,5 @@
 import {
+  GET_FRIDGE_CONTENTS_TOOL,
   OPENAI_TOOLS,
   RECOMMEND_RECIPES_TOOL,
 } from "./tools.js";
@@ -169,6 +170,9 @@ export function sanitizeRecipeContext(value) {
       source.selectedIngredients,
       MAX_SELECTED_INGREDIENTS
     ),
+    // App-supplied language. The dish pipeline searches in this language and
+    // returns results adapted to it.
+    language: cleanString(source.language, 32) || "en",
     preferences: {
       schemaVersion: 1,
       explicit: {
@@ -200,6 +204,12 @@ export function sanitizeRecipeContext(value) {
   };
 }
 
+/**
+ * Recipe mode forces the two-call sequence rather than hoping for it:
+ * the first round may only read the fridge, the second may only recommend.
+ * `tool_choice` pins a function, so each round is deterministic; the API has no
+ * way to force a sequence in a single request.
+ */
 export function resolveRoundToolPolicy({ intent, round = 0 } = {}) {
   if (normalizeChatIntent(intent) !== RECIPE_INTENT) {
     return {
@@ -209,20 +219,23 @@ export function resolveRoundToolPolicy({ intent, round = 0 } = {}) {
     };
   }
 
-  if (round === 0) {
+  if (round <= 0) {
     return {
-      tools: [RECOMMEND_RECIPES_TOOL],
+      tools: [GET_FRIDGE_CONTENTS_TOOL],
       toolChoice: {
         type: "function",
-        function: { name: "recommendRecipes" },
+        function: { name: "getFridgeContents" },
       },
       parallelToolCalls: false,
     };
   }
 
   return {
-    tools: [],
-    toolChoice: undefined,
-    parallelToolCalls: undefined,
+    tools: [RECOMMEND_RECIPES_TOOL],
+    toolChoice: {
+      type: "function",
+      function: { name: "recommendRecipes" },
+    },
+    parallelToolCalls: false,
   };
 }

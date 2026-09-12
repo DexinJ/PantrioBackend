@@ -1338,6 +1338,9 @@ export function attachChatGateway(
           ? "recipe_recommendation"
           : "chat";
       const recipeContext = sanitizeRecipeContext(msg.recipeContext);
+      // Already validated above; the recipe pipeline uses it so a dish is
+      // searched for, and returned, in the app's language.
+      recipeContext.language = language;
 
       // SQLite-backed token budget enforcement (trial)
       // const db = await getDb();

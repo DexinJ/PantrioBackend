@@ -93,3 +93,17 @@ Thumbs.db
 .vercel/
 .netlify/
 .firebase/
+
+# =========================
+# Test files
+# =========================
+test/
+*.test.js
+*.test.ts
+*.test.jsx
+*.test.tsx
+*.test.json
+*.test.yaml
+*.test.yml
+*.test.xml
+*.test.html
