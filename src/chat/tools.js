@@ -14,6 +14,7 @@ import {
   recommendRecipes as runRecipeRecommendations,
 } from "./recipeRecommendations.js";
 import { searchRecipesWithDish } from "./recipeDishSearch.js";
+import { withMissingItems } from "./recipeMissingItems.js";
 import {
   estimateAndApplyRecipeMetadata,
   recipeEstimationEnabled,
@@ -169,10 +170,16 @@ export function createRecommendRecipesTool({
     };
     // A named dish goes through the dish pipeline; everything else keeps using
     // the inventory engine unchanged.
-    if (typeof args?.dishQuery === "string" && args.dishQuery.trim()) {
-      return searchRecipesWithDish(args, recipeContext, dependencies);
-    }
-    return recommendRecipesFn(args, recipeContext, dependencies);
+    const result =
+      typeof args?.dishQuery === "string" && args.dishQuery.trim()
+        ? await searchRecipesWithDish(args, recipeContext, dependencies)
+        : await recommendRecipesFn(args, recipeContext, dependencies);
+    // The card ships addable items alongside the publisher's lines, so the
+    // shopping-list button needs no parser and no model round trip.
+    return withMissingItems(result, {
+      language: recipeContext.language,
+      signal: ctx?.signal,
+    });
   };
 }
 
