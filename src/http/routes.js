@@ -41,6 +41,10 @@ import {
   generateRecipeIdeas as runRecipeIdeation,
   recipeIdeationEnabled,
 } from "../chat/recipeIdeation.js";
+import {
+  recipeTranslationEnabled,
+  translateRecipes,
+} from "../chat/recipeDishSearch.js";
 import { sanitizeRecipeContext } from "../chat/recipeRequest.js";
 import {
   SubscriptionStatusValidationError,
@@ -446,6 +450,9 @@ export function createRecipeRecommendationHandler({
         estimationEnabled,
         ideate,
         ideationEnabled,
+        language: safeRecipeContext.language,
+        translate: translateRecipes,
+        translationEnabled: recipeTranslationEnabled(),
         maxResultCount: active
           ? SUBSCRIBER_MAX_RESULT_COUNT
           : FREE_MAX_RESULT_COUNT,

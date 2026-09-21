@@ -1,5 +1,12 @@
 import { fetchPublicTextPage } from "./safeWebFetch.js";
 import { parseRecipeJsonLd } from "./recipeJsonLd.js";
+import {
+  countTranslatableStrings,
+  recipeTranslationEnabled,
+  translateRecipes,
+} from "./recipeDishSearch.js";
+import { dedupeSimilarDishes } from "./recipeDedup.js";
+import { extractRecipesFromPage } from "./recipeTextExtract.js";
 
 const ENERGY_PREFERENCES = new Set(["any", "light", "balanced", "hearty"]);
 const SKILL_LEVELS = new Set(["beginner", "intermediate", "advanced"]);
@@ -795,7 +802,7 @@ async function searchForPages(
   return [...unique.values()].slice(0, limits.maxPages);
 }
 
-async function fetchRecipePages(fetchPage, pages, limits, deadline) {
+async function fetchRecipePages(fetchPage, pages, limits, deadline, language) {
   const fetched = new Array(pages.length);
   let cursor = 0;
   let failedPages = 0;
@@ -830,7 +837,19 @@ async function fetchRecipePages(fetchPage, pages, limits, deadline) {
           maxRecipes: limits.maxRecipesPerPage,
         });
         malformedScripts += parsed.diagnostics.malformedScripts;
-        fetched[index] = parsed.recipes;
+        let recipes = parsed.recipes;
+        if (recipes.length === 0) {
+          recipes = await awaitAbortable(
+            () =>
+              extractRecipesFromPage(page.text, {
+                pageUrl: page.url || result.link,
+                language,
+                signal: deadline.signal,
+              }),
+            deadline
+          );
+        }
+        fetched[index] = recipes;
       } catch (error) {
         if (deadline.signal.aborted) throw abortError(deadline);
         failedPages += 1;
@@ -1608,6 +1627,9 @@ export async function recommendRecipes(
     ideate,
     ideationEnabled = false,
     maxResultCount = MAX_RESULT_COUNT,
+    translate = translateRecipes,
+    translationEnabled = recipeTranslationEnabled(),
+    language,
   } = {}
 ) {
   if (typeof search !== "function") {
@@ -1681,7 +1703,8 @@ export async function recommendRecipes(
         fetchPage,
         wavePages,
         limits,
-        deadline
+        deadline,
+        language ?? recipeContext?.language ?? "en"
       );
       aggregate.recipes.push(...fetched.recipes);
       aggregate.failedPages += fetched.failedPages;
@@ -1780,10 +1803,15 @@ export async function recommendRecipes(
       inputs,
       constraintRules
     );
-    const deduped = dedupeCandidates(
+    const urlDeduped = dedupeCandidates(
       scoreCandidates(constrained.recipes, inputs, ideaPlan || [])
     );
-    let pool = deduped;
+    const dishDedup = await dedupeSimilarDishes(urlDeduped, {
+      language: language ?? recipeContext?.language ?? "en",
+      signal,
+    });
+    const dedupeDropped = dishDedup.dropped;
+    let pool = dishDedup.recipes;
     const mealFiltered = filterMealTypeMismatches(pool, inputs);
     if (mealFiltered.length >= Math.min(inputs.resultCount, pool.length)) {
       pool = mealFiltered;
@@ -1836,8 +1864,43 @@ export async function recommendRecipes(
       }
     }
 
+    // Localize the selected recipes into the app's language so the inventory
+    // path matches the dish path. Best effort: any failure keeps the original
+    // publisher text.
+    const targetLanguage =
+      typeof language === "string" && language.trim()
+        ? language.trim()
+        : typeof recipeContext?.language === "string"
+          ? recipeContext.language
+          : "en";
+    const translatableCount = countTranslatableStrings(
+      selected,
+      targetLanguage
+    );
+    let returnedRecipes = selected;
+    let translationApplied = 0;
+    if (
+      translationEnabled &&
+      typeof translate === "function" &&
+      translatableCount > 0
+    ) {
+      try {
+        const translated = await translate(selected, targetLanguage, { signal });
+        const applied = Array.isArray(translated)
+          ? translated.filter((recipe) => recipe?.translation).length
+          : 0;
+        if (Array.isArray(translated) && applied > 0) {
+          returnedRecipes = translated;
+          translationApplied = applied;
+        }
+      } catch {
+        // Keep the publisher text; translation is never allowed to fail the
+        // whole recommendation.
+      }
+    }
+
     return {
-      recipes: selected,
+      recipes: returnedRecipes,
       warnings: warnings.slice(0, 12),
       meta: {
         queryCount: queryPlan.length,
@@ -1847,7 +1910,7 @@ export async function recommendRecipes(
         candidatesParsed: aggregate.recipes.length,
         candidatesAfterHardConstraints: constrained.recipes.length,
         candidatePoolTarget: CANDIDATE_POOL_TARGET,
-        returnedCount: selected.length,
+        returnedCount: returnedRecipes.length,
         ...(ideationEnabled || ideaPlan
           ? {
               ideation: {
@@ -1861,6 +1924,16 @@ export async function recommendRecipes(
           : {}),
         estimatedCount,
         estimationFailedCount,
+        translation: {
+          enabled: Boolean(translationEnabled),
+          requested: translatableCount,
+          applied: translationApplied,
+          failed:
+            translatableCount > 0 && translationApplied === 0 ? 1 : 0,
+        },
+        dedupe: {
+          nearDuplicateDropped: dedupeDropped,
+        },
         requiredIngredientCount: requestedGate.required.length,
         candidatesMissingRequested: requestedGate.missingTotal,
         filtered: constrained.stats,

@@ -13,7 +13,11 @@ import {
   FREE_MAX_RESULT_COUNT,
   recommendRecipes as runRecipeRecommendations,
 } from "./recipeRecommendations.js";
-import { searchRecipesWithDish } from "./recipeDishSearch.js";
+import {
+  recipeTranslationEnabled,
+  searchRecipesWithDish,
+  translateRecipes,
+} from "./recipeDishSearch.js";
 import { withMissingItems } from "./recipeMissingItems.js";
 import {
   estimateAndApplyRecipeMetadata,
@@ -163,6 +167,9 @@ export function createRecommendRecipesTool({
       estimationEnabled,
       ideate,
       ideationEnabled,
+      language: recipeContext?.language,
+      translate: translateRecipes,
+      translationEnabled: recipeTranslationEnabled(),
       maxResultCount:
         ctx?.recipeMaxResultCount == null
           ? FREE_MAX_RESULT_COUNT

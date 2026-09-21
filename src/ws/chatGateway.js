@@ -744,6 +744,18 @@ export function attachChatGateway(
         return;
       }
 
+      if (one?.usage && typeof one.usage === "object") {
+        const addTokenCount = (value) =>
+          Number.isFinite(value) && value > 0
+            ? Math.max(0, Math.trunc(value))
+            : 0;
+        state.usage.promptTokens += addTokenCount(one.usage.prompt_tokens);
+        state.usage.completionTokens += addTokenCount(
+          one.usage.completion_tokens
+        );
+        state.usage.totalTokens += addTokenCount(one.usage.total_tokens);
+      }
+
       /* Previous post-hoc guest accounting. This allowed concurrent requests
          and interrupted streams to consume tokens before anything was charged.
       // Usage accounting (trial)
@@ -807,6 +819,11 @@ export function attachChatGateway(
 
       // Normal completion
       if (!one.needsTools) {
+        send(ws, {
+          type: "request_usage",
+          requestId,
+          usage: state.usage,
+        });
         send(ws, { type: "done", requestId });
         deleteActiveRequest(requestId);
         return;
@@ -1425,6 +1442,11 @@ export function attachChatGateway(
         plan,
         dailyLimit,
         round: 0,
+        usage: {
+          promptTokens: 0,
+          completionTokens: 0,
+          totalTokens: 0,
+        },
         toolsLockedAfterIsolatedAction: false,
         recipeFollowUpAvailable: false,
         recipeFollowUpUsed: false,

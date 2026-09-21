@@ -1,0 +1,21 @@
+# Example input for scripts/recipe-extraction-accuracy.mjs
+# One entry per line:  URL  or  URL|languageCode
+# Blank lines and lines starting with # are ignored.
+#
+# Replace these placeholders with real, publicly fetchable recipe pages in
+# each language before running the harness.
+
+https://example.com/recipe|en
+https://example.fr/recette|fr
+https://example.es/receta|es
+https://example.de/rezept|de
+https://example.it/ricetta|it
+https://example.pt/receita|pt
+https://example.nl/recept|nl
+https://example.pl/przepis|pl
+https://example.ru/recept|ru
+https://example.jp/レシピ|ja
+https://example.kr/레시피|ko
+https://example.vn/cong-thuc|vi
+https://example.th/สูตร|th
+https://example.cn/菜谱|zh

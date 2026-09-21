@@ -39,6 +39,8 @@
 import { OPENAI_API_KEY, SERPER_API_KEY } from "../config/env.js";
 import { fetchPublicTextPage } from "./safeWebFetch.js";
 import { parseRecipeJsonLd } from "./recipeJsonLd.js";
+import { dedupeSimilarDishes } from "./recipeDedup.js";
+import { extractRecipesFromPage } from "./recipeTextExtract.js";
 
 // ---------------------------------------------------------------------------
 // Limits
@@ -1186,10 +1188,15 @@ const TRANSLATION_FIELD_ORDER = Object.freeze([
   "missingIngredients",
   "description",
   "instructions",
+  "whyRecommended",
 ]);
 
 function fieldValues(recipe, field) {
-  if (field === "title" || field === "description") {
+  if (
+    field === "title" ||
+    field === "description" ||
+    field === "whyRecommended"
+  ) {
     const value = recipe?.[field];
     return typeof value === "string" && value ? [[null, value]] : [];
   }
@@ -1957,11 +1964,19 @@ export async function searchRecipesByDish(
             continue;
           }
           if (fetched.truncated) truncatedPages += 1;
-          const parsed = parsePage(fetched.text, {
-            pageUrl: fetched.url || page.link,
-            maxRecipes: limits.maxRecipesPerPage,
-          });
-          parsedPages[index] = parsed?.recipes || [];
+          let recipes =
+            parsePage(fetched.text, {
+              pageUrl: fetched.url || page.link,
+              maxRecipes: limits.maxRecipesPerPage,
+            })?.recipes || [];
+          if (recipes.length === 0) {
+            recipes = await extractRecipesFromPage(fetched.text, {
+              pageUrl: fetched.url || page.link,
+              language: normalizedLanguage,
+              signal: deadline.signal,
+            });
+          }
+          parsedPages[index] = recipes;
         } catch {
           failedPages += 1;
         }
@@ -2116,7 +2131,12 @@ export async function searchRecipesByDish(
       };
     });
 
-    const selected = selectDiverse(scored, wanted).map((candidate) =>
+    const dishDedup = await dedupeSimilarDishes(scored, {
+      language: normalizedLanguage,
+      signal,
+    });
+    const dedupeDropped = dishDedup.dropped;
+    const selected = selectDiverse(dishDedup.recipes, wanted).map((candidate) =>
       publicRecipe(candidate, {
         dishQuery: dish,
         language: normalizedLanguage,
@@ -2220,6 +2240,9 @@ export async function searchRecipesByDish(
           requested: translation.requested,
           applied: translation.applied,
           failed: translation.failed,
+        },
+        dedupe: {
+          nearDuplicateDropped: dedupeDropped,
         },
         applied: {
           energyPreference: energy,
