@@ -52,6 +52,7 @@ export async function runToolCalls(toolCalls, ctx, { tools = TOOLS } = {}) {
 
     let result;
     try {
+      ctx.wsSend({ type: "tool_started", requestId: ctx.requestId, name: toolName });
       result = await tools[toolName](args, ctx);
       throwIfAborted(ctx?.signal);
     } catch (e) {

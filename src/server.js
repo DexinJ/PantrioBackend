@@ -72,7 +72,7 @@ const wss = new WebSocketServer({
   // maxPayload: MAX_WS_PAYLOAD_BYTES,
 });
 
-const chatGateway = attachChatGateway(wss);
+const chatGateway = attachChatGateway(wss, { serverToolTimeoutMs: 40_000 });
 
 const accountDeletionRecoveryInterval = setInterval(
   () => void runAccountDeletionRecovery(),
