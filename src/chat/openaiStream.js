@@ -197,12 +197,15 @@ export async function streamOpenAIOnce({
 
   const toolCalls = toolCallState.filter(Boolean);
   const needsTools = finishReason === "tool_calls" && toolCalls.length > 0;
+  const totalMs = Date.now() - t0;
+  const ttftMs = firstTokenAt ? Math.max(0, firstTokenAt - t0) : null;
   return {
     ok: true,
     finishReason,
     needsTools,
     toolCalls,
     usage,
+    timing: { ttftMs, totalMs },
   };
   });
 }
