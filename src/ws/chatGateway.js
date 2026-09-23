@@ -66,7 +66,6 @@ import {
   SUBSCRIBER_MAX_RESULT_COUNT,
 } from "../chat/recipeRecommendations.js";
 import { compactRecipeResultsForChat } from "../chat/recipeCompact.js";
-import { createChatTrace } from "../telemetry/chatTrace.js";
 
 let activeChatRequests = 0;
 const activeChatRequestsByUser = new Map();
@@ -513,7 +512,6 @@ export function attachChatGateway(
       const state = active.get(requestId);
       if (!state) return;
 
-      const round = state.round || 0;
       const {
         controller,
         model,
@@ -758,15 +756,6 @@ export function attachChatGateway(
         state.usage.totalTokens += addTokenCount(one.usage.total_tokens);
       }
 
-      if (state.trace.enabled && one?.timing) {
-        state.trace.add(`round${round}:upstream`, one.timing.totalMs, {
-          ttftMs: one.timing.ttftMs,
-          promptTokens: one.usage?.prompt_tokens,
-          completionTokens: one.usage?.completion_tokens,
-          needsTools: Boolean(one.needsTools),
-        });
-      }
-
       /* Previous post-hoc guest accounting. This allowed concurrent requests
          and interrupted streams to consume tokens before anything was charged.
       // Usage accounting (trial)
@@ -830,10 +819,6 @@ export function attachChatGateway(
 
       // Normal completion
       if (!one.needsTools) {
-        const trace = state.trace.snapshot();
-        if (trace) {
-          send(ws, { type: "chat_trace", requestId, trace });
-        }
         send(ws, {
           type: "request_usage",
           requestId,
@@ -922,7 +907,6 @@ export function attachChatGateway(
 
       // ✅ HYBRID: run server tools immediately (e.g., webSearch)
       if (serverCalls.length) {
-        const endTools = state.trace.span(`round${round}:tools`);
         try {
           const serverToolMsgs = await withAbortDeadline({
             parentSignal: state.controller.signal,
@@ -951,11 +935,6 @@ export function attachChatGateway(
                   ? SUBSCRIBER_MAX_RESULT_COUNT
                   : FREE_MAX_RESULT_COUNT,
               }),
-          });
-          endTools({
-            toolNames: serverCalls
-              .map((call) => call?.function?.name)
-              .filter(Boolean),
           });
           if (active.get(requestId) !== state) return;
           const enrichedToolMsgs = [];
@@ -1462,13 +1441,6 @@ export function attachChatGateway(
         quotaApplies,
         plan,
         dailyLimit,
-        trace: createChatTrace({
-          model,
-          language,
-          intent,
-          isSubscribed,
-          quotaApplies,
-        }),
         round: 0,
         usage: {
           promptTokens: 0,
