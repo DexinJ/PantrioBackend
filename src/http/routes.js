@@ -18,6 +18,10 @@ import {
   publicAccountDeletion,
 } from "../accountDeletion/accountDeletionStore.js";
 import { OPENAI_API_KEY } from "../config/env.js";
+import {
+  MODEL_SUMMARIZE,
+  MODEL_TRANSCRIPTION,
+} from "../config/models.js";
 import { getDb } from "../db/db.js";
 import {
   MAX_CHAT_MESSAGES,
@@ -1208,7 +1212,7 @@ export function attachRoutes(app) {
 
         formData.append(
           "model",
-          "gpt-4o-mini-transcribe"
+          MODEL_TRANSCRIPTION
         );
 
         const upstreamController = new AbortController();
@@ -1414,13 +1418,15 @@ export function attachRoutes(app) {
         });
       }
 
+      const summarySystemPrompt =
+        "Summarize the following chat for memory retention. " +
+        "Focus only on fridge and shopping-list state. " +
+        `Reply in ${language}.`;
+
       const summaryQuotaMessages = [
         {
           role: "system",
-          content:
-            "Summarize the following chat for memory retention. " +
-            "Focus only on fridge and shopping-list state. " +
-            `Reply in ${language}.`,
+          content: summarySystemPrompt,
         },
         ...messages,
       ];
@@ -1514,14 +1520,11 @@ export function attachRoutes(app) {
               "Content-Type": "application/json",
             },
             body: JSON.stringify({
-              model: "gpt-4o-mini",
+              model: MODEL_SUMMARIZE,
               messages: [
                 {
                   role: "system",
-                  content:
-                    "Summarize the following chat for memory retention. " +
-                    "Focus only on fridge and shopping-list state. " +
-                    `Reply in ${language}.`,
+                  content: summarySystemPrompt,
                 },
                 ...messages,
               ],

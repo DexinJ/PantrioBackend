@@ -6,6 +6,7 @@ import {
   SUBSCRIBER_MAX_COMPLETION_TOKENS,
   SUBSCRIBER_MAX_PROMPT_TOKENS,
 } from "../config/policy.js";
+import { CHAT_MODEL_PAID_DEFAULT } from "../config/models.js";
 
 const PLAN_ID = /^[a-z][a-z0-9_-]{0,31}$/;
 const PRODUCT_ID = /^[A-Za-z0-9][A-Za-z0-9._-]{2,254}$/;
@@ -30,7 +31,7 @@ const DEFAULT_PAID_PLANS = Object.freeze([
       "com.chilltech.pantrio.subscription.yearly",
     ]),
     dailyTokenLimit: null,
-    defaultModel: "gpt-5",
+    defaultModel: CHAT_MODEL_PAID_DEFAULT,
     allowedModels: Object.freeze([...ALLOWED_MODELS_AUTHED]),
     maxCompletionTokens: SUBSCRIBER_MAX_COMPLETION_TOKENS,
     maxPromptTokens: SUBSCRIBER_MAX_PROMPT_TOKENS,

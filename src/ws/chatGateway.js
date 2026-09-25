@@ -61,6 +61,7 @@ import {
 import { PROPOSE_ADD_MISSING_INGREDIENTS_TO_SHOPPING_LIST_TOOL } from "../chat/tools.js";
 import { runToolCalls } from "../chat/toolRunner.js"; // ✅ HYBRID: enable server-side tools
 import { trimWorkingMessagesToFit } from "../chat/messageTrimmer.js";
+import { buildSystemMessage } from "../chat/systemPrompt.js";
 import {
   FREE_MAX_RESULT_COUNT,
   SUBSCRIBER_MAX_RESULT_COUNT,
@@ -144,8 +145,6 @@ function sendQuotaError(
 }
 
 const CLIENT_MESSAGE_ROLES = new Set([
-  "system",
-  "developer",
   "user",
   "assistant",
 ]);
@@ -174,6 +173,11 @@ function validatePayloadComplexity(value) {
   }
 
   return true;
+}
+
+function sanitizeUserName(value) {
+  if (typeof value !== "string") return "";
+  return value.replace(/\s+/g, " ").trim().slice(0, 60);
 }
 
 function validateStartMessages(messages) {
@@ -707,8 +711,8 @@ export function attachChatGateway(
             ownerType,
             ownerKey,
             quotaReservation,
-            null,
-            1
+            0,
+            0
           );
         }
         throw error;
@@ -1358,6 +1362,10 @@ export function attachChatGateway(
       // Already validated above; the recipe pipeline uses it so a dish is
       // searched for, and returned, in the app's language.
       recipeContext.language = language;
+      const systemPrompt = buildSystemMessage({
+        userName: sanitizeUserName(msg.userName),
+        language,
+      });
 
       // SQLite-backed token budget enforcement (trial)
       // const db = await getDb();
@@ -1424,7 +1432,7 @@ export function attachChatGateway(
         controller,
         releaseConcurrency,
         workingMessages: [
-          { role: "system", content: `Reply in ${language}.` },
+          { role: "system", content: systemPrompt },
           ...messages,
         ],
         model,

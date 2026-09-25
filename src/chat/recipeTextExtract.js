@@ -14,7 +14,9 @@
 // It is additive: nothing imports it yet. See the integration notes at the
 // bottom for the two worker edits that use it as a fallback.
 
-const DEFAULT_MODEL = "gpt-4o-mini";
+import { MODEL_RECIPE_TEXT_EXTRACT } from "../config/models.js";
+
+const DEFAULT_MODEL = MODEL_RECIPE_TEXT_EXTRACT;
 const DEFAULT_TIMEOUT_MS = 12_000;
 const MAX_OUTPUT_TOKENS = 2_000;
 const MAX_PAGE_TEXT_CHARS = 16_000;

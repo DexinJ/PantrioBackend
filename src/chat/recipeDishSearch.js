@@ -41,6 +41,7 @@ import { fetchPublicTextPage } from "./safeWebFetch.js";
 import { parseRecipeJsonLd } from "./recipeJsonLd.js";
 import { dedupeSimilarDishes } from "./recipeDedup.js";
 import { extractRecipesFromPage } from "./recipeTextExtract.js";
+import { MODEL_RECIPE_TRANSLATION } from "../config/models.js";
 
 // ---------------------------------------------------------------------------
 // Limits
@@ -1015,7 +1016,7 @@ export function dislikedIngredientPenalty(
 // AI helpers: dish aliases and result translation
 // ---------------------------------------------------------------------------
 
-const DEFAULT_TRANSLATION_MODEL = "gpt-4o-mini";
+const DEFAULT_TRANSLATION_MODEL = MODEL_RECIPE_TRANSLATION;
 const MAX_ALIAS_CACHE_ENTRIES = 200;
 const MAX_TRANSLATION_STRINGS = 240;
 const MAX_TRANSLATION_CHARS = 20_000;

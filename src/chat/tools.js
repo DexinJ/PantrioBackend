@@ -5,10 +5,7 @@
 // - Keeps the rest unchanged
 
 import { SERPER_API_KEY } from "../config/env.js";
-import {
-  SafeWebFetchError,
-  fetchPublicTextPage,
-} from "./safeWebFetch.js";
+import { fetchPublicTextPage } from "./safeWebFetch.js";
 import {
   FREE_MAX_RESULT_COUNT,
   recommendRecipes as runRecipeRecommendations,
@@ -87,28 +84,6 @@ export const PRESET_FOOD_TYPE_CATEGORIES = [
   "Frozen",
 ];
 export const PRESET_STATE_CATEGORIES = ["Opened", "Unopened", "Raw", "Cooked", "Cut", "Whole"];
-// ✅ CHANGED: add these helpers
-function stripHtmlToText(html) {
-  // very lightweight HTML → text (good enough to extract ingredients/steps)
-  return html
-    .replace(/<script[\s\S]*?<\/script>/gi, " ")
-    .replace(/<style[\s\S]*?<\/style>/gi, " ")
-    .replace(/<noscript[\s\S]*?<\/noscript>/gi, " ")
-    .replace(/<\/(p|div|li|h1|h2|h3|h4|br)>/gi, "\n")
-    .replace(/<[^>]+>/g, " ")
-    .replace(/\n{3,}/g, "\n\n")
-    .replace(/[ \t]{2,}/g, " ")
-    .trim();
-}
-
-function isProbablyRecipePage(text) {
-  const t = (text || "").toLowerCase();
-  return (
-    t.includes("ingredients") &&
-    (t.includes("instructions") || t.includes("directions") || t.includes("method"))
-  );
-}
-// ✅ END CHANGED
 
 async function fetchWithDeadline(url, options, { signal, timeoutMs = 10_000 } = {}) {
   const controller = new AbortController();
@@ -247,42 +222,6 @@ export const TOOLS = {
     return { query: q, results };
   },
 
-  // ✅ NEW: browse/fetch a URL and return readable text
-  webFetch: async (args, ctx) => {
-    const url = typeof args?.url === "string" ? args.url.trim() : "";
-    const maxChars = Number.isFinite(args?.maxChars)
-      ? Math.max(1000, Math.min(20000, args.maxChars))
-      : 12000;
-
-    if (!url) return { error: "Missing url", url: "", text: "" };
-
-    try {
-      const page = await fetchPublicTextPage(url, { signal: ctx?.signal });
-      const fullText = stripHtmlToText(page.text);
-      const clipped = fullText.slice(0, maxChars);
-
-      return {
-        url: page.url,
-        text: clipped,
-        clipped: page.truncated || fullText.length > clipped.length,
-        isRecipeLikely: isProbablyRecipePage(clipped),
-      };
-    } catch (error) {
-      return {
-        code:
-          error instanceof SafeWebFetchError
-            ? error.code
-            : "FETCH_FAILED",
-        error:
-          error instanceof SafeWebFetchError
-            ? error.message
-            : "The webpage could not be fetched.",
-        url,
-        text: "",
-      };
-    }
-  },
-
   recommendRecipes: createRecommendRecipesTool(),
 };
 
@@ -297,22 +236,22 @@ export const TOOLS = {
 const CATEGORY_SCHEMA = {
   type: "object",
   description:
-    "You MUST provide exactly 1 storage, exactly 1 urgency, and exactly 1 food_type category. state is optional.",
+    "Exactly 1 storage, exactly 1 urgency, exactly 1 food_type. state is optional.",
   properties: {
     storage: {
       type: "string",
       enum: PRESET_STORAGE_CATEGORIES,
-      description: "REQUIRED. Exactly one storage category.",
+      description: "Exactly one storage category.",
     },
     urgency: {
       type: "string",
       enum: PRESET_URGENCY_CATEGORIES,
-      description: "REQUIRED. Exactly one urgency category.",
+      description: "Exactly one urgency category.",
     },
     food_type: {
       type: "string",
       enum: PRESET_FOOD_TYPE_CATEGORIES,
-      description: "REQUIRED. Exactly one food type category.",
+      description: "Exactly one food type category.",
     },
     state: {
       type: "string",
@@ -328,7 +267,7 @@ const EXPIRES_IN_DAYS_SCHEMA = {
   type: "integer",
   minimum: 1,
   description:
-    "Whole-day shelf-life estimate from today (e.g. raw chicken 2, milk 7, frozen meat 180). Always express expiry this way; never pass calendar dates. The app converts this to an expiration date when the change is applied.",
+    "Whole-day shelf-life estimate from today (e.g. raw chicken 2, milk 7, frozen meat 180). Never pass calendar dates.",
 };
 
 export const RECOMMEND_RECIPES_TOOL = {
@@ -336,21 +275,20 @@ export const RECOMMEND_RECIPES_TOOL = {
   function: {
     name: "recommendRecipes",
     description:
-      "Find and rank real recipes using the user's trusted fridge inventory and saved recipe preferences. Search fresh on every request and never avoid a recipe because it was shown before. Use this for recipe ideas, meal ideas, or 'what can I cook?' requests. Call it once per user request. A follow-up after a previous recipe answer is a NEW request: pass only constraints from the latest user message. If the user names an ingredient to use (or a single fridge item is selected), only return recipes that contain it. Put only constraints stated for the current request in the arguments; saved defaults and fridge items are supplied separately by the app.",
+      "Find and rank real recipes from the user's fridge inventory and saved preferences. Search fresh each request; never skip a recipe shown before. Use for recipe/meal/'what can I cook?' requests. Call once per request. A follow-up is a new request: pass only the latest message's constraints. If the user names an ingredient (or selects one fridge item), return only recipes containing it. The app supplies saved defaults and fridge items; pass only current-meal constraints.",
     parameters: {
       type: "object",
       properties: {
         dishQuery: {
           type: ["string", "null"],
           description:
-            "The dish the user named, written in the user's own language exactly as they said it (for example 'tomato egg stir fry', '番茄炒蛋'). Set this whenever the user names a dish. Never translate it and never duplicate it into mustUseIngredients. Null when the user listed ingredients instead of naming a dish.",
+            "The dish the user named, exactly as they said it in their language (e.g. 'tomato egg stir fry', '番茄炒蛋'). Set when the user names a dish. Never translate or copy into mustUseIngredients. Null when the user listed ingredients instead.",
         },
         preferredCuisines: {
           type: "array",
           items: { type: "string" },
           maxItems: 5,
-          description:
-            "Cuisines requested for this meal, such as Asian, Japanese, Mexican, or American.",
+          description: "Cuisines requested for this meal (e.g. Asian, Mexican).",
         },
         energyPreference: {
           type: "string",
@@ -361,15 +299,13 @@ export const RECOMMEND_RECIPES_TOOL = {
           type: ["integer", "null"],
           minimum: 100,
           maximum: 2500,
-          description:
-            "Explicit calorie ceiling per serving, or null when none was stated.",
+          description: "Calorie ceiling per serving, or null if none stated.",
         },
         maxPrepMinutes: {
           type: ["integer", "null"],
           minimum: 5,
           maximum: 480,
-          description:
-            "Explicit total-time ceiling in minutes, or null when none was stated.",
+          description: "Total-time ceiling in minutes, or null if none stated.",
         },
         mealType: {
           type: ["string", "null"],
@@ -379,8 +315,7 @@ export const RECOMMEND_RECIPES_TOOL = {
         skillLevel: {
           type: ["string", "null"],
           enum: ["beginner", "intermediate", "advanced"],
-          description:
-            "Cooking skill level requested. Only pass it when the user states a skill or difficulty; never invent one.",
+          description: "Cooking skill level. Only pass when the user states one.",
         },
         cookingMethod: {
           type: ["string", "null"],
@@ -394,35 +329,31 @@ export const RECOMMEND_RECIPES_TOOL = {
             "oven",
           ],
           description:
-            "Cooking method the user asked for (e.g. air fryer, Instant Pot, one pot, sheet pan). Only pass it when the user states a method; never invent one.",
+            "Cooking method the user asked for (e.g. air fryer, one pot). Only pass when stated.",
         },
         maxIngredients: {
           type: ["integer", "null"],
           minimum: 3,
           maximum: 30,
-          description:
-            "Maximum number of ingredients the user is willing to use. Only pass it when the user states a count.",
+          description: "Max ingredients the user is willing to use. Only pass when stated.",
         },
         dietaryPatterns: {
           type: "array",
           items: { type: "string" },
           maxItems: 8,
-          description:
-            "Dietary constraints stated for this meal, such as vegetarian or gluten-free.",
+          description: "Dietary constraints for this meal (e.g. vegetarian, gluten-free).",
         },
         mustUseIngredients: {
           type: "array",
           items: { type: "string" },
           maxItems: 20,
-          description:
-            "Ingredients the user explicitly asked to use. Do not copy the full fridge inventory here.",
+          description: "Ingredients the user explicitly asked to use. Never copy the full fridge inventory.",
         },
         excludedIngredients: {
           type: "array",
           items: { type: "string" },
           maxItems: 20,
-          description:
-            "Ingredients the user explicitly asked to avoid for this meal.",
+          description: "Ingredients to avoid for this meal.",
         },
         servings: {
           type: "integer",
@@ -434,8 +365,7 @@ export const RECOMMEND_RECIPES_TOOL = {
           type: "integer",
           minimum: 1,
           maximum: 4,
-          description:
-            "Number of recipe suggestions requested (1-4; default 4).",
+          description: "Number of recipe suggestions (1-4; default 4).",
         },
       },
       additionalProperties: false,
@@ -448,15 +378,14 @@ export const PROPOSE_RECIPE_PREFERENCE_UPDATE_TOOL = {
   function: {
     name: "proposeRecipePreferenceUpdate",
     description:
-      "Show a confirmation card for saving persistent recipe preferences. Use when the user asks to remember/save/always/usually prefer something, or clearly states a durable allergy or dietary pattern. This tool does not save by itself. Never use it for a one-meal constraint such as 'no peanuts tonight'.",
+      "Show a confirmation card to save persistent recipe preferences (remember/save/always/usually, or a durable allergy/diet). Does not save by itself. Never use for a one-meal constraint like 'no peanuts tonight'.",
     parameters: {
       type: "object",
       properties: {
         operation: {
           type: "string",
           enum: ["merge", "remove", "replace"],
-          description:
-            "Use merge to add preferences (default), remove to delete named list values, and replace only when the user explicitly asks to replace or clear a field.",
+          description: "merge adds (default), remove deletes named values, replace clears/replaces a field.",
         },
         patch: {
           type: "object",
@@ -512,7 +441,7 @@ export const OPENAI_TOOLS = [
     function: {
       name: "webSearch",
       description:
-        "Search the web only when the user explicitly asks to browse/search online or when an answer requires up-to-date external facts such as news, prices, or recalls. Do not use for recipe recommendations; use recommendRecipes instead. Do not use for normal fridge or shopping-list actions.",
+        "Search the web only when the user asks to browse/search online or the answer needs up-to-date facts (news, prices, recalls). Never use for recipes (use recommendRecipes) or for fridge/shopping-list actions.",
       parameters: {
         type: "object",
         properties: {
@@ -560,7 +489,7 @@ export const OPENAI_TOOLS = [
     function: {
       name: "addFridgeItem",
       description:
-        "Add an item to the fridge (mutates state). You MUST include categories with exactly 1 storage, exactly 1 urgency, and exactly 1 food_type. state is optional. Estimate shelf life in whole days with expiresInDays based on food_type, storage, and state. Never invent categories.",
+        "Add an item to the fridge. Include exactly 1 storage, 1 urgency, 1 food_type (state optional). Estimate shelf life in whole days with expiresInDays. Never invent categories.",
       parameters: {
         type: "object",
         properties: {
@@ -583,7 +512,7 @@ export const OPENAI_TOOLS = [
     function: {
       name: "addShoppingItem",
       description:
-        "Add an item to the shopping list (mutates state). You MUST include categories with exactly 1 storage, exactly 1 urgency, and exactly 1 food_type. state is optional. Never invent categories.",
+        "Add an item to the shopping list. Include exactly 1 storage, 1 urgency, 1 food_type (state optional). Never invent categories.",
       parameters: {
         type: "object",
         properties: {
@@ -686,7 +615,7 @@ export const OPENAI_TOOLS = [
     function: {
       name: "proposeAddAllToFridge",
       description:
-        "UI-only (no state changes): after the user attaches a fridge image, or explicitly asks to add a clearly listed batch, show one 'Add all to fridge' confirmation card for the extracted items. Never use this for recipe ingredients, recipe results, meal ideas, or ordinary bullet lists. Each item MUST include categories with exactly 1 storage, exactly 1 urgency, and exactly 1 food_type; state is optional. Estimate shelf life in whole days with expiresInDays based on food_type, storage, and state. Never invent categories.",
+        "UI-only: after a fridge image or an explicit batch-add request, show one 'Add all to fridge' confirmation card. Never use for recipes, meal ideas, or ordinary lists. Each item needs exactly 1 storage, 1 urgency, 1 food_type (state optional) and a whole-day expiresInDays estimate. Never invent categories.",
       parameters: {
         type: "object",
         properties: {
@@ -720,7 +649,7 @@ export const OPENAI_TOOLS = [
     function: {
       name: "streamlineLists",
       description:
-        "Streamline the fridge and/or shopping lists. This tool may mutate state by normalizing item name/quantity and ensuring items have a food_type tag. MANDATORY TAGGING: if an item has NO tags, you MUST infer and APPLY a preset food_type tag when possible. If retag=true, you may also correct an incorrect/missing food_type tag. NEVER invent new tags outside presets. NEVER remove or modify storage/urgency/state tags.",
+        "Normalize fridge/shopping items (name/quantity) and ensure food_type tags. If an item has no tags, infer and apply a preset food_type. If retag=true, also correct wrong/missing food_type. Never invent tags outside presets, and never touch storage/urgency/state tags.",
       parameters: {
         type: "object",
         properties: {
@@ -732,13 +661,13 @@ export const OPENAI_TOOLS = [
           retag: {
             type: "boolean",
             description:
-              "If true, also correct existing food_type tags when the inference differs. If false, only add food_type when tags are missing.",
+              "Also correct existing food_type tags when they differ; if false, only fill missing tags.",
             default: true,
           },
           dryRun: {
             type: "boolean",
             description:
-              "If true, do not apply edits; only return what would change. NOTE: if there are tagless items, you should run with dryRun=false to actually fix them.",
+              "Preview only; do not apply. To actually fix tagless items, run with dryRun=false.",
             default: false,
           },
         },
@@ -755,7 +684,7 @@ export const OPENAI_TOOLS = [
     function: {
       name: "updateFridgeItem",
       description:
-        "Edit a single fridge item: rename it, change its quantity, categories, or expiry (expiry is a whole-day estimate in expiresInDays). Resolve the item by id when available, otherwise by exact name. For changes to several items, use proposeBulkFridgeUpdate instead.",
+        "Edit one fridge item (name, quantity, categories, or whole-day expiresInDays). Resolve by id when available, otherwise by exact name. For several items use proposeBulkFridgeUpdate.",
       parameters: {
         type: "object",
         properties: {
@@ -783,7 +712,7 @@ export const OPENAI_TOOLS = [
     function: {
       name: "proposeBulkFridgeUpdate",
       description:
-        "Show one confirmation card for multiple fridge changes (rename, quantity, categories, expiry in whole-day expiresInDays, or removal). Resolve each entry by id when available, otherwise by exact name. Nothing is changed until the user confirms on the card.",
+        "Show one confirmation card for multiple fridge changes (rename, quantity, categories, whole-day expiresInDays, or remove). Resolve by id when available, otherwise by exact name. Nothing changes until confirmed.",
       parameters: {
         type: "object",
         properties: {
@@ -827,7 +756,7 @@ export const OPENAI_TOOLS = [
     function: {
       name: "proposeAddMissingIngredientsToShoppingList",
       description:
-        "After recommendRecipes returns, propose adding the recommended recipes' missing ingredients to the shopping list. Shows one confirmation card; nothing is added until the user confirms. Never use for the fridge and never call before recommendRecipes.",
+        "After recommendRecipes, propose adding missing ingredients to the shopping list. One confirmation card; nothing is added until confirmed. Never use for the fridge or before recommendRecipes.",
       parameters: {
         type: "object",
         properties: {

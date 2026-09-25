@@ -19,9 +19,11 @@
 //     model pass for cross-language and synonym cases that token overlap
 //     cannot see (番茄炒蛋 vs "Tomato Egg Stir Fry", "omelette aux tomates").
 
+import { MODEL_RECIPE_DEDUPE } from "../config/models.js";
+
 const DEFAULT_MAX_EXTRA_TITLE_TOKENS = 2;
 const DEFAULT_INGREDIENT_JACCARD = 0.5;
-const DEFAULT_DEDUPE_MODEL = "gpt-4o-mini";
+const DEFAULT_DEDUPE_MODEL = MODEL_RECIPE_DEDUPE;
 const MAX_DEDUPE_LLM_RECIPES = 24;
 const MAX_DEDUPE_LLM_INGREDIENTS = 6;
 const DEFAULT_DEDUPE_TIMEOUT_MS = 12_000;

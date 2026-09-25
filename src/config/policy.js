@@ -1,34 +1,32 @@
 // src/config/policy.js
 import { parseNodeEnvironment } from "./runtimeConfig.js";
+import { CHAT_MODEL_FREE, CHAT_MODELS_ALLOWED } from "./models.js";
 
 // Full access models (signed-in users)
 // Non-subscribers are narrowed to NON_SUBSCRIBER_CHAT_MODEL below.
-export const ALLOWED_MODELS_AUTHED = new Set([
-    "gpt-5",
-    "gpt-5-mini",
-    "gpt-4o",
-    "gpt-4o-mini",
-  ]);
+export const ALLOWED_MODELS_AUTHED = new Set(CHAT_MODELS_ALLOWED);
   
-  // Trial models (cheap + predictable)
-  export const ALLOWED_MODELS_TRIAL = new Set([
-    "gpt-5",
-    "gpt-5-mini",
-    "gpt-4o",
-    "gpt-4o-mini",
-  ]);
-
   // All users without an active subscription are forced onto this model.
-  // Keep ALLOWED_MODELS_TRIAL above unchanged for protocol/history reference.
-  export const NON_SUBSCRIBER_CHAT_MODEL = "gpt-5-mini";
+  export const NON_SUBSCRIBER_CHAT_MODEL = CHAT_MODEL_FREE;
   export const ALLOWED_MODELS_NON_SUBSCRIBER = new Set([
     NON_SUBSCRIBER_CHAT_MODEL,
   ]);
+
+  // Models that support explicit prompt-cache breakpoints (GPT-5.6 generation).
+  // Earlier models (gpt-4o / gpt-4o-mini) are implicit-cache only and must not
+  // receive the breakpoint marker or prompt_cache_options.
+  export const EXPLICIT_CACHE_BREAKPOINT_MODELS = new Set([
+    "gpt-5.6-luna",
+    "gpt-5.6-terra",
+  ]);
+
+  // Safety toggle for the backend's explicit cache boundary. Flip to false to
+  // fall back to implicit caching without a redeploy.
+  export const EXPLICIT_PROMPT_CACHE_ENABLED = true;
   
   // Tools allowed during trial
   export const TRIAL_ALLOWED_TOOLS = new Set([
     "webSearch",
-    "webFetch",
     "recommendRecipes",
     "proposeRecipePreferenceUpdate",
     "addFridgeItem",

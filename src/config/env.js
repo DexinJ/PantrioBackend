@@ -5,6 +5,10 @@ import {
   requireNodeEnvironment,
   validateSingleReplicaEnvironment,
 } from "./runtimeConfig.js";
+import {
+  MODEL_RECIPE_ESTIMATION_DEFAULT,
+  MODEL_RECIPE_IDEATION_DEFAULT,
+} from "./models.js";
 
 dotenv.config();
 
@@ -17,14 +21,14 @@ export const RECIPE_AI_ESTIMATION_ENABLED = /^(1|true|yes)$/i.test(
   String(process.env.RECIPE_AI_ESTIMATION || "")
 );
 export const RECIPE_ESTIMATION_MODEL =
-  String(process.env.RECIPE_ESTIMATION_MODEL || "gpt-4o-mini").trim() ||
-  "gpt-4o-mini";
+  String(process.env.RECIPE_ESTIMATION_MODEL || MODEL_RECIPE_ESTIMATION_DEFAULT).trim() ||
+  MODEL_RECIPE_ESTIMATION_DEFAULT;
 export const RECIPE_IDEATION_ENABLED = /^(1|true|yes)$/i.test(
   String(process.env.RECIPE_IDEATION || "")
 );
 export const RECIPE_IDEATION_MODEL =
-  String(process.env.RECIPE_IDEATION_MODEL || "gpt-4o-mini").trim() ||
-  "gpt-4o-mini";
+  String(process.env.RECIPE_IDEATION_MODEL || MODEL_RECIPE_IDEATION_DEFAULT).trim() ||
+  MODEL_RECIPE_IDEATION_DEFAULT;
 
 validateSingleReplicaEnvironment(process.env);
 if (!OPENAI_API_KEY) throw new Error("Missing OPENAI_API_KEY in .env");

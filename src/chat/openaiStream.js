@@ -2,6 +2,10 @@
 import { OPENAI_API_KEY } from "../config/env.js";
 import { OPENAI_TOOLS } from "./tools.js";
 import { safeJsonParse } from "../utils/json.js";
+import {
+  EXPLICIT_CACHE_BREAKPOINT_MODELS,
+  EXPLICIT_PROMPT_CACHE_ENABLED,
+} from "../config/policy.js";
 
 function upsertToolCalls(toolCallState, toolCallsDelta) {
   for (const tc of toolCallsDelta) {
@@ -53,6 +57,56 @@ async function withAbortTimeout(controller, timeoutMs, operation) {
   }
 }
 
+const EXPLICIT_CACHE_BREAKPOINT = Object.freeze({ mode: "explicit" });
+
+function supportsExplicitCacheBreakpoints(model) {
+  return (
+    EXPLICIT_PROMPT_CACHE_ENABLED === true &&
+    typeof model === "string" &&
+    EXPLICIT_CACHE_BREAKPOINT_MODELS.has(model)
+  );
+}
+
+/**
+ * Attach the explicit cache breakpoint to the leading system message, marking
+ * the end of the reusable "tools + system prompt" prefix. String system content
+ * is converted to a single content part so the marker can be attached.
+ */
+function markSystemCacheBreakpoint(messages) {
+  if (!Array.isArray(messages)) return messages;
+
+  return messages.map((message, index) => {
+    if (index !== 0 || !message || message.role !== "system") return message;
+
+    let parts;
+    if (typeof message.content === "string") {
+      parts = [{ type: "text", text: message.content }];
+    } else if (Array.isArray(message.content)) {
+      parts = message.content.map((part) => ({ ...part }));
+    } else {
+      return message;
+    }
+
+    if (parts.length === 0) {
+      parts = [
+        {
+          type: "text",
+          text: "",
+          prompt_cache_breakpoint: EXPLICIT_CACHE_BREAKPOINT,
+        },
+      ];
+    } else {
+      const lastIndex = parts.length - 1;
+      parts[lastIndex] = {
+        ...parts[lastIndex],
+        prompt_cache_breakpoint: EXPLICIT_CACHE_BREAKPOINT,
+      };
+    }
+
+    return { ...message, content: parts };
+  });
+}
+
 /**
  * Stream one OpenAI call and forward deltas to ws.
  * Tool calls are returned to the gateway. The gateway owns routing so raw
@@ -76,6 +130,10 @@ export async function streamOpenAIOnce({
   return withAbortTimeout(controller, timeoutMs, async () => {
   let firstTokenAt = null;
   const t0 = Date.now();
+  const explicitCache = supportsExplicitCacheBreakpoints(model);
+  const requestMessages = explicitCache
+    ? markSystemCacheBreakpoint(messages)
+    : messages;
   const resp = await fetch("https://api.openai.com/v1/chat/completions", {
     method: "POST",
     headers: {
@@ -84,9 +142,12 @@ export async function streamOpenAIOnce({
     },
     body: JSON.stringify({
       model,
-      messages,
+      messages: requestMessages,
       stream: true,
       stream_options: { include_usage: true },
+      ...(explicitCache
+        ? { prompt_cache_options: { mode: "explicit", ttl: "30m" } }
+        : {}),
       ...(Array.isArray(tools) && tools.length
         ? {
             tools,

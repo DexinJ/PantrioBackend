@@ -192,8 +192,8 @@ Products and server-side capabilities are controlled by validated
     "name": "Pantrio Starter",
     "productIds": ["com.chilltech.pantrio.starter.monthly"],
     "dailyTokenLimit": 50000,
-    "defaultModel": "gpt-5-mini",
-    "allowedModels": ["gpt-5-mini"],
+    "defaultModel": "gpt-5.6-luna",
+    "allowedModels": ["gpt-5.6-luna"],
     "maxCompletionTokens": 1000,
     "maxPromptTokens": 25000
   },
@@ -205,8 +205,8 @@ Products and server-side capabilities are controlled by validated
       "com.chilltech.pantrio.subscription.yearly"
     ],
     "dailyTokenLimit": null,
-    "defaultModel": "gpt-5",
-    "allowedModels": ["gpt-5", "gpt-5-mini", "gpt-4o", "gpt-4o-mini"],
+    "defaultModel": "gpt-5.6-terra",
+    "allowedModels": ["gpt-5.6-terra", "gpt-5.6-luna", "gpt-4o", "gpt-4o-mini"],
     "maxCompletionTokens": 4000,
     "maxPromptTokens": 50000
   }
@@ -226,7 +226,7 @@ priority, so list plans from lowest to highest entitlement. Keep retired
 product IDs configured while their transaction chains may still send
 notifications. When the variable is omitted, the current monthly/yearly Pro
 catalog is used. The built-in free plan remains 20,000 daily tokens,
-`gpt-5-mini`, and 600 completion tokens.
+`gpt-5.6-luna`, and 4,000 completion tokens per round.
 
 ## Client subscription telemetry
 
@@ -269,14 +269,14 @@ revocation. Local non-production environments may temporarily set
 ## Non-subscriber token quota
 
 Authenticated users without verified subscription access receive 20,000 total
-tokens per Los Angeles calendar day and at most 600 completion tokens per
+tokens per Los Angeles calendar day and at most 4,000 completion tokens per
 text-model round. Usage is keyed by Firebase UID. Chat tool-continuation rounds,
 summarization, and transcription usage reported by OpenAI all count toward the
 daily total. WebSocket chat requires a valid Firebase ID token; client-selected
 guest or trial IDs are not accepted as quota identities.
 
 WebSocket chat requests from non-subscribers are always executed with
-`gpt-5-mini`, even if the client requests another model. Verified subscribers
+`gpt-5.6-luna`, even if the client requests another model. Verified subscribers
 receive the daily limit, default/allowed models, completion cap, and prompt cap
 configured for their specific plan.
 
@@ -313,7 +313,7 @@ The session response is shaped as:
   },
   "model": {
     "requested": null,
-    "effective": "gpt-5-mini",
+    "effective": "gpt-5.6-luna",
     "restricted": true
   },
   "apple": {

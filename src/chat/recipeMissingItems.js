@@ -13,12 +13,13 @@
 // at the bottom for the two edits that wire it in.
 
 import { OPENAI_API_KEY } from "../config/env.js";
+import { MODEL_RECIPE_MISSING_ITEMS } from "../config/models.js";
 
 export const MAX_MISSING_ITEMS = 30;
 export const MAX_ITEM_NAME_LENGTH = 120;
 export const MAX_ITEM_QUANTITY_LENGTH = 40;
 
-const DEFAULT_MODEL = "gpt-4o-mini";
+const DEFAULT_MODEL = MODEL_RECIPE_MISSING_ITEMS;
 const MAX_LINES_PER_CALL = 60;
 const MAX_CACHE_ENTRIES = 200;
 const DEFAULT_TIMEOUT_MS = 12_000;

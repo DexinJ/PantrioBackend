@@ -106,6 +106,9 @@ async function configureOperationalPragmas(db) {
   // journal_mode cannot be changed from inside a transaction. Compatibility is
   // checked before this call so an older binary never mutates a newer database.
   await db.exec("PRAGMA journal_mode = WAL");
+  // WAL already keeps the database consistent on crash; NORMAL trades the last
+  // few transactions on power loss for substantially cheaper write commits.
+  await db.exec("PRAGMA synchronous = NORMAL");
   // foreign_keys is connection-local and is also a no-op inside a transaction.
   await db.exec("PRAGMA foreign_keys = ON");
 }
