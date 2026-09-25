@@ -42,7 +42,9 @@ export const ALLOWED_MODELS_AUTHED = new Set(CHAT_MODELS_ALLOWED);
   ]);
   
   // Trial token budgets (SQLite-backed daily quota)
-  export const TRIAL_TOKENS_PER_DAY = 20_000;      // adjust to your product
+  // TEMP: effectively unlimited for testing. Restore a product value (e.g.
+  // 20_000) before shipping. See plan below for making this configurable.
+  export const TRIAL_TOKENS_PER_DAY = 1_000_000_000;
   export const TRIAL_MAX_COMPLETION_TOKENS = 4_000;  // per request cap
 
   // The existing trial budget is now the shared daily budget for every
