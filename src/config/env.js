@@ -29,6 +29,11 @@ export const RECIPE_IDEATION_ENABLED = /^(1|true|yes)$/i.test(
 export const RECIPE_IDEATION_MODEL =
   String(process.env.RECIPE_IDEATION_MODEL || MODEL_RECIPE_IDEATION_DEFAULT).trim() ||
   MODEL_RECIPE_IDEATION_DEFAULT;
+// When enabled, every chat round sent to the AI provider is logged as a single
+// structured JSON line (with images redacted and long text truncated).
+export const LOG_AI_REQUESTS = /^(1|true|yes)$/i.test(
+  String(process.env.LOG_AI_REQUESTS || "")
+);
 
 validateSingleReplicaEnvironment(process.env);
 if (!OPENAI_API_KEY) throw new Error("Missing OPENAI_API_KEY in .env");

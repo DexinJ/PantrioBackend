@@ -18,6 +18,7 @@ import { MODEL_RECIPE_MISSING_ITEMS } from "../config/models.js";
 export const MAX_MISSING_ITEMS = 30;
 export const MAX_ITEM_NAME_LENGTH = 120;
 export const MAX_ITEM_QUANTITY_LENGTH = 40;
+export const MAX_ITEM_LINE_LENGTH = 160;
 
 const DEFAULT_MODEL = MODEL_RECIPE_MISSING_ITEMS;
 const MAX_LINES_PER_CALL = 60;
@@ -138,6 +139,7 @@ function createJsonChatClient({
 /** Every line is still addable when the service cannot help. */
 function fallbackItem(line) {
   return {
+    line: clip(line, MAX_ITEM_LINE_LENGTH),
     name: clip(line, MAX_ITEM_NAME_LENGTH),
     quantity: "1",
   };
@@ -160,6 +162,7 @@ function normalizeParsedItems(parsed, lines) {
       (positional ? lines[index] : undefined);
     if (!line) return;
     byLine.set(line, {
+      line: clip(line, MAX_ITEM_LINE_LENGTH),
       name,
       quantity: clip(entry?.quantity, MAX_ITEM_QUANTITY_LENGTH) || "1",
     });
@@ -240,9 +243,12 @@ export async function decorateWithMissingItems(
     if (missing.length === 0) return recipe;
     return {
       ...recipe,
-      missingItems: missing.map(
-        (line) => table.get(line) ?? fallbackItem(line)
-      ),
+      missingItems: missing.map((line) => {
+        const item = table.get(line) ?? fallbackItem(line);
+        // The key is the canonical display line, so every item keeps its own
+        // source text even when a custom structurer omitted it.
+        return { ...item, line: clip(line, MAX_ITEM_LINE_LENGTH) };
+      }),
     };
   });
 }

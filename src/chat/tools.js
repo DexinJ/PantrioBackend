@@ -267,7 +267,7 @@ const EXPIRES_IN_DAYS_SCHEMA = {
   type: "integer",
   minimum: 1,
   description:
-    "Whole-day shelf-life estimate from today (e.g. raw chicken 2, milk 7, frozen meat 180). Never pass calendar dates.",
+    "Required whole-day shelf-life estimate from today (e.g. raw chicken 2, milk 7, frozen meat 180). Never pass calendar dates.",
 };
 
 export const RECOMMEND_RECIPES_TOOL = {
@@ -441,14 +441,14 @@ export const OPENAI_TOOLS = [
     function: {
       name: "webSearch",
       description:
-        "Search the web only when the user asks to browse/search online or the answer needs up-to-date facts (news, prices, recalls). Never use for recipes (use recommendRecipes) or for fridge/shopping-list actions.",
+        "Search the web when the user asks to browse/search online or needs up-to-date facts (news, prices, recalls). Returns short snippets (title, link, snippet) only; there is no page-fetch tool, so answer from the snippets. Never use for recipes (use recommendRecipes) or fridge/shopping-list actions.",
       parameters: {
         type: "object",
         properties: {
-          query: { type: "string", description: "Search query." },
+          query: { type: "string", description: "Specific, natural-language search query." },
           k: {
             type: "integer",
-            description: "Number of results (1-10).",
+            description: "Number of results (1-10). Defaults to 5 when omitted.",
             minimum: 1,
             maximum: 10,
           },
@@ -489,7 +489,7 @@ export const OPENAI_TOOLS = [
     function: {
       name: "addFridgeItem",
       description:
-        "Add an item to the fridge. Include exactly 1 storage, 1 urgency, 1 food_type (state optional). Estimate shelf life in whole days with expiresInDays. Never invent categories.",
+        "Add an item to the fridge. Include exactly 1 storage, 1 urgency, 1 food_type (state optional). Always include a whole-day shelf-life estimate in expiresInDays. Never invent categories.",
       parameters: {
         type: "object",
         properties: {
@@ -501,7 +501,7 @@ export const OPENAI_TOOLS = [
           categories: CATEGORY_SCHEMA,
           expiresInDays: EXPIRES_IN_DAYS_SCHEMA,
         },
-        required: ["name", "categories"],
+        required: ["name", "categories", "expiresInDays"],
         additionalProperties: false,
       },
     },
@@ -615,7 +615,7 @@ export const OPENAI_TOOLS = [
     function: {
       name: "proposeAddAllToFridge",
       description:
-        "UI-only: after a fridge image or an explicit batch-add request, show one 'Add all to fridge' confirmation card. Never use for recipes, meal ideas, or ordinary lists. Each item needs exactly 1 storage, 1 urgency, 1 food_type (state optional) and a whole-day expiresInDays estimate. Never invent categories.",
+        "UI-only: after a fridge image or an explicit batch-add request, show one 'Add all to fridge' confirmation card. Never use for recipes, meal ideas, or ordinary lists. Each item needs exactly 1 storage, 1 urgency, 1 food_type (state optional) and a required whole-day expiresInDays estimate. Never invent categories.",
       parameters: {
         type: "object",
         properties: {
@@ -631,7 +631,7 @@ export const OPENAI_TOOLS = [
                 categories: CATEGORY_SCHEMA,
                 expiresInDays: EXPIRES_IN_DAYS_SCHEMA,
               },
-              required: ["name", "categories"],
+              required: ["name", "categories", "expiresInDays"],
               additionalProperties: false,
             },
           },
@@ -684,7 +684,7 @@ export const OPENAI_TOOLS = [
     function: {
       name: "updateFridgeItem",
       description:
-        "Edit one fridge item (name, quantity, categories, or whole-day expiresInDays). Resolve by id when available, otherwise by exact name. For several items use proposeBulkFridgeUpdate.",
+        "Edit one fridge item (name, quantity, categories, and a whole-day expiresInDays estimate). Always include expiresInDays. Resolve by id when available, otherwise by exact name. For several items use proposeBulkFridgeUpdate.",
       parameters: {
         type: "object",
         properties: {
@@ -698,6 +698,7 @@ export const OPENAI_TOOLS = [
               categories: CATEGORY_SCHEMA,
               expiresInDays: EXPIRES_IN_DAYS_SCHEMA,
             },
+            required: ["expiresInDays"],
             additionalProperties: false,
           },
         },
@@ -712,7 +713,7 @@ export const OPENAI_TOOLS = [
     function: {
       name: "proposeBulkFridgeUpdate",
       description:
-        "Show one confirmation card for multiple fridge changes (rename, quantity, categories, whole-day expiresInDays, or remove). Resolve by id when available, otherwise by exact name. Nothing changes until confirmed.",
+        "Show one confirmation card for multiple fridge changes (rename, quantity, categories, whole-day expiresInDays, or remove). Resolve by id when available, otherwise by exact name. Every non-remove change must include expiresInDays. Nothing changes until confirmed.",
       parameters: {
         type: "object",
         properties: {
@@ -733,6 +734,7 @@ export const OPENAI_TOOLS = [
                     categories: CATEGORY_SCHEMA,
                     expiresInDays: EXPIRES_IN_DAYS_SCHEMA,
                   },
+                  required: ["expiresInDays"],
                   additionalProperties: false,
                 },
                 remove: {
@@ -751,40 +753,4 @@ export const OPENAI_TOOLS = [
     },
   },
 
-  {
-    type: "function",
-    function: {
-      name: "proposeAddMissingIngredientsToShoppingList",
-      description:
-        "After recommendRecipes, propose adding missing ingredients to the shopping list. One confirmation card; nothing is added until confirmed. Never use for the fridge or before recommendRecipes.",
-      parameters: {
-        type: "object",
-        properties: {
-          items: {
-            type: "array",
-            minItems: 1,
-            items: {
-              type: "object",
-              properties: {
-                name: { type: "string", description: "Ingredient name." },
-                quantity: { type: "string", description: "Optional amount." },
-                categories: CATEGORY_SCHEMA,
-              },
-              required: ["name"],
-              additionalProperties: false,
-            },
-          },
-          title: { type: "string", description: "Optional card title." },
-        },
-        required: ["items"],
-        additionalProperties: false,
-      },
-    },
-  },
 ];
-
-export const PROPOSE_ADD_MISSING_INGREDIENTS_TO_SHOPPING_LIST_TOOL =
-  OPENAI_TOOLS.find(
-    (tool) =>
-      tool?.function?.name === "proposeAddMissingIngredientsToShoppingList"
-  );

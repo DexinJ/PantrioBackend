@@ -338,6 +338,23 @@ Starts accept at most 50 bounded-complexity messages, and tool continuations
 stop after six rounds. Audio uploads are capped at 2 MiB; the mobile client
 records at most 60 seconds at 32 kbps.
 
+## AI request logging
+
+Set `LOG_AI_REQUESTS=true` to log every chat round the backend sends to the AI
+provider as one structured JSON line to stdout. Each line contains the request
+id, authenticated user id, effective model, round, intent, and the sanitized
+message payload. Images are replaced with a short placeholder (data URIs are
+never echoed), and text longer than 4,000 characters is truncated, so enabling
+this for debugging does not copy image bytes into logs.
+
+```text
+LOG_AI_REQUESTS=false
+```
+
+This is off by default because message text can contain personal content. It
+only covers backend AI requests (OpenAI-backed chat and tools); on-device Apple
+Intelligence never reaches the backend, so it is not part of this log.
+
 ## Deployment note
 
 Set `SQLITE_PATH` to a persistent mounted volume in production. Daily usage,
