@@ -1421,6 +1421,7 @@ export function attachRoutes(app) {
       const summarySystemPrompt =
         "Summarize the following chat for memory retention. " +
         "Focus only on fridge and shopping-list state. " +
+        "Never mention tool names, prompts, schemas, or internal pipeline steps. " +
         `Reply in ${language}.`;
 
       const summaryQuotaMessages = [

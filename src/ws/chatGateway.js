@@ -53,8 +53,9 @@ import {
 import { streamOpenAIOnce } from "../chat/openaiStream.js";
 import { resolveChatModel } from "../chat/modelPolicy.js";
 import {
-  detectRecipeFollowUp,
-  normalizeChatIntent,
+  normalizeRecipeUiAction,
+  RECIPE_UI_ACTIONS,
+  resolveRequestRoutingWithReason,
   resolveRoundToolPolicy,
   sanitizeRecipeContext,
 } from "../chat/recipeRequest.js";
@@ -688,6 +689,7 @@ export function attachChatGateway(
         model,
         round: state.round || 0,
         intent: state.intent,
+        intentSource: state.intentSource,
         messages: state.workingMessages,
       });
 
@@ -1336,23 +1338,36 @@ export function attachChatGateway(
         });
         return;
       }
-      const normalizedIntent = normalizeChatIntent(msg.intent);
       const lastUserMessage = [...(Array.isArray(messages) ? messages : [])]
         .reverse()
         .find((message) => message?.role === "user");
-      const detectedFollowUp = detectRecipeFollowUp({
-        text: lastUserMessage ? textOfMessage(lastUserMessage) : "",
-        history: Array.isArray(messages) ? messages.slice(0, -1) : [],
-        language,
-      });
-      const intent =
-        normalizedIntent === "recipe_recommendation" || detectedFollowUp
-          ? "recipe_recommendation"
-          : "chat";
+      if (msg.uiAction !== undefined && !normalizeRecipeUiAction(msg.uiAction)) {
+        send(ws, {
+          type: "error",
+          requestId,
+          code: "INVALID_REQUEST",
+          message: `uiAction must be one of: ${RECIPE_UI_ACTIONS.join(", ")}.`,
+        });
+        return;
+      }
+      const uiAction = normalizeRecipeUiAction(msg.uiAction);
+      const lastUserText = lastUserMessage ? textOfMessage(lastUserMessage) : "";
       const recipeContext = sanitizeRecipeContext(msg.recipeContext);
       // Already validated above; the recipe pipeline uses it so a dish is
       // searched for, and returned, in the app's language.
       recipeContext.language = language;
+      // Routing is server-owned: the client's classifier is gone, free text is
+      // matched by high-precision rules, and an explicit UI action always wins.
+      // `msg.intent` is accepted for installed clients but is no longer
+      // authoritative — a wrong client guess can no longer hijack the turn.
+      const { intent, reason: intentSource } = resolveRequestRoutingWithReason({
+        text: lastUserText,
+        history: Array.isArray(messages) ? messages.slice(0, -1) : [],
+        uiAction,
+        legacyIntent: msg.intent,
+        selectedIngredients: recipeContext.selectedIngredients,
+        language,
+      });
       const systemPrompt = buildSystemMessage({
         userName: sanitizeUserName(msg.userName),
         language,
@@ -1429,6 +1444,7 @@ export function attachChatGateway(
         model,
         language,
         intent,
+        intentSource,
         recipeContext,
         isAuthed,
         userId,

@@ -28,11 +28,10 @@ const DEFAULT_TIMEOUT_MS = 12_000;
 const STRUCTURING_SYSTEM_PROMPT = `You turn recipe ingredient lines into shopping-list items.
 For each line return:
 - name: the ingredient, without the quantity and without packaging words
-- quantity: the amount exactly as written, including phrases like "to taste" or "as needed". Use "1" only when the line carries no amount at all.
+- quantity: the smallest amount a shopper can realistically buy, as a short value. Prefer a plain count of purchasable units ("1", "2", "3"). Use the natural count when the ingredient is sold by the piece ("3 eggs" -> "3", "2 onions" -> "2"). Otherwise use "1" for one package, can, bottle, or bunch. Never put a recipe-only portion or tasting amount such as "1/4 tsp", "1 tbsp", "1/2 cup", "to taste", or "as needed" into quantity.
 Rules:
 - Never invent an ingredient that is not in the line.
-- quantity is only the amount. Leave parenthetical alternatives, brand notes and commentary out of both fields rather than moving them into quantity.
-- Keep numbers in the form they appear: "1/4 cup" stays "1/4 cup", never "¼ cup".
+- quantity is only the purchasable amount. Leave parenthetical alternatives, brand notes, and commentary out of both fields rather than moving them into quantity.
 - Keep a preparation note out of the name only when the ingredient still reads correctly without it ("1 lb flank steak, cut into strips" -> name "flank steak").
 - Keep the line you were given in "line", unchanged.
 Respond with ONLY JSON: {"items":[{"line":"...","name":"...","quantity":"..."}]}`;

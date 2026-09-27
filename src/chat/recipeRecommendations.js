@@ -2,6 +2,7 @@ import { fetchPublicTextPage } from "./safeWebFetch.js";
 import { parseRecipeJsonLd } from "./recipeJsonLd.js";
 import {
   countTranslatableStrings,
+  ingredientMatchesTerm,
   recipeTranslationEnabled,
   translateRecipes,
 } from "./recipeDishSearch.js";
@@ -19,25 +20,25 @@ const COOKING_METHODS = new Set([
   "stovetop",
   "oven",
 ]);
-const MAX_RESULT_COUNT = 4;
-const DEFAULT_RESULT_COUNT = 4;
+const MAX_RESULT_COUNT = 6;
+const DEFAULT_RESULT_COUNT = 6;
 const MAX_IDEATION_IDEAS = 5;
 const IDEA_MATCH_WEIGHT = 0.25;
 // How many viable candidates to gather before picking the final short list.
 // Selection returns at most MAX_RESULT_COUNT, but search keeps going until
 // roughly this many required/viable recipes are available (or the budget ends).
-const CANDIDATE_POOL_TARGET = 10;
+const CANDIDATE_POOL_TARGET = 14;
 // Search work is not charged against the user's token quota, so there is no
 // entitlement-specific search budget. These limits are server safety rails
 // (latency/load) only; entitlement now controls just the result-count cap.
 const SAFETY_LIMITS = Object.freeze({
   maxSearchQueries: 8,
-  searchResultsPerQuery: 10,
-  maxPages: 24,
-  fetchConcurrency: 3,
-  pageTimeoutMs: 10_000,
+  searchResultsPerQuery: 12,
+  maxPages: 32,
+  fetchConcurrency: 8,
+  pageTimeoutMs: 7_000,
   pageMaxBytes: 512 * 1024,
-  overallTimeoutMs: 30_000,
+  overallTimeoutMs: 40_000,
   maxRecipesPerPage: 6,
 });
 const DEFAULT_LIMITS = SAFETY_LIMITS;
@@ -287,11 +288,12 @@ function termTokens(value, { removeStopWords = false } = {}) {
     .map(singularizeToken);
 }
 
-function termMatchesIngredient(term, ingredient) {
-  const expected = termTokens(term, { removeStopWords: true });
-  if (expected.length === 0) return false;
-  const actual = new Set(termTokens(ingredient));
-  return expected.every((token) => actual.has(token));
+function stripTermStopWords(value) {
+  return String(value || "")
+    .trim()
+    .split(/\s+/)
+    .filter((word) => word && !TERM_STOP_WORDS.has(word.toLowerCase()))
+    .join(" ");
 }
 
 function normalizedStringList(value, { maxItems = 20, maxLength = 60 } = {}) {
@@ -871,7 +873,7 @@ async function fetchRecipePages(fetchPage, pages, limits, deadline, language) {
 function findConstraintConflict(recipe, rules) {
   for (const rule of rules) {
     for (const ingredient of recipe.ingredients) {
-      if (rule.terms.some((term) => termMatchesIngredient(term, ingredient))) {
+      if (rule.terms.some((term) => ingredientMatchesTerm(stripTermStopWords(term), ingredient))) {
         return { label: rule.label, ingredient };
       }
     }
@@ -1038,7 +1040,7 @@ function matchItemsToRecipe(recipe, items) {
   const matchedIngredientIndexes = new Set();
   for (const item of items) {
     const index = recipe.ingredients.findIndex((ingredient) =>
-      termMatchesIngredient(item, ingredient)
+      ingredientMatchesTerm(stripTermStopWords(item), ingredient)
     );
     if (index >= 0) {
       matched.push(item);
@@ -1169,7 +1171,7 @@ function ideaCoreOverlap(recipe, idea) {
   const ingredients = Array.isArray(recipe.ingredients) ? recipe.ingredients : [];
   let matched = 0;
   for (const core of idea.coreIngredients || []) {
-    if (ingredients.some((ingredient) => termMatchesIngredient(core, ingredient))) {
+    if (ingredients.some((ingredient) => ingredientMatchesTerm(stripTermStopWords(core), ingredient))) {
       matched += 1;
     }
   }
@@ -1682,48 +1684,61 @@ export async function recommendRecipes(
       fetchedPages: 0,
     };
     let searchesRun = 0;
-    for (let offset = 0; offset < queryPlan.length; offset += 2) {
-      assertNotAborted(deadline);
-      const waveQueries = queryPlan.slice(offset, offset + 2);
-      searchesRun += waveQueries.length;
-      const wavePages = await searchForPages(
-        search,
-        waveQueries,
-        limits,
-        deadline,
-        warnings,
-        { exclude: seenUrls }
-      );
-      if (wavePages.length === 0) break;
-      for (const page of wavePages) {
-        seenUrls.add(canonicalUrl(page.link));
-        aggregate.pages.push(page);
+    // A spent budget is not a failed request: whatever earlier waves already
+    // produced is ranked and returned, with a warning explaining the limit.
+    try {
+      for (let offset = 0; offset < queryPlan.length; offset += 2) {
+        assertNotAborted(deadline);
+        const waveQueries = queryPlan.slice(offset, offset + 2);
+        searchesRun += waveQueries.length;
+        const wavePages = await searchForPages(
+          search,
+          waveQueries,
+          limits,
+          deadline,
+          warnings,
+          { exclude: seenUrls }
+        );
+        if (wavePages.length === 0) break;
+        for (const page of wavePages) {
+          seenUrls.add(canonicalUrl(page.link));
+          aggregate.pages.push(page);
+        }
+        const fetched = await fetchRecipePages(
+          fetchPage,
+          wavePages,
+          limits,
+          deadline,
+          language ?? recipeContext?.language ?? "en"
+        );
+        aggregate.recipes.push(...fetched.recipes);
+        aggregate.failedPages += fetched.failedPages;
+        aggregate.truncatedPages += fetched.truncatedPages;
+        aggregate.malformedScripts += fetched.malformedScripts;
+        aggregate.fetchedPages += fetched.fetchedPages;
+        const constrainedWave = applyHardConstraints(
+          aggregate.recipes,
+          inputs,
+          constraintRules
+        );
+        const required = effectiveRequiredIngredients(inputs);
+        const usableRequired =
+          required.length > 0
+            ? constrainedWave.recipes.filter(
+                (recipe) => requiredCoverage(recipe, required).score >= 1
+              ).length
+            : constrainedWave.recipes.length;
+        if (usableRequired >= CANDIDATE_POOL_TARGET) break;
       }
-      const fetched = await fetchRecipePages(
-        fetchPage,
-        wavePages,
-        limits,
-        deadline,
-        language ?? recipeContext?.language ?? "en"
+    } catch (error) {
+      if (!deadline.timedOut) throw error;
+      pushWarning(
+        warnings,
+        warning(
+          "RECIPE_SEARCH_TIMEOUT",
+          "The recipe search ran out of time; results are limited to the pages that were already read."
+        )
       );
-      aggregate.recipes.push(...fetched.recipes);
-      aggregate.failedPages += fetched.failedPages;
-      aggregate.truncatedPages += fetched.truncatedPages;
-      aggregate.malformedScripts += fetched.malformedScripts;
-      aggregate.fetchedPages += fetched.fetchedPages;
-      const constrainedWave = applyHardConstraints(
-        aggregate.recipes,
-        inputs,
-        constraintRules
-      );
-      const required = effectiveRequiredIngredients(inputs);
-      const usableRequired =
-        required.length > 0
-          ? constrainedWave.recipes.filter(
-              (recipe) => requiredCoverage(recipe, required).score >= 1
-            ).length
-          : constrainedWave.recipes.length;
-      if (usableRequired >= CANDIDATE_POOL_TARGET) break;
     }
     if (aggregate.failedPages > 0) {
       pushWarning(
@@ -1777,7 +1792,11 @@ export async function recommendRecipes(
             deadline
           );
         } catch (error) {
-          if (deadline.signal.aborted) throw abortError(deadline);
+          // Metadata is nice to have. A spent budget skips it instead of
+          // discarding the recipes that were already found.
+          if (deadline.signal.aborted && !deadline.timedOut) {
+            throw abortError(deadline);
+          }
           estimation = null;
         }
         estimatedCount =

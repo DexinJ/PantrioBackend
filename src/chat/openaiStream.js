@@ -3,8 +3,10 @@ import { OPENAI_API_KEY } from "../config/env.js";
 import { OPENAI_TOOLS } from "./tools.js";
 import { safeJsonParse } from "../utils/json.js";
 import {
+  DEFAULT_REASONING_EFFORT,
   EXPLICIT_CACHE_BREAKPOINT_MODELS,
   EXPLICIT_PROMPT_CACHE_ENABLED,
+  REASONING_EFFORT_MODELS,
 } from "../config/policy.js";
 
 function upsertToolCalls(toolCallState, toolCallsDelta) {
@@ -64,6 +66,13 @@ function supportsExplicitCacheBreakpoints(model) {
     EXPLICIT_PROMPT_CACHE_ENABLED === true &&
     typeof model === "string" &&
     EXPLICIT_CACHE_BREAKPOINT_MODELS.has(model)
+  );
+}
+
+function supportsReasoningEffort(model) {
+  return (
+    typeof model === "string" &&
+    REASONING_EFFORT_MODELS.has(model)
   );
 }
 
@@ -147,6 +156,9 @@ export async function streamOpenAIOnce({
       stream_options: { include_usage: true },
       ...(explicitCache
         ? { prompt_cache_options: { mode: "explicit", ttl: "30m" } }
+        : {}),
+      ...(supportsReasoningEffort(model)
+        ? { reasoning_effort: DEFAULT_REASONING_EFFORT }
         : {}),
       ...(Array.isArray(tools) && tools.length
         ? {

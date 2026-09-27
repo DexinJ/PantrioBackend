@@ -47,19 +47,31 @@ import { MODEL_RECIPE_TRANSLATION } from "../config/models.js";
 // Limits
 // ---------------------------------------------------------------------------
 
-export const MAX_DISH_RESULT_COUNT = 4;
-export const DEFAULT_DISH_RESULT_COUNT = 4;
+export const MAX_DISH_RESULT_COUNT = 6;
+export const DEFAULT_DISH_RESULT_COUNT = 6;
 
 export const DEFAULT_DISH_LIMITS = Object.freeze({
-  maxSearchQueries: 4,
-  searchResultsPerQuery: 10,
-  maxPages: 20,
-  fetchConcurrency: 3,
-  pageTimeoutMs: 10_000,
+  maxSearchQueries: 8,
+  searchResultsPerQuery: 12,
+  maxPages: 30,
+  fetchConcurrency: 8,
+  // Queries are independent HTTP calls, so a few in flight at once keeps the
+  // larger non-English budget from costing seconds of wall clock.
+  searchConcurrency: 3,
+  pageTimeoutMs: 7_000,
   pageMaxBytes: 512 * 1024,
-  overallTimeoutMs: 25_000,
+  overallTimeoutMs: 35_000,
   maxRecipesPerPage: 6,
 });
+
+// Near matches are only a fallback for a named dish with nothing exact. They
+// are labelled in the UI, so keep them to a minority of the short list.
+export const MAX_NEAR_MATCH_RESULTS = 2;
+
+// Translation is the last step and the only optional one: with less than this
+// much budget left, results are returned in their published language and the
+// caller is told why.
+export const MIN_TRANSLATION_BUDGET_MS = 6_000;
 
 /**
  * Hosts that essentially never carry Schema.org Recipe markup. Measured host
@@ -118,7 +130,7 @@ export const DEFAULT_DENIED_HOST_PATTERNS = Object.freeze([
  * is in place because they do not turn into extra page fetches.
  */
 export function defaultDishQueryBudget(language) {
-  return normalizeRecipeLanguage(language) === "en" ? 4 : 6;
+  return normalizeRecipeLanguage(language) === "en" ? 6 : 8;
 }
 
 export function hostnameOf(value) {
@@ -186,6 +198,14 @@ const MESSAGES = Object.freeze({
     partialPages: "One or more searches were unavailable; results may be limited.",
     noStructured: (dish) =>
       `Pages matching ${dish} were found, but none exposed structured recipe data.`,
+    nearMatch: (dish, count) =>
+      `No exact published recipe for ${dish} was found; ${count} close ${
+        count === 1 ? "match is" : "matches are"
+      } labelled as a near match.`,
+    deadlineReached:
+      "The search ran out of time; only the pages fetched so far are included.",
+    translationSkipped:
+      "Results were returned in their published language because the search ran out of time to translate them.",
   }),
   zh: Object.freeze({
     usesRequested: (items) => `使用了你要求的${items.join("、")}`,
@@ -196,6 +216,10 @@ const MESSAGES = Object.freeze({
     partialPages: "部分搜索不可用，结果可能不完整。",
     noStructured: (dish) =>
       `找到了与「${dish}」相关的页面，但都没有结构化食谱数据。`,
+    nearMatch: (dish, count) =>
+      `没有找到与「${dish}」完全一致的已发布食谱，已标注 ${count} 个近似匹配。`,
+    deadlineReached: "搜索超时，仅返回已抓取到的页面结果。",
+    translationSkipped: "搜索时间不足，结果按原始语言返回。",
   }),
 });
 
@@ -693,6 +717,38 @@ export function filterByDish(
   return { accepted, rejected };
 }
 
+/**
+ * True when a candidate keeps the dish's head noun ("清蒸鱼" -> "清蒸鲈鱼",
+ * "mapo tofu" -> "spicy mapo tofu"). The near-match band starts at 50%
+ * coverage, which on its own lets an unrelated lookalike through; requiring the
+ * head noun keeps the fallback to "the same dish, described differently".
+ */
+export function sharesDishHead(recipe, dishQuery, { aliases = [] } = {}) {
+  const titleText = normalizeDishText(recipe?.title || "");
+  if (!titleText) return false;
+  const titleTokens = dishTokenSet(recipe?.title || "");
+  const branches = [dishQuery, ...(Array.isArray(aliases) ? aliases : [])]
+    .filter((entry) => typeof entry === "string" && entry.trim());
+
+  for (const branch of branches) {
+    const stripped = stripDishModifiers(branch);
+    if (!stripped) continue;
+    const characters = [...stripped.replace(/\s+/g, "")];
+    const cjkCharacters = characters.filter((character) =>
+      CJK_CHARACTER.test(character)
+    );
+    if (cjkCharacters.length > 0) {
+      const head = cjkCharacters[cjkCharacters.length - 1];
+      if (titleText.includes(head)) return true;
+      continue;
+    }
+    const tokens = dishTokens(stripped);
+    if (tokens.length === 0) continue;
+    if (titleTokens.has(tokens[tokens.length - 1])) return true;
+  }
+  return false;
+}
+
 // ---------------------------------------------------------------------------
 // Query planning
 // ---------------------------------------------------------------------------
@@ -1139,8 +1195,51 @@ function createJsonChatClient({
 const ALIAS_SYSTEM_PROMPT = `You give alternative names for a dish so a recipe search can recognise it in other languages.
 Rules:
 - Return the dish name in English plus at most 3 other common names.
+- Also return up to 2 same-language variants publishers actually use for the SAME dish, for example 清蒸鱼 -> 清蒸鲈鱼, 清蒸黄鱼, or mapo tofu -> spicy mapo tofu.
+- A variant may name the specific fish, meat cut, or regional style of the same dish. It must never be a different dish, a different main ingredient, a broader category, or a single generic word such as 鱼 or tofu.
 - Use the name real recipe sites would publish, never a description or an ingredient list.
 Respond with ONLY JSON: {"aliases":["...","..."]}`;
+
+/**
+ * Guards an alias before it can widen a search. The gate still scores every
+ * candidate, and a recipe that only matches an alias is returned as a labelled
+ * near match, so this only has to reject aliases that are too generic to be
+ * meaningful ("鱼", "tofu").
+ */
+export function isUsableDishAlias(alias, dishQuery) {
+  const candidate = stripDishModifiers(alias);
+  const dish = stripDishModifiers(dishQuery);
+  if (!candidate || !dish) return false;
+  if (normalizeDishText(candidate) === normalizeDishText(dish)) return false;
+
+  const candidateCharacters = [...candidate.replace(/\s+/g, "")];
+  const cjkCharacters = candidateCharacters.filter((character) =>
+    CJK_CHARACTER.test(character)
+  );
+  const dishCharacters = [...dish.replace(/\s+/g, "")];
+  const dishCjk = dishCharacters.filter((character) =>
+    CJK_CHARACTER.test(character)
+  );
+  const candidateIsCjk = cjkCharacters.length > 0;
+  const dishIsCjk = dishCjk.length > 0;
+
+  if (candidateIsCjk && dishIsCjk) {
+    if (cjkCharacters.length < 2) return false;
+    // The head noun (last character) has to survive, so 清蒸鲈鱼 still reads
+    // as the same 鱼 dish while a bare 鱼 alias is rejected above.
+    return candidate.includes(dishCjk[dishCjk.length - 1]);
+  }
+
+  const candidateTokens = dishTokens(candidate);
+  const dishTokensList = dishTokens(dish);
+  if (candidateTokens.length < 2) return false;
+  // Cross-script aliases (麻婆豆腐 -> "Mapo Tofu") cannot share a head token;
+  // the translation is trusted once it is more than a single generic word.
+  if (candidateIsCjk !== dishIsCjk) return true;
+  if (dishTokensList.length === 0) return false;
+  const head = dishTokensList[dishTokensList.length - 1];
+  return candidateTokens.includes(head);
+}
 
 /**
  * Best-effort alternative names for a dish. This is what lets a proper-noun
@@ -1164,6 +1263,7 @@ export function createDishAliasExpander(options = {}) {
       ? parsed.aliases
           .map((entry) => (typeof entry === "string" ? entry.trim() : ""))
           .filter((entry) => entry && entry.toLowerCase() !== name.toLowerCase())
+          .filter((entry) => isUsableDishAlias(entry, name))
           .slice(0, 4)
       : [];
     if (cache.size >= MAX_ALIAS_CACHE_ENTRIES) cache.clear();
@@ -1810,6 +1910,11 @@ export async function searchRecipesByDish(
   }
 
   const deadline = createDeadline(signal, limits.overallTimeoutMs);
+  const startedAt = Date.now();
+  // Translation is the last step and the least important one, so it is
+  // skipped rather than allowed to blow through the request budget.
+  const remainingMs = () =>
+    Math.max(0, limits.overallTimeoutMs - (Date.now() - startedAt));
   let queriesRun = 0;
   let failedSearches = 0;
   let skippedHostResults = 0;
@@ -1867,49 +1972,65 @@ export async function searchRecipesByDish(
       maxQueries: Math.max(1, limits.maxSearchQueries - reserved),
     });
 
-    // 1. Search every dish query, newest links first, deduped.
+    // 1. Search every dish query, newest links first, deduped. Queries are
+    //    independent HTTP calls, so a bounded pool keeps the larger
+    //    non-English budget from costing seconds of wall clock.
     const seen = new Map();
     const runQueries = async (queryList) => {
-      for (const query of queryList) {
-        if (deadline.signal.aborted) return;
-        if (seen.size >= limits.maxPages) return;
-        queriesRun += 1;
-        let response;
-        try {
-          response = await search(
-            {
-              query,
-              k: limits.searchResultsPerQuery,
-              hl: locale.hl,
-              gl: locale.gl,
-            },
-            { signal: deadline.signal }
-          );
-        } catch {
-          failedSearches += 1;
-          continue;
-        }
-        if (response?.error) failedSearches += 1;
-        for (const result of normalizedResults(response).slice(
-          0,
-          limits.searchResultsPerQuery
-        )) {
-          const host = hostnameOf(result.link);
-          if (isDeniedHost(host, deniedHosts)) {
-            skippedHostResults += 1;
-            if (skippedHosts.size < 20) skippedHosts.add(host);
+      const queue = [...queryList];
+      const workerCount = Math.min(
+        Math.max(1, limits.searchConcurrency),
+        queue.length
+      );
+      const worker = async () => {
+        while (true) {
+          const query = queue.shift();
+          if (!query) return;
+          if (deadline.signal.aborted) return;
+          if (seen.size >= limits.maxPages) return;
+          queriesRun += 1;
+          let response;
+          try {
+            response = await search(
+              {
+                query,
+                k: limits.searchResultsPerQuery,
+                hl: locale.hl,
+                gl: locale.gl,
+              },
+              { signal: deadline.signal }
+            );
+          } catch {
+            failedSearches += 1;
             continue;
           }
-          const key = canonicalUrl(result.link);
-          if (!seen.has(key)) seen.set(key, result);
-          if (seen.size >= limits.maxPages) break;
+          if (response?.error) failedSearches += 1;
+          for (const result of normalizedResults(response).slice(
+            0,
+            limits.searchResultsPerQuery
+          )) {
+            const host = hostnameOf(result.link);
+            if (isDeniedHost(host, deniedHosts)) {
+              skippedHostResults += 1;
+              if (skippedHosts.size < 20) skippedHosts.add(host);
+              continue;
+            }
+            const key = canonicalUrl(result.link);
+            if (!seen.has(key)) seen.set(key, result);
+            if (seen.size >= limits.maxPages) break;
+          }
         }
-      }
+      };
+      await Promise.all(
+        Array.from({ length: workerCount }, () => worker())
+      );
     };
     await runQueries(primaryQueries);
 
     // 2. Collect the language-service results and spend the reserved budget on
-    //    the alternative names they produced.
+    //    the alternative names they produced. Each alias is phrased with the
+    //    template that matches its own script, so a Chinese variant does not
+    //    become "… recipe".
     let aliasQueries = [];
     if (aliasRequest) {
       const outcome = await aliasRequest;
@@ -1926,8 +2047,13 @@ export async function searchRecipesByDish(
         aliasExpansion = "empty";
       }
       aliasQueries = aliasesUsed
-        .map((entry) => `${entry} recipe`)
-        .filter((entry) => !primaryQueries.includes(entry))
+        .map((entry) => {
+          // Phrase each alias with its own script's template: "mapo tofu
+          // recipe" searches better than "mapo tofu 做法", and vice versa.
+          const aliasLanguage = dominantScript(entry) === "cjk" ? "zh" : "en";
+          return buildDishQueries(entry, aliasLanguage, { maxQueries: 1 })[0];
+        })
+        .filter((entry) => entry && !primaryQueries.includes(entry))
         .slice(0, reserved);
       await runQueries(aliasQueries);
     }
@@ -1941,62 +2067,9 @@ export async function searchRecipesByDish(
       pushWarning("SEARCH_PARTIALLY_UNAVAILABLE", messages.partialPages);
     }
 
-    // 2. Fetch pages with bounded concurrency.
-    const parsedPages = new Array(pages.length);
-    let cursor = 0;
-    let failedPages = 0;
-    let truncatedPages = 0;
-    const worker = async () => {
-      while (true) {
-        const index = cursor;
-        cursor += 1;
-        if (index >= pages.length) return;
-        if (deadline.signal.aborted) return;
-        const page = pages[index];
-        try {
-          const fetched = await fetchPage(page.link, {
-            signal: deadline.signal,
-            timeoutMs: limits.pageTimeoutMs,
-            maxBytes: limits.pageMaxBytes,
-            maxRedirects: 3,
-          });
-          if (typeof fetched?.text !== "string") {
-            failedPages += 1;
-            continue;
-          }
-          if (fetched.truncated) truncatedPages += 1;
-          let recipes =
-            parsePage(fetched.text, {
-              pageUrl: fetched.url || page.link,
-              maxRecipes: limits.maxRecipesPerPage,
-            })?.recipes || [];
-          if (recipes.length === 0) {
-            recipes = await extractRecipesFromPage(fetched.text, {
-              pageUrl: fetched.url || page.link,
-              language: normalizedLanguage,
-              signal: deadline.signal,
-            });
-          }
-          parsedPages[index] = recipes;
-        } catch {
-          failedPages += 1;
-        }
-      }
-    };
-    await Promise.all(
-      Array.from({ length: Math.min(limits.fetchConcurrency, pages.length) }, () => worker())
-    );
-
-    const parsed = parsedPages.flat();
-    if (failedPages > 0) {
-      pushWarning("PAGES_PARTIALLY_UNAVAILABLE", "One or more recipe pages could not be read safely.");
-    }
-    if (truncatedPages > 0) {
-      pushWarning("PAGES_TRUNCATED", "One or more large recipe pages were truncated before parsing.");
-    }
-
-    // 3. Ingredient variants from the language service, then safety
-    //    constraints, then the dish identity gate.
+    // 3. Ingredient variants from the language service resolve before the
+    //    fetch loop so every wave can be constrained and gated, which is what
+    //    lets the loop stop as soon as enough real dishes qualify.
     const variantTable = variantRequest
       ? (await variantRequest)?.value ?? {}
       : {};
@@ -2018,6 +2091,78 @@ export async function searchRecipesByDish(
       0
     );
 
+    // 4. Fetch pages in waves and stop early once the pool is deep enough. An
+    //    easy dish costs one wave; a rare one may spend the whole page budget.
+    const parsed = [];
+    let failedPages = 0;
+    let truncatedPages = 0;
+    let pagesFetched = 0;
+    const earlyExitTarget = Math.min(wanted + 2, limits.maxPages);
+    for (
+      let start = 0;
+      start < pages.length;
+      start += limits.fetchConcurrency
+    ) {
+      if (deadline.signal.aborted) break;
+      const wave = pages.slice(start, start + limits.fetchConcurrency);
+      const waveRecipes = await Promise.all(
+        wave.map(async (page) => {
+          try {
+            const fetched = await fetchPage(page.link, {
+              signal: deadline.signal,
+              timeoutMs: limits.pageTimeoutMs,
+              maxBytes: limits.pageMaxBytes,
+              maxRedirects: 3,
+            });
+            if (typeof fetched?.text !== "string") {
+              failedPages += 1;
+              return [];
+            }
+            pagesFetched += 1;
+            if (fetched.truncated) truncatedPages += 1;
+            let recipes =
+              parsePage(fetched.text, {
+                pageUrl: fetched.url || page.link,
+                maxRecipes: limits.maxRecipesPerPage,
+              })?.recipes || [];
+            if (recipes.length === 0) {
+              recipes = await extractRecipesFromPage(fetched.text, {
+                pageUrl: fetched.url || page.link,
+                language: normalizedLanguage,
+                signal: deadline.signal,
+              });
+            }
+            return recipes;
+          } catch {
+            failedPages += 1;
+            return [];
+          }
+        })
+      );
+      parsed.push(...waveRecipes.flat());
+
+      const safeWave = parsed.filter(
+        (recipe) =>
+          !findConstraintConflict(recipe, constraints, matchesIngredient)
+      );
+      const acceptedSoFar = filterByDish(safeWave, dish, {
+        minimum: minimumVerdict,
+        aliases: aliasesUsed,
+      }).accepted.length;
+      if (acceptedSoFar >= earlyExitTarget) break;
+    }
+
+    if (failedPages > 0) {
+      pushWarning("PAGES_PARTIALLY_UNAVAILABLE", "One or more recipe pages could not be read safely.");
+    }
+    if (truncatedPages > 0) {
+      pushWarning("PAGES_TRUNCATED", "One or more large recipe pages were truncated before parsing.");
+    }
+    if (deadline.signal.aborted) {
+      pushWarning("SEARCH_DEADLINE_REACHED", messages.deadlineReached);
+    }
+
+    // 5. Safety constraints, then the dish identity gate.
     const safe = parsed.filter(
       (recipe) =>
         !findConstraintConflict(recipe, constraints, matchesIngredient)
@@ -2027,12 +2172,34 @@ export async function searchRecipesByDish(
       aliases: aliasesUsed,
     });
 
+    // A named dish with nothing exact still deserves an answer, so a second
+    // pass keeps the closest partial matches and labels them. They are capped
+    // and can never displace an exact or strong result.
+    const nearMatchPool = minimumVerdict === "partial"
+      ? { accepted: [], rejected: [] }
+      : filterByDish(gated.rejected, dish, {
+          minimum: "partial",
+          aliases: aliasesUsed,
+        });
+    const nearMatches = nearMatchPool.accepted
+      .filter((recipe) => sharesDishHead(recipe, dish, { aliases: aliasesUsed }))
+      .map((recipe) => ({ ...recipe, nearMatch: true }))
+      .sort((a, b) => b.dishMatch.score - a.dishMatch.score)
+      .slice(0, MAX_NEAR_MATCH_RESULTS);
+    if (nearMatches.length > 0) {
+      pushWarning(
+        "NEAR_DISH_MATCH",
+        messages.nearMatch(dish, nearMatches.length)
+      );
+    }
+
     const gateCounts = {
       exact: 0,
       strong: 0,
       partial: 0,
       alias: 0,
-      rejected: gated.rejected.length,
+      near: nearMatches.length,
+      rejected: gated.rejected.length - nearMatches.length,
     };
     for (const recipe of gated.accepted) {
       gateCounts[recipe.dishMatch.verdict] =
@@ -2076,14 +2243,26 @@ export async function searchRecipesByDish(
       wanted
     );
     const limited = applyLimits(mealFiltered, preferenceLimits, wanted);
+    // Near matches only ever fill the space the real matches leave, and they
+    // keep their label through ranking, selection and the public payload.
+    const nearFiltered = filterWhenEnough(
+      nearMatches,
+      (recipe) => !mealTypeMismatch(recipe, mealTypeBucket),
+      wanted
+    );
+    const nearLimited = applyLimits(
+      nearFiltered,
+      preferenceLimits,
+      MAX_NEAR_MATCH_RESULTS
+    );
 
-    // 5. Rank the dishes that already passed the gate. Dish fidelity dominates;
+    // 6. Rank the dishes that already passed the gate. Dish fidelity dominates;
     //    preferences and fridge overlap only order the survivors.
     const inventoryItems = Array.isArray(inventory)
       ? inventory.filter(Boolean)
       : [];
 
-    const scored = limited.map((recipe, index) => {
+    const scoreRecipe = (recipe, index) => {
       const inventoryMatch = matchInventory(
         recipe,
         inventoryItems,
@@ -2130,14 +2309,28 @@ export async function searchRecipesByDish(
         scoreBreakdown: breakdown,
         _index: index,
       };
-    });
+    };
+    const scored = limited.map(scoreRecipe);
+    const scoredNear = nearLimited.map((recipe, index) =>
+      scoreRecipe(recipe, limited.length + index)
+    );
 
-    const dishDedup = await dedupeSimilarDishes(scored, {
+    const dishDedup = await dedupeSimilarDishes([...scored, ...scoredNear], {
       language: normalizedLanguage,
       signal,
     });
     const dedupeDropped = dishDedup.dropped;
-    const selected = selectDiverse(dishDedup.recipes, wanted).map((candidate) =>
+    const selectedReal = selectDiverse(
+      dishDedup.recipes.filter((recipe) => recipe.nearMatch !== true),
+      wanted
+    );
+    const selectedNear = selectedReal.length < wanted
+      ? selectDiverse(
+          dishDedup.recipes.filter((recipe) => recipe.nearMatch === true),
+          wanted - selectedReal.length
+        )
+      : [];
+    const selected = [...selectedReal, ...selectedNear].map((candidate) =>
       publicRecipe(candidate, {
         dishQuery: dish,
         language: normalizedLanguage,
@@ -2150,16 +2343,21 @@ export async function searchRecipesByDish(
     //    user, and vice versa. Best effort: failures keep the original text.
     const translatable = countTranslatableStrings(selected, normalizedLanguage);
     let returned = selected;
-    if (
+    const translationBudgetMs = remainingMs();
+    const canTranslate =
       translationEnabled &&
       typeof translate === "function" &&
-      translatable > 0
+      translatable > 0 &&
+      !deadline.signal.aborted &&
+      translationBudgetMs > MIN_TRANSLATION_BUDGET_MS;
+    if (
+      canTranslate
     ) {
       try {
         const translated = await translate(selected, normalizedLanguage, {
-          // Linked to the caller's signal rather than the pipeline deadline: a
-          // slow search must not silently cancel the translation step, but a
-          // disconnected client must still stop the work.
+          // Linked to the caller's signal: a disconnected client must stop the
+          // work, but the pipeline deadline must not silently cancel a
+          // translation that still has budget to finish.
           signal,
         });
         const appliedCount = Array.isArray(translated)
@@ -2192,11 +2390,15 @@ export async function searchRecipesByDish(
         };
       }
     } else {
+      const skipped =
+        translationEnabled && translatable > 0 && !deadline.signal.aborted;
+      if (skipped) pushWarning("TRANSLATION_SKIPPED", messages.translationSkipped);
       translation = {
         enabled: Boolean(translationEnabled),
         requested: translatable,
         applied: 0,
         failed: 0,
+        skipped,
       };
     }
 
@@ -2221,10 +2423,17 @@ export async function searchRecipesByDish(
           resultsSkipped: skippedHostResults,
           hostsSkipped: [...skippedHosts],
         },
-        pagesFetched: parsedPages.filter(Boolean).length,
+        pagesFetched,
         candidatesParsed: parsed.length,
         candidatesAfterConstraints: safe.length,
         dishGate: gateCounts,
+        nearMatches: nearMatches.map((recipe) => ({
+          title: recipe.title,
+          url: recipe.url,
+          verdict: recipe.dishMatch?.verdict || "partial",
+          coverage: recipe.dishMatch?.score ?? null,
+          missingTokens: recipe.dishMatch?.missingTokens || [],
+        })),
         minimumVerdict,
         aliases: {
           source: aliasExpansion,

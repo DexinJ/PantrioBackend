@@ -20,6 +20,18 @@ export const ALLOWED_MODELS_AUTHED = new Set(CHAT_MODELS_ALLOWED);
     "gpt-5.6-terra",
   ]);
 
+  // Models that accept a top-level `reasoning_effort` field in Chat Completions.
+  // gpt-5.6-luna does not support effort when tools are present and errors if
+  // the field is sent, so it is deliberately excluded here (free users stay on
+  // Luna and simply never receive the field). Earlier models are excluded too.
+  export const REASONING_EFFORT_MODELS = new Set([
+    "gpt-5.6-terra",
+    "gpt-6-astra",
+  ]);
+
+  // Default reasoning effort for models that support it.
+  export const DEFAULT_REASONING_EFFORT = "medium";
+
   // Safety toggle for the backend's explicit cache boundary. Flip to false to
   // fall back to implicit caching without a redeploy.
   export const EXPLICIT_PROMPT_CACHE_ENABLED = true;

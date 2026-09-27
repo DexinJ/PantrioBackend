@@ -4,7 +4,7 @@
 // - Updates tool description + schema to match your new behavior
 // - Keeps the rest unchanged
 
-import { SERPER_API_KEY } from "../config/env.js";
+import { LOG_AI_REQUESTS, SERPER_API_KEY } from "../config/env.js";
 import { fetchPublicTextPage } from "./safeWebFetch.js";
 import {
   FREE_MAX_RESULT_COUNT,
@@ -85,6 +85,50 @@ export const PRESET_FOOD_TYPE_CATEGORIES = [
 ];
 export const PRESET_STATE_CATEGORIES = ["Opened", "Unopened", "Raw", "Cooked", "Cut", "Whole"];
 
+/**
+ * Opt-in one-line summary of what a recipe search actually did. Support runs
+ * flip LOG_AI_REQUESTS on; this makes the outcome (gate counts, near matches,
+ * page budget, warnings) readable without parsing the whole transcript, and
+ * keeps future reports grounded in the pipeline instead of the model's
+ * narration.
+ */
+function logRecipeToolMeta({ args, result, startedAt }) {
+  if (!LOG_AI_REQUESTS) return;
+  const meta = result?.meta && typeof result.meta === "object" ? result.meta : {};
+  try {
+    console.log(
+      JSON.stringify({
+        event: "recipe_tool_meta",
+        timestamp: new Date().toISOString(),
+        dishQuery: typeof args?.dishQuery === "string" ? args.dishQuery : "",
+        engine:
+          typeof args?.dishQuery === "string" && args.dishQuery.trim()
+            ? "dish"
+            : "inventory",
+        durationMs: Date.now() - startedAt,
+        returnedCount: Array.isArray(result?.recipes)
+          ? result.recipes.length
+          : 0,
+        nearMatchCount: Array.isArray(meta.nearMatches)
+          ? meta.nearMatches.length
+          : 0,
+        dishGate: meta.dishGate || null,
+        minimumVerdict: meta.minimumVerdict || null,
+        queriesRun: meta.queriesRun ?? null,
+        pagesConsidered: meta.pagesConsidered ?? null,
+        pagesFetched: meta.pagesFetched ?? null,
+        candidatesParsed: meta.candidatesParsed ?? null,
+        error: result?.error ? String(result.error).slice(0, 300) : null,
+        warnings: Array.isArray(result?.warnings)
+          ? result.warnings.map((entry) => entry?.code).filter(Boolean)
+          : [],
+      })
+    );
+  } catch {
+    // Diagnostics must never break a recipe request.
+  }
+}
+
 async function fetchWithDeadline(url, options, { signal, timeoutMs = 10_000 } = {}) {
   const controller = new AbortController();
   const forwardAbort = () => controller.abort(signal?.reason);
@@ -152,10 +196,12 @@ export function createRecommendRecipesTool({
     };
     // A named dish goes through the dish pipeline; everything else keeps using
     // the inventory engine unchanged.
+    const startedAt = Date.now();
     const result =
       typeof args?.dishQuery === "string" && args.dishQuery.trim()
         ? await searchRecipesWithDish(args, recipeContext, dependencies)
         : await recommendRecipesFn(args, recipeContext, dependencies);
+    logRecipeToolMeta({ args, result, startedAt });
     // The card ships addable items alongside the publisher's lines, so the
     // shopping-list button needs no parser and no model round trip.
     return withMissingItems(result, {
@@ -364,8 +410,8 @@ export const RECOMMEND_RECIPES_TOOL = {
         resultCount: {
           type: "integer",
           minimum: 1,
-          maximum: 4,
-          description: "Number of recipe suggestions (1-4; default 4).",
+          maximum: 6,
+          description: "Number of recipe suggestions (1-6; default 6).",
         },
       },
       additionalProperties: false,

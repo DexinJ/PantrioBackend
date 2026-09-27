@@ -124,6 +124,7 @@ export function logAiRequest(
     model = "",
     round = 0,
     intent = "",
+    intentSource = "",
     messages = [],
   } = entry || {};
 
@@ -136,6 +137,7 @@ export function logAiRequest(
       model,
       round: Number.isInteger(round) ? round : 0,
       intent,
+      intentSource,
       messages: sanitizeMessagesForLog(messages),
     })
   );
