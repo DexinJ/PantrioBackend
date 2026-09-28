@@ -44,6 +44,11 @@ import { parseRecipeJsonLd } from "./recipeJsonLd.js";
 import { dedupeSimilarDishes } from "./recipeDedup.js";
 import { extractRecipesFromPage } from "./recipeTextExtract.js";
 import { MODEL_RECIPE_TRANSLATION } from "../config/models.js";
+import {
+  clip,
+  dishQueryShape,
+  noopRecipeTrace,
+} from "./recipeTrace.js";
 
 // ---------------------------------------------------------------------------
 // Limits
@@ -69,6 +74,9 @@ export const DEFAULT_DISH_LIMITS = Object.freeze({
 // Near matches are only a fallback for a named dish with nothing exact. They
 // are labelled in the UI, so keep them to a minority of the short list.
 export const MAX_NEAR_MATCH_RESULTS = 2;
+
+// Diagnostics only: how many per-candidate gate decisions one request may log.
+export const MAX_TRACE_GATE_LINES = 20;
 
 // Translation is the last step and the only optional one: with less than this
 // much budget left, results are returned in their published language and the
@@ -1859,6 +1867,9 @@ export async function searchRecipesByDish(
     // BYO providers hand the text pass to the client through a collector.
     extractPageRecipes = extractRecipesFromPage,
     llmDedupeEnabled = true,
+    // Diagnostics only. Defaults to a no-op so nothing changes when the
+    // LOG_AI_REQUESTS flag is off (see recipeTrace.js).
+    trace = noopRecipeTrace,
   } = {}
 ) {
   if (typeof search !== "function" || typeof fetchPage !== "function") {
@@ -1932,6 +1943,32 @@ export async function searchRecipesByDish(
     failed: 0,
   };
   const skippedHosts = new Set();
+  // Phase clocks. The overall budget is shared, so knowing which phase spent it
+  // is the difference between "the search was slow" and "translation ate it".
+  const phases = {
+    searchesMs: 0,
+    aliasAwaitMs: 0,
+    variantsMs: 0,
+    fetchesMs: 0,
+    extractionsMs: 0,
+    dedupeMs: 0,
+    translationMs: 0,
+  };
+  let deadlinePhase = null;
+  const notePhase = (name) => {
+    if (deadline.signal.aborted && !deadlinePhase) deadlinePhase = name;
+  };
+
+  trace("recipe_pipeline_start", {
+    dishQuery: dishQueryShape(dish),
+    language: normalizedLanguage,
+    locale,
+    limits,
+    minimumVerdict,
+    providedAliases,
+    inventoryCount: Array.isArray(inventory) ? inventory.length : 0,
+    searchIsDefault: search === dishSerperSearch,
+  });
 
   try {
     // 0. Language services start first and run while the search is in flight.
@@ -1994,6 +2031,8 @@ export async function searchRecipesByDish(
           if (deadline.signal.aborted) return;
           if (seen.size >= limits.maxPages) return;
           queriesRun += 1;
+          const queryStartedAt = Date.now();
+          let queryDeniedSkipped = 0;
           let response;
           try {
             response = await search(
@@ -2005,18 +2044,29 @@ export async function searchRecipesByDish(
               },
               { signal: deadline.signal }
             );
-          } catch {
+          } catch (error) {
             failedSearches += 1;
+            trace("recipe_search_query", {
+              query,
+              k: limits.searchResultsPerQuery,
+              hl: locale.hl,
+              gl: locale.gl,
+              ms: Date.now() - queryStartedAt,
+              ok: false,
+              error: error?.message || "search threw",
+            });
             continue;
           }
           if (response?.error) failedSearches += 1;
-          for (const result of normalizedResults(response).slice(
+          const results = normalizedResults(response).slice(
             0,
             limits.searchResultsPerQuery
-          )) {
+          );
+          for (const result of results) {
             const host = hostnameOf(result.link);
             if (isDeniedHost(host, deniedHosts)) {
               skippedHostResults += 1;
+              queryDeniedSkipped += 1;
               if (skippedHosts.size < 20) skippedHosts.add(host);
               continue;
             }
@@ -2024,13 +2074,30 @@ export async function searchRecipesByDish(
             if (!seen.has(key)) seen.set(key, result);
             if (seen.size >= limits.maxPages) break;
           }
+          trace("recipe_search_query", {
+            query,
+            k: limits.searchResultsPerQuery,
+            hl: locale.hl,
+            gl: locale.gl,
+            ms: Date.now() - queryStartedAt,
+            ok: !response?.error,
+            error: response?.error || null,
+            resultCount: results.length,
+            deniedHostSkipped: queryDeniedSkipped,
+            seenSize: seen.size,
+          });
         }
       };
       await Promise.all(
         Array.from({ length: workerCount }, () => worker())
       );
     };
-    await runQueries(primaryQueries);
+    {
+      const phaseStartedAt = Date.now();
+      await runQueries(primaryQueries);
+      phases.searchesMs += Date.now() - phaseStartedAt;
+      notePhase("searches");
+    }
 
     // 2. Collect the language-service results and spend the reserved budget on
     //    the alternative names they produced. Each alias is phrased with the
@@ -2038,7 +2105,10 @@ export async function searchRecipesByDish(
     //    become "… recipe".
     let aliasQueries = [];
     if (aliasRequest) {
+      const aliasAwaitStart = Date.now();
       const outcome = await aliasRequest;
+      phases.aliasAwaitMs += Date.now() - aliasAwaitStart;
+      notePhase("aliases");
       const expanded = outcome?.value;
       if (!outcome?.ok) {
         aliasExpansion = "failed";
@@ -2060,7 +2130,10 @@ export async function searchRecipesByDish(
         })
         .filter((entry) => entry && !primaryQueries.includes(entry))
         .slice(0, reserved);
+      const aliasQueryStart = Date.now();
       await runQueries(aliasQueries);
+      phases.searchesMs += Date.now() - aliasQueryStart;
+      notePhase("aliasQueries");
     }
     const queries = [...primaryQueries, ...aliasQueries].slice(
       0,
@@ -2075,9 +2148,13 @@ export async function searchRecipesByDish(
     // 3. Ingredient variants from the language service resolve before the
     //    fetch loop so every wave can be constrained and gated, which is what
     //    lets the loop stop as soon as enough real dishes qualify.
-    const variantTable = variantRequest
-      ? (await variantRequest)?.value ?? {}
-      : {};
+    let variantTable = {};
+    if (variantRequest) {
+      const variantStart = Date.now();
+      variantTable = (await variantRequest)?.value ?? {};
+      phases.variantsMs += Date.now() - variantStart;
+      notePhase("variants");
+    }
     const ingredientVariants = buildIngredientVariants(termSet, variantTable);
     const ingredientExclusions = buildIngredientExclusions(
       termSet,
@@ -2110,8 +2187,11 @@ export async function searchRecipesByDish(
     ) {
       if (deadline.signal.aborted) break;
       const wave = pages.slice(start, start + limits.fetchConcurrency);
+      const waveStartedAt = Date.now();
       const waveRecipes = await Promise.all(
         wave.map(async (page) => {
+          const pageStartedAt = Date.now();
+          const host = hostnameOf(page.link);
           try {
             const fetched = await fetchPage(page.link, {
               signal: deadline.signal,
@@ -2121,6 +2201,13 @@ export async function searchRecipesByDish(
             });
             if (typeof fetched?.text !== "string") {
               failedPages += 1;
+              trace("recipe_page", {
+                host,
+                url: page.link,
+                ms: Date.now() - pageStartedAt,
+                ok: false,
+                code: "NO_TEXT",
+              });
               return [];
             }
             pagesFetched += 1;
@@ -2130,20 +2217,45 @@ export async function searchRecipesByDish(
                 pageUrl: fetched.url || page.link,
                 maxRecipes: limits.maxRecipesPerPage,
               })?.recipes || [];
+            const jsonLdRecipeCount = recipes.length;
+            let extractionRan = false;
             if (recipes.length === 0) {
+              extractionRan = true;
+              const extractionStartedAt = Date.now();
               recipes = await extractPageRecipes(fetched.text, {
                 pageUrl: fetched.url || page.link,
                 language: normalizedLanguage,
                 signal: deadline.signal,
               });
+              phases.extractionsMs += Date.now() - extractionStartedAt;
             }
+            trace("recipe_page", {
+              host,
+              url: fetched.url || page.link,
+              ms: Date.now() - pageStartedAt,
+              ok: true,
+              truncated: Boolean(fetched.truncated),
+              textChars: fetched.text.length,
+              jsonLdRecipeCount,
+              extractionRan,
+              recipeCount: Array.isArray(recipes) ? recipes.length : 0,
+            });
             return recipes;
-          } catch {
+          } catch (error) {
             failedPages += 1;
+            trace("recipe_page", {
+              host,
+              url: page.link,
+              ms: Date.now() - pageStartedAt,
+              ok: false,
+              code: error?.code || error?.name || "FETCH_FAILED",
+            });
             return [];
           }
         })
       );
+      phases.fetchesMs += Date.now() - waveStartedAt;
+      notePhase("fetches");
       parsed.push(...waveRecipes.flat());
 
       const safeWave = parsed.filter(
@@ -2154,6 +2266,14 @@ export async function searchRecipesByDish(
         minimum: minimumVerdict,
         aliases: aliasesUsed,
       }).accepted.length;
+      trace("recipe_fetch_wave", {
+        wave: Math.floor(start / limits.fetchConcurrency) + 1,
+        pagesInWave: wave.length,
+        ms: Date.now() - waveStartedAt,
+        parsedSoFar: parsed.length,
+        acceptedSoFar,
+        earlyExitTarget,
+      });
       if (acceptedSoFar >= earlyExitTarget) break;
     }
 
@@ -2176,7 +2296,26 @@ export async function searchRecipesByDish(
       minimum: minimumVerdict,
       aliases: aliasesUsed,
     });
-
+    // Which candidates were kept and which were dropped, and why. This is the
+    // only place the answer to "it found the page but rejected it" is visible.
+    const gateDecisions = [
+      ...gated.accepted.map((recipe) => ({ recipe, accepted: true })),
+      ...gated.rejected.map((recipe) => ({ recipe, accepted: false })),
+    ].slice(0, MAX_TRACE_GATE_LINES);
+    for (const { recipe, accepted } of gateDecisions) {
+      const match =
+        recipe.dishMatch ||
+        scoreDishMatch(recipe, dish, { aliases: aliasesUsed });
+      trace("recipe_gate", {
+        title: clip(recipe?.title || "", 140),
+        accepted,
+        verdict: match.verdict,
+        coverage: match.coverage,
+        matchedTokens: match.matchedTokens,
+        missingTokens: match.missingTokens,
+        minimumVerdict,
+      });
+    }
     // A named dish with nothing exact still deserves an answer, so a second
     // pass keeps the closest partial matches and labels them. They are capped
     // and can never displace an exact or strong result.
@@ -2197,6 +2336,13 @@ export async function searchRecipesByDish(
         messages.nearMatch(dish, nearMatches.length)
       );
     }
+    trace("recipe_gate_summary", {
+      candidates: safe.length,
+      accepted: gated.accepted.length,
+      rejected: gated.rejected.length,
+      nearMatchPool: nearMatchPool.accepted.length,
+      nearMatches: nearMatches.length,
+    });
 
     const gateCounts = {
       exact: 0,
@@ -2320,11 +2466,14 @@ export async function searchRecipesByDish(
       scoreRecipe(recipe, limited.length + index)
     );
 
+    const dedupeStartedAt = Date.now();
     const dishDedup = await dedupeSimilarDishes([...scored, ...scoredNear], {
       language: normalizedLanguage,
       signal,
       llmEnabled: llmDedupeEnabled,
     });
+    phases.dedupeMs += Date.now() - dedupeStartedAt;
+    notePhase("dedupe");
     const dedupeDropped = dishDedup.dropped;
     const selectedReal = selectDiverse(
       dishDedup.recipes.filter((recipe) => recipe.nearMatch !== true),
@@ -2360,12 +2509,14 @@ export async function searchRecipesByDish(
       canTranslate
     ) {
       try {
+        const translationStartedAt = Date.now();
         const translated = await translate(selected, normalizedLanguage, {
           // Linked to the caller's signal: a disconnected client must stop the
           // work, but the pipeline deadline must not silently cancel a
           // translation that still has budget to finish.
           signal,
         });
+        phases.translationMs += Date.now() - translationStartedAt;
         const appliedCount = Array.isArray(translated)
           ? translated.filter((recipe) => recipe.translation).length
           : 0;
@@ -2414,6 +2565,45 @@ export async function searchRecipesByDish(
         parsed.length === 0 ? messages.noStructured(dish) : messages.noDish(dish)
       );
     }
+
+    // One line that answers "where did the turn go": phase durations, the
+    // budget verdict, and the counters that explain an empty result. Note that
+    // translation is measured here but is deliberately not part of the 35s
+    // deadline, so elapsedMs can exceed it.
+    trace("recipe_pipeline_summary", {
+      dishQuery: dishQueryShape(dish),
+      elapsedMs: Date.now() - startedAt,
+      budgetMs: limits.overallTimeoutMs,
+      phasesMs: { ...phases },
+      deadlineHit: deadline.signal.aborted,
+      deadlinePhase,
+      queries,
+      queriesRun,
+      failedSearches,
+      pagesConsidered: pages.length,
+      pagesFetched,
+      failedPages,
+      truncatedPages,
+      candidatesParsed: parsed.length,
+      candidatesAfterConstraints: safe.length,
+      gate: gateCounts,
+      nearMatches: nearMatches.length,
+      aliases: { source: aliasExpansion, names: aliasesUsed },
+      hostFilter: {
+        resultsSkipped: skippedHostResults,
+        hostsSkipped: [...skippedHosts],
+      },
+      translation: {
+        enabled: Boolean(translationEnabled),
+        requested: translation.requested,
+        applied: translation.applied,
+        failed: translation.failed,
+        skipped: Boolean(translation.skipped),
+      },
+      dedupeDropped,
+      returnedCount: returned.length,
+      warnings: warnings.map((entry) => entry.code),
+    });
 
     return {
       recipes: returned,
@@ -2543,6 +2733,7 @@ export async function searchRecipesWithDish(
       aliasExpansionEnabled: deps.aliasExpansionEnabled,
       extractPageRecipes: deps.extractPageRecipes,
       llmDedupeEnabled: deps.llmDedupeEnabled,
+      trace: deps.trace,
     }
   );
 }

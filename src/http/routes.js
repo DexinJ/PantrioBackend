@@ -52,6 +52,12 @@ import {
   searchRecipesWithDish,
   translateRecipes,
 } from "../chat/recipeDishSearch.js";
+import {
+  argsShape,
+  createRecipeTrace,
+  dishQueryShape,
+} from "../chat/recipeTrace.js";
+import { newId } from "../utils/ids.js";
 import { sanitizeRecipeContext } from "../chat/recipeRequest.js";
 import {
   buildHelperManifest,
@@ -484,12 +490,37 @@ export function createRecipeRecommendationHandler({
     }
 
     const abortScope = createRecipeRequestAbortScope(req, res);
+    const startedAt = Date.now();
     try {
       const safeRecipeContext = sanitizeRecipeContextFn(recipeContext);
       const { active } = await resolveEntitlement(req);
       const language = safeRecipeContext.language;
       const dishQuery =
         typeof overrides?.dishQuery === "string" && overrides.dishQuery.trim();
+      // The REST path has no request id, so one is minted here and echoed back
+      // so a client-side report can be joined to these lines. A client may also
+      // supply its own for end-to-end correlation.
+      const traceId =
+        String(req.header?.("x-recipe-trace") || "").trim().slice(0, 80) ||
+        newId();
+      const trace = createRecipeTrace({
+        traceId,
+        path: "rest",
+        userId: req.authenticatedUser.uid,
+      });
+      trace("recipe_engine_decision", {
+        engine: dishQuery ? "dish" : "inventory",
+        dishQuery: dishQueryShape(overrides?.dishQuery),
+        args: argsShape(overrides),
+        language,
+        provider: provider.kind,
+        byo,
+        inventoryCount: safeRecipeContext.inventory.length,
+        selectedIngredientCount: safeRecipeContext.selectedIngredients.length,
+        maxResultCount: active
+          ? SUBSCRIBER_MAX_RESULT_COUNT
+          : FREE_MAX_RESULT_COUNT,
+      });
       const db = await Promise.resolve()
         .then(getDbFn)
         .catch(() => null);
@@ -506,6 +537,18 @@ export function createRecipeRecommendationHandler({
         ? createExtractionCollectorFn({ language })
         : null;
       const hints = byo ? sanitizeRecipeHints(body?.hints) : null;
+      trace("recipe_rest_request", {
+        hints: hints
+          ? {
+              aliases: hints.aliases,
+              variantTerms: Object.keys(hints.variantTable).length,
+              ideas: hints.ideas.length,
+            }
+          : null,
+        hintsSupplied: Boolean(body?.hints),
+        overridesKeys: Object.keys(overrides || {}).slice(0, 30),
+        compactForChat: body?.compactForChat === true,
+      });
       const dependencies = {
         search: meteredSearch,
         fetchPage,
@@ -537,6 +580,7 @@ export function createRecipeRecommendationHandler({
         aliasExpansionEnabled: byo ? hints.aliases.length > 0 : true,
         llmDedupeEnabled: !byo,
         extractPageRecipes: extraction ? extraction.extractPageRecipes : undefined,
+        trace,
       };
       if (hints) {
         dependencies.ideate = async () => ({ ok: true, ideas: hints.ideas });
@@ -560,7 +604,27 @@ export function createRecipeRecommendationHandler({
             ],
           }
         : result;
+      const resultRecipes = Array.isArray(result?.recipes) ? result.recipes : [];
+      trace("recipe_rest_result", {
+        engine: dishQuery ? "dish" : "inventory",
+        status: "ok",
+        durationMs: Date.now() - startedAt,
+        returnedCount: resultRecipes.length,
+        firstRecipeTitles: resultRecipes
+          .slice(0, 3)
+          .map((recipe) => String(recipe?.title || "").slice(0, 120)),
+        hasDishField: resultRecipes.some((recipe) => Boolean(recipe?.dish)),
+        helperTasks: Array.isArray(withTasks?.helperTasks)
+          ? withTasks.helperTasks.length
+          : 0,
+        warnings: Array.isArray(result?.warnings)
+          ? result.warnings.map((entry) => entry?.code).filter(Boolean)
+          : [],
+      });
       if (abortScope.signal.aborted || res.headersSent) return;
+      // Only when tracing is on, and defensively: test doubles may not
+      // implement set().
+      if (trace.enabled) res.set?.("X-Recipe-Trace", traceId);
       return res.json(
         body?.compactForChat === true
           ? compactRecipeResultsForChat(withTasks)

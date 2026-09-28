@@ -25,6 +25,11 @@ import {
   generateRecipeIdeas as runRecipeIdeation,
   recipeIdeationEnabled,
 } from "./recipeIdeation.js";
+import {
+  argsShape,
+  createRecipeTrace,
+  dishQueryShape,
+} from "./recipeTrace.js";
 
 // ✅ Single source of truth for what GPT is allowed to send
 export const PRESET_CATEGORIES = [
@@ -93,23 +98,34 @@ export const PRESET_STATE_CATEGORIES = ["Opened", "Unopened", "Raw", "Cooked", "
  * keeps future reports grounded in the pipeline instead of the model's
  * narration.
  */
-function logRecipeToolMeta({ args, result, startedAt }) {
+function logRecipeToolMeta({ args, result, startedAt, trace }) {
   if (!LOG_AI_REQUESTS) return;
   const meta = result?.meta && typeof result.meta === "object" ? result.meta : {};
+  const recipes = Array.isArray(result?.recipes) ? result.recipes : [];
   try {
     console.log(
       JSON.stringify({
         event: "recipe_tool_meta",
         timestamp: new Date().toISOString(),
+        // Same id as the per-round transcript line and every pipeline event, so
+        // one turn can be followed end to end.
+        traceId: trace?.traceId || "",
+        requestId: trace?.requestId || "",
         dishQuery: typeof args?.dishQuery === "string" ? args.dishQuery : "",
+        dishQueryShape: dishQueryShape(args?.dishQuery),
+        argsShape: argsShape(args),
         engine:
           typeof args?.dishQuery === "string" && args.dishQuery.trim()
             ? "dish"
             : "inventory",
         durationMs: Date.now() - startedAt,
-        returnedCount: Array.isArray(result?.recipes)
-          ? result.recipes.length
-          : 0,
+        returnedCount: recipes.length,
+        firstRecipeTitles: recipes
+          .slice(0, 3)
+          .map((recipe) => String(recipe?.title || "").slice(0, 120)),
+        // Present only on dish cards; its absence on an inventory result is the
+        // quickest way to tell the two engines apart after the fact.
+        hasDishField: recipes.some((recipe) => Boolean(recipe?.dish)),
         nearMatchCount: Array.isArray(meta.nearMatches)
           ? meta.nearMatches.length
           : 0,
@@ -119,6 +135,7 @@ function logRecipeToolMeta({ args, result, startedAt }) {
         pagesConsidered: meta.pagesConsidered ?? null,
         pagesFetched: meta.pagesFetched ?? null,
         candidatesParsed: meta.candidatesParsed ?? null,
+        translation: meta.translation || null,
         error: result?.error ? String(result.error).slice(0, 300) : null,
         warnings: Array.isArray(result?.warnings)
           ? result.warnings.map((entry) => entry?.code).filter(Boolean)
@@ -181,6 +198,27 @@ export function createRecommendRecipesTool({
     const recipeContext = ctx?.recipeContext || {};
     const isDishQuery =
       typeof args?.dishQuery === "string" && Boolean(args.dishQuery.trim());
+    // The WebSocket gateway already has a requestId, so reuse it as the trace id
+    // and every line for this turn joins on one value.
+    const trace = createRecipeTrace({
+      traceId: ctx?.requestId || "",
+      requestId: ctx?.requestId || "",
+      path: "ws",
+      userId: ctx?.userId || "",
+    });
+    trace("recipe_engine_decision", {
+      engine: isDishQuery ? "dish" : "inventory",
+      dishQuery: dishQueryShape(args?.dishQuery),
+      args: argsShape(args),
+      language: recipeContext?.language || "en",
+      inventoryCount: Array.isArray(recipeContext?.inventory)
+        ? recipeContext.inventory.length
+        : 0,
+      selectedIngredientCount: Array.isArray(recipeContext?.selectedIngredients)
+        ? recipeContext.selectedIngredients.length
+        : 0,
+      isAuthed: Boolean(ctx?.isAuthed),
+    });
     const dependencies = {
       // Serper is shared infrastructure, so every query is metered against the
       // caller even when the model itself runs on the user's own key.
@@ -202,6 +240,7 @@ export function createRecommendRecipesTool({
         ctx?.recipeMaxResultCount == null
           ? FREE_MAX_RESULT_COUNT
           : ctx.recipeMaxResultCount,
+      trace,
     };
     // A named dish goes through the dish pipeline; everything else keeps using
     // the inventory engine unchanged.
@@ -210,7 +249,7 @@ export function createRecommendRecipesTool({
       isDishQuery
         ? await searchRecipesWithDish(args, recipeContext, dependencies)
         : await recommendRecipesFn(args, recipeContext, dependencies);
-    logRecipeToolMeta({ args, result, startedAt });
+    logRecipeToolMeta({ args, result, startedAt, trace });
     // The card ships addable items alongside the publisher's lines, so the
     // shopping-list button needs no parser and no model round trip.
     return withMissingItems(result, {
@@ -234,6 +273,27 @@ export const TOOLS = {
     if (!SERPER_API_KEY) {
       return { error: "Missing SERPER_API_KEY on server", query: q, results: [] };
     }
+
+    // The recipe engines hand this function {query, k, hl, gl}, but only
+    // {q, num} is put on the wire. Logging the body that is actually sent is
+    // what makes a missing locale observable instead of invisible.
+    const transport = createRecipeTrace({
+      traceId: ctx?.requestId || "",
+      requestId: ctx?.requestId || "",
+      path: "ws",
+      userId: ctx?.userId || "",
+    });
+    transport("websearch_request", {
+      query: q,
+      k,
+      requestedHl: typeof args?.hl === "string" ? args.hl : null,
+      requestedGl: typeof args?.gl === "string" ? args.gl : null,
+      sentBody: { q, num: k },
+      dropped: [
+        ...(args?.hl ? ["hl"] : []),
+        ...(args?.gl ? ["gl"] : []),
+      ],
+    });
 
     let resp;
     try {
