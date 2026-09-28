@@ -11,7 +11,11 @@ import {
   MAX_PENDING_CHAT_STARTS,
   MAX_PENDING_CHAT_STARTS_PER_CONNECTION,
   MAX_TOOL_ROUNDS,
+  RESPONSES_REASONING_OUTPUT_ALLOWANCE,
   START_LIMIT_AUTHED,
+  resolveReasoningPolicy,
+  supportsExplicitCacheBreakpoints,
+  usesResponsesApi,
   // TRIAL_TOKENS_PER_DAY, // Superseded by the shared non-subscriber quota.
 } from "../config/policy.js";
 
@@ -51,6 +55,8 @@ import {
 } from "../usage/quotaSnapshot.js";
 
 import { streamOpenAIOnce } from "../chat/openaiStream.js";
+import { streamResponsesOnce } from "../chat/responsesStream.js";
+import { buildResponsesInput } from "../chat/responsesAdapter.js";
 import { resolveChatModel } from "../chat/modelPolicy.js";
 import {
   normalizeRecipeUiAction,
@@ -334,6 +340,8 @@ export function attachChatGateway(
     verifyActiveTokenFn = verifyFirebaseToken,
     getDbFn = getDb,
     streamOpenAIOnceFn = streamOpenAIOnce,
+    streamResponsesOnceFn = streamResponsesOnce,
+    usesResponsesApiFn = usesResponsesApi,
     runToolCallsFn = runToolCalls,
     serverToolTimeoutMs = 25_000,
     toolResultsTimeoutMs = 30_000,
@@ -693,20 +701,55 @@ export function attachChatGateway(
         messages: state.workingMessages,
       });
 
+      const useResponses = usesResponsesApiFn(model);
+
       try {
-        one = await streamOpenAIOnceFn({
-          ws,
-          send,
-          requestId,
-          model,
-          messages: state.workingMessages,
-          controller,
-          // maxTokens: maxTokensForThisRequest,
-          maxTokens: maxTokensForThisRound,
-          tools: toolPolicy.tools,
-          toolChoice: toolPolicy.toolChoice,
-          parallelToolCalls: toolPolicy.parallelToolCalls,
-        });
+        if (useResponses) {
+          // The user-facing completion allowance governs quota; the API limit is
+          // raised by a reasoning allowance so thinking tokens do not silently
+          // consume the answer budget.
+          const responseMaxTokens =
+            Number.isInteger(maxTokensForThisRound) && maxTokensForThisRound > 0
+              ? maxTokensForThisRound + RESPONSES_REASONING_OUTPUT_ALLOWANCE
+              : undefined;
+          const { instructions, input } = buildResponsesInput({
+            messages: state.workingMessages,
+            roundOutputs: state.roundOutputs,
+            explicitCache: supportsExplicitCacheBreakpoints(model),
+          });
+
+          one = await streamResponsesOnceFn({
+            ws,
+            send,
+            requestId,
+            model,
+            instructions,
+            input,
+            controller,
+            maxTokens: responseMaxTokens,
+            reasoning: resolveReasoningPolicy({
+              plan,
+              model,
+              round: state.round || 0,
+            }),
+            tools: toolPolicy.tools,
+            toolChoice: toolPolicy.toolChoice,
+            parallelToolCalls: toolPolicy.parallelToolCalls,
+          });
+        } else {
+          one = await streamOpenAIOnceFn({
+            ws,
+            send,
+            requestId,
+            model,
+            messages: state.workingMessages,
+            controller,
+            maxTokens: maxTokensForThisRound,
+            tools: toolPolicy.tools,
+            toolChoice: toolPolicy.toolChoice,
+            parallelToolCalls: toolPolicy.parallelToolCalls,
+          });
+        }
       } catch (error) {
         if (quotaReservation) {
           await reconcileUsageReservation(
@@ -749,6 +792,36 @@ export function attachChatGateway(
         });
         deleteActiveRequest(requestId);
         return;
+      }
+
+      if (one.incomplete) {
+        // The provider ran out of output budget (reasoning included). Partial
+        // text may already be on screen, so only fail when nothing was shown.
+        console.warn("[chat] model response incomplete", {
+          requestId,
+          model,
+          reason: one.incompleteReason,
+        });
+        if (!one.textProduced) {
+          if (quotaReservation) {
+            await reconcileUsageReservation(
+              db,
+              ownerType,
+              ownerKey,
+              quotaReservation,
+              0,
+              0
+            );
+          }
+          send(ws, {
+            type: "error",
+            requestId,
+            code: "AI_INCOMPLETE",
+            message: "The AI response was cut short. Please try again.",
+          });
+          deleteActiveRequest(requestId);
+          return;
+        }
       }
 
       if (one?.usage && typeof one.usage === "object") {
@@ -879,6 +952,17 @@ export function attachChatGateway(
       state.collectedToolMsgs = [];
       state.clientToolCallIds = new Set();
       state.round = (state.round || 0) + 1;
+
+      // Keep this round's raw output items (reasoning + function calls) so the
+      // next Responses round can replay them; the Chat-shaped transcript drops
+      // reasoning entirely. Lookup is by call id, so trimming a round removes
+      // its reasoning with it.
+      if (Array.isArray(one.outputItems) && one.outputItems.length) {
+        state.roundOutputs.push({
+          callIds: state.toolCalls.map((call) => call?.id).filter(Boolean),
+          items: one.outputItems,
+        });
+      }
 
       let { serverCalls, clientCalls } = splitToolCalls(state.toolCalls);
       if (isolatedToolCall) {
@@ -1472,6 +1556,9 @@ export function attachChatGateway(
         receivedClientToolCallIds: new Set(),
         toolResultsTimeout: null,
         pendingToolResults: null,
+        // Raw Responses output items per tool round. The Chat-shaped transcript
+        // cannot represent reasoning items, so they are replayed from here.
+        roundOutputs: [],
       });
 
       // send(ws, { type: "started", requestId, isAuthed });

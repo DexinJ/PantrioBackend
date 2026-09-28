@@ -25,7 +25,7 @@ const MAX_LINES_PER_CALL = 60;
 const MAX_CACHE_ENTRIES = 200;
 const DEFAULT_TIMEOUT_MS = 12_000;
 
-const STRUCTURING_SYSTEM_PROMPT = `You turn recipe ingredient lines into shopping-list items.
+export const STRUCTURING_SYSTEM_PROMPT = `You turn recipe ingredient lines into shopping-list items.
 For each line return:
 - name: the ingredient, without the quantity and without packaging words
 - quantity: the smallest amount a shopper can realistically buy, as a short value. Prefer a plain count of purchasable units ("1", "2", "3"). Use the natural count when the ingredient is sold by the piece ("3 eggs" -> "3", "2 onions" -> "2"). Otherwise use "1" for one package, can, bottle, or bunch. Never put a recipe-only portion or tasting amount such as "1/4 tsp", "1 tbsp", "1/2 cup", "to taste", or "as needed" into quantity.
@@ -280,26 +280,18 @@ export async function withMissingItems(
 }
 
 // ---------------------------------------------------------------------------
-// Integration notes (not applied)
+// Wiring
 // ---------------------------------------------------------------------------
 //
-// 1. src/chat/tools.js — inside `recommendRecipesTool`, wrap whichever engine
-//    ran, so both the dish pipeline and the inventory engine are covered:
+// Pantrio: `createRecommendRecipesTool` wraps whichever engine ran with
+// `withMissingItems` (src/chat/tools.js), so the cards arrive with `{ name,
+// quantity }` already split.
 //
-//      import { withMissingItems } from "./recipeMissingItems.js";
-//      ...
-//      const result = dishQuery
-//        ? await searchRecipesWithDish(args, recipeContext, dependencies)
-//        : await recommendRecipesFn(args, recipeContext, dependencies);
-//      return withMissingItems(result, {
-//        language: recipeContext.language,
-//        signal: ctx?.signal,
-//      });
+// BYO providers (custom API key / Apple AI): the REST route never runs this
+// module. It returns a `missingItems` task descriptor from
+// recipeHelperTasks.js instead, the client runs the same prompt on the user's
+// provider, and the merged result carries the same shape. Without that task the
+// card falls back to the publisher line as the item name — the behaviour
+// `fallbackItem` exists to keep usable.
 //
-// 2. fridge-manager/utils/recipeCards.js — keep the new field when a card is
-//    normalized for storage, next to missingIngredients:
-//
-//      missingItems: clipList(source.missingItems, MAX_MISSING_ITEMS),
-//
-//    Without this the field is dropped on persist and the button disappears
-//    after a reload.
+// The client keeps the field on persistence in fridge-manager/utils/recipeCards.js.

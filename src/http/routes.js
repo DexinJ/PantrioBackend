@@ -24,6 +24,7 @@ import {
 } from "../config/models.js";
 import { getDb } from "../db/db.js";
 import {
+  BYO_CLIENT_HELPERS,
   MAX_CHAT_MESSAGES,
   MAX_CHAT_PAYLOAD_DEPTH,
   MAX_CHAT_PAYLOAD_NODES,
@@ -46,10 +47,36 @@ import {
   recipeIdeationEnabled,
 } from "../chat/recipeIdeation.js";
 import {
+  isUsableDishAlias,
   recipeTranslationEnabled,
+  searchRecipesWithDish,
   translateRecipes,
 } from "../chat/recipeDishSearch.js";
 import { sanitizeRecipeContext } from "../chat/recipeRequest.js";
+import {
+  buildHelperManifest,
+  buildPostSearchTasks,
+  createExtractionCollector,
+  HELPER_TASK_VERSION,
+  sanitizeRecipeHints,
+} from "../chat/recipeHelperTasks.js";
+import {
+  applyClientExtractions,
+  MAX_APPLY_EXTRACTIONS,
+  MAX_APPLY_RECIPES,
+} from "../chat/recipeExtractionApply.js";
+import {
+  byoUnsupportedBody,
+  isByoProvider,
+  normalizeProvider,
+} from "../chat/providerRouting.js";
+import {
+  parseOwner,
+} from "../usage/usageStore.js";
+import {
+  getSerperUsageSnapshot,
+  withSerperMetering,
+} from "../usage/serperUsageStore.js";
 import {
   SubscriptionStatusValidationError,
   normalizeSubscriptionSnapshot,
@@ -374,6 +401,7 @@ function createRecipeRequestAbortScope(req, res) {
 
 export function createRecipeRecommendationHandler({
   recommendRecipesFn = runRecipeRecommendations,
+  searchRecipesWithDishFn = searchRecipesWithDish,
   search = TOOLS.webSearch,
   fetchPage = fetchPublicTextPage,
   sanitizeRecipeContextFn = sanitizeRecipeContext,
@@ -381,11 +409,18 @@ export function createRecipeRecommendationHandler({
   estimationEnabled = recipeEstimationEnabled(),
   ideate = runRecipeIdeation,
   ideationEnabled = recipeIdeationEnabled(),
+  buildPostSearchTasksFn = buildPostSearchTasks,
+  createExtractionCollectorFn = createExtractionCollector,
+  getSerperUsageSnapshotFn = getSerperUsageSnapshot,
+  byoClientHelpers = BYO_CLIENT_HELPERS,
   resolveEntitlementFn,
   getDbFn = getDb,
 } = {}) {
   if (typeof recommendRecipesFn !== "function") {
     throw new TypeError("recommendRecipesFn must be a function");
+  }
+  if (typeof searchRecipesWithDishFn !== "function") {
+    throw new TypeError("searchRecipesWithDishFn must be a function");
   }
   if (typeof search !== "function") {
     throw new TypeError("search must be a function");
@@ -430,10 +465,16 @@ export function createRecipeRecommendationHandler({
     const body = req.body;
     const overrides = body?.overrides ?? {};
     const recipeContext = body?.recipeContext ?? {};
+    const provider = normalizeProvider(body?.provider);
+    // BYO_CLIENT_HELPERS=false restores the old server-side helper behaviour
+    // for every provider, which is the rollback path for this work.
+    const byo = isByoProvider(body?.provider) && byoClientHelpers;
     if (
       !isPlainRecord(body) ||
       !isPlainRecord(overrides) ||
       !isPlainRecord(recipeContext) ||
+      (body?.provider !== undefined && !isPlainRecord(body.provider)) ||
+      (body?.hints !== undefined && !isPlainRecord(body.hints)) ||
       !payloadComplexityIsValid(body)
     ) {
       return res.status(400).json({
@@ -446,26 +487,84 @@ export function createRecipeRecommendationHandler({
     try {
       const safeRecipeContext = sanitizeRecipeContextFn(recipeContext);
       const { active } = await resolveEntitlement(req);
-      const result = await recommendRecipesFn(overrides, safeRecipeContext, {
+      const language = safeRecipeContext.language;
+      const dishQuery =
+        typeof overrides?.dishQuery === "string" && overrides.dishQuery.trim();
+      const db = await Promise.resolve()
+        .then(getDbFn)
+        .catch(() => null);
+      const owner = parseOwner(req.authenticatedUser.uid, true);
+      const ownerCtx = db ? { db, ...owner } : null;
+      // Search is shared infrastructure: it is metered for every provider, and
+      // it is the only dependency that stays ours on a BYO request.
+      const meteredSearch = withSerperMetering(
         search,
+        ownerCtx,
+        dishQuery ? "recipe_dish" : "recipe_inventory"
+      );
+      const extraction = byo
+        ? createExtractionCollectorFn({ language })
+        : null;
+      const hints = byo ? sanitizeRecipeHints(body?.hints) : null;
+      const dependencies = {
+        search: meteredSearch,
         fetchPage,
         signal: abortScope.signal,
-        estimateMeta,
-        estimationEnabled,
-        ideate,
-        ideationEnabled,
-        language: safeRecipeContext.language,
-        translate: translateRecipes,
-        translationEnabled: recipeTranslationEnabled(),
+        language,
         maxResultCount: active
           ? SUBSCRIBER_MAX_RESULT_COUNT
           : FREE_MAX_RESULT_COUNT,
-      });
+        // BYO providers run every model step on the user's own key, so the
+        // server-side helpers are switched off rather than merely ignored.
+        estimateMeta: byo ? null : estimateMeta,
+        estimationEnabled: byo ? false : estimationEnabled,
+        ideate: byo ? null : ideate,
+        ideationEnabled: byo ? false : ideationEnabled,
+        translate: byo ? null : translateRecipes,
+        translationEnabled: byo ? false : recipeTranslationEnabled(),
+        // BYO hints replace the pre-search helpers: the client already ran the
+        // same prompts on the user's provider. Hints are untrusted input, so
+        // aliases pass the same usability guard the model output does.
+        expandDish: hints
+          ? async (dish) =>
+              hints.aliases.filter((alias) => isUsableDishAlias(alias, dish))
+          : undefined,
+        expandIngredients: hints
+          ? async () => hints.variantTable
+          : undefined,
+        // Hint-backed functions never call a model, so alias expansion stays
+        // enabled when the client supplied aliases and is off otherwise.
+        aliasExpansionEnabled: byo ? hints.aliases.length > 0 : true,
+        llmDedupeEnabled: !byo,
+        extractPageRecipes: extraction ? extraction.extractPageRecipes : undefined,
+      };
+      if (hints) {
+        dependencies.ideate = async () => ({ ok: true, ideas: hints.ideas });
+        dependencies.ideationEnabled = hints.ideas.length > 0;
+      }
+      const rawResult = dishQuery
+        ? await searchRecipesWithDishFn(overrides, safeRecipeContext, dependencies)
+        : await recommendRecipesFn(overrides, safeRecipeContext, dependencies);
+      // The engine result is returned untouched. On the pantrio path the tool
+      // wrapper adds shopping-list items; on a BYO path the client does it, so
+      // nothing here needs to run a model of ours.
+      const result = rawResult;
+      const withTasks = byo
+        ? {
+            ...result,
+            provider: provider.kind,
+            helperTaskVersion: HELPER_TASK_VERSION,
+            helperTasks: [
+              ...buildPostSearchTasksFn(result, { language }),
+              ...(extraction ? extraction.tasks : []),
+            ],
+          }
+        : result;
       if (abortScope.signal.aborted || res.headersSent) return;
       return res.json(
         body?.compactForChat === true
-          ? compactRecipeResultsForChat(result)
-          : result
+          ? compactRecipeResultsForChat(withTasks)
+          : withTasks
       );
     } catch (error) {
       if (abortScope.signal.aborted || res.headersSent) return;
@@ -568,6 +667,68 @@ export function attachRoutes(app) {
     ),
     limitConcurrentRecipeRecommendations,
     createRecipeRecommendationHandler()
+  );
+
+  // Pre-search helper prompts for clients that run them on the user's own
+  // provider. Cacheable: the version changes only when a prompt changes.
+  app.get("/api/recipes/helper-manifest", authenticateRequest, (req, res) => {
+    const manifest = buildHelperManifest();
+    const etag = `W/"helper-manifest-${manifest.version}"`;
+    if (req.headers?.["if-none-match"] === etag) {
+      return res.status(304).end();
+    }
+    res.setHeader("ETag", etag);
+    res.setHeader("Cache-Control", "private, max-age=600");
+    return res.json(manifest);
+  });
+
+  // Return path for client-executed `textExtraction` tasks. The client's JSON
+  // is re-validated here (shape, saved constraints, dish gate) before it can
+  // join the recipe list, so a BYO provider cannot bypass those rules.
+  app.post(
+    "/api/recipes/apply-extractions",
+    authenticateRequest,
+    rateLimitAuthenticatedRequest(
+      "recipe-apply-extractions",
+      RECIPE_RECOMMENDATION_RATE_LIMIT
+    ),
+    async (req, res) => {
+      if (!req.authenticatedUser?.uid) {
+        return res.status(401).json({
+          code: "AUTH_REQUIRED",
+          error: "Authentication is required.",
+        });
+      }
+      const body = req.body;
+      if (!isPlainRecord(body) || !payloadComplexityIsValid(body)) {
+        return res.status(400).json({
+          code: "INVALID_RECIPE_REQUEST",
+          error: "The extraction payload must be a reasonably sized object.",
+        });
+      }
+      if (!isByoProvider(body.provider)) {
+        return res.status(400).json({
+          code: "PROVIDER_NOT_SUPPORTED",
+          error: "Extraction results are only accepted from a client-side provider.",
+        });
+      }
+      const recipes = Array.isArray(body.recipes)
+        ? body.recipes.slice(0, MAX_APPLY_RECIPES)
+        : [];
+      const extractions = Array.isArray(body.extractions)
+        ? body.extractions.slice(0, MAX_APPLY_EXTRACTIONS)
+        : [];
+      const preferences = sanitizeRecipeContextFn({
+        preferences: body.recipeContext?.preferences,
+      }).preferences;
+      const result = applyClientExtractions({
+        recipes,
+        extractions,
+        dishQuery: typeof body.dishQuery === "string" ? body.dishQuery : "",
+        preferences,
+      });
+      return res.json(result);
+    }
   );
 
   // --------------------
@@ -1092,6 +1253,9 @@ export function attachRoutes(app) {
       let quotaReservationContext = null;
 
       try {
+        if (isByoProvider(req.body?.provider)) {
+          return res.status(400).json(byoUnsupportedBody("Transcription"));
+        }
         const decoded = req.authenticatedUser;
 
         const uploadedFile = req.file;
@@ -1392,6 +1556,9 @@ export function attachRoutes(app) {
     let db = null;
 
     try {
+      if (isByoProvider(req.body?.provider)) {
+        return res.status(400).json(byoUnsupportedBody("Summarization"));
+      }
       const decoded = req.authenticatedUser;
 
       const {

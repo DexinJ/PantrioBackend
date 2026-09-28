@@ -804,7 +804,14 @@ async function searchForPages(
   return [...unique.values()].slice(0, limits.maxPages);
 }
 
-async function fetchRecipePages(fetchPage, pages, limits, deadline, language) {
+async function fetchRecipePages(
+  fetchPage,
+  pages,
+  limits,
+  deadline,
+  language,
+  extractPageRecipes = extractRecipesFromPage
+) {
   const fetched = new Array(pages.length);
   let cursor = 0;
   let failedPages = 0;
@@ -843,7 +850,7 @@ async function fetchRecipePages(fetchPage, pages, limits, deadline, language) {
         if (recipes.length === 0) {
           recipes = await awaitAbortable(
             () =>
-              extractRecipesFromPage(page.text, {
+              extractPageRecipes(page.text, {
                 pageUrl: page.url || result.link,
                 language,
                 signal: deadline.signal,
@@ -1632,6 +1639,11 @@ export async function recommendRecipes(
     translate = translateRecipes,
     translationEnabled = recipeTranslationEnabled(),
     language,
+    // BYO providers replace this with a collector that hands the text pass to
+    // the client instead of calling a model of ours.
+    extractPageRecipes = extractRecipesFromPage,
+    // The LLM dedupe pass is a refinement; the deterministic pass always runs.
+    llmDedupeEnabled = true,
   } = {}
 ) {
   if (typeof search !== "function") {
@@ -1709,7 +1721,8 @@ export async function recommendRecipes(
           wavePages,
           limits,
           deadline,
-          language ?? recipeContext?.language ?? "en"
+          language ?? recipeContext?.language ?? "en",
+          extractPageRecipes
         );
         aggregate.recipes.push(...fetched.recipes);
         aggregate.failedPages += fetched.failedPages;
@@ -1828,6 +1841,7 @@ export async function recommendRecipes(
     const dishDedup = await dedupeSimilarDishes(urlDeduped, {
       language: language ?? recipeContext?.language ?? "en",
       signal,
+      llmEnabled: llmDedupeEnabled,
     });
     const dedupeDropped = dishDedup.dropped;
     let pool = dishDedup.recipes;

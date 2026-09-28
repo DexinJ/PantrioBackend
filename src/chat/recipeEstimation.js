@@ -18,7 +18,7 @@ const TIME_MIN = 5;
 const TIME_MAX = 720;
 const MAX_ESTIMATION_OUTPUT_TOKENS = 2_000;
 
-const ESTIMATION_SYSTEM_PROMPT = `You estimate nutrition and total cooking time for home-cooking recipes.
+export const ESTIMATION_SYSTEM_PROMPT = `You estimate nutrition and total cooking time for home-cooking recipes.
 For each recipe in the input JSON, return an estimate object with:
 - caloriesPerServing: integer calories in one typical serving (50-3000)
 - totalMinutes: integer total prep plus cook time in minutes (5-720)

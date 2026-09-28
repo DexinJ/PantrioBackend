@@ -19,7 +19,7 @@ import { MODEL_RECIPE_TEXT_EXTRACT } from "../config/models.js";
 const DEFAULT_MODEL = MODEL_RECIPE_TEXT_EXTRACT;
 const DEFAULT_TIMEOUT_MS = 12_000;
 const MAX_OUTPUT_TOKENS = 2_000;
-const MAX_PAGE_TEXT_CHARS = 16_000;
+export const MAX_PAGE_TEXT_CHARS = 16_000;
 const MAX_TITLE_LENGTH = 180;
 const MAX_INGREDIENTS = 30;
 const MAX_INSTRUCTIONS = 12;
@@ -264,7 +264,7 @@ export function normalizeExtractedRecipe(parsed, pageUrl = "") {
   };
 }
 
-const EXTRACT_SYSTEM_PROMPT = `You extract a recipe from webpage text that has no structured recipe markup.
+export const EXTRACT_SYSTEM_PROMPT = `You extract a recipe from webpage text that has no structured recipe markup.
 Return ONLY JSON shaped like:
 {"title":"...","ingredients":["...","..."],"instructions":["...","..."]}
 Rules:
@@ -386,27 +386,16 @@ export async function extractRecipesFromPage(
 }
 
 // ---------------------------------------------------------------------------
-// Integration notes (not applied)
+// Wiring
 // ---------------------------------------------------------------------------
 //
-// 1. src/chat/recipeDishSearch.js — in the fetch worker, after `parsePage`
-//    returns no recipes:
+// Both engines call `extractRecipesFromPage` when a fetched page exposes no
+// Schema.org recipe markup (see the fetch workers in recipeDishSearch.js and
+// recipeRecommendations.js); the dependency is injectable, which is how a BYO
+// request swaps in the collector from recipeHelperTasks.js. That collector
+// hands the text pass to the client with an 8,000-character excerpt and returns
+// no recipes, so no model of ours runs for a user-supplied provider.
 //
-//      import { extractRecipesFromPage } from "./recipeTextExtract.js";
-//      ...
-//      let recipes = parsed?.recipes || [];
-//      if (recipes.length === 0) {
-//        recipes = await extractRecipesFromPage(fetched.text, {
-//          pageUrl: fetched.url || page.link,
-//          language: normalizedLanguage,
-//          signal: deadline.signal,
-//        });
-//      }
-//      parsedPages[index] = recipes;
-//
-// 2. src/chat/recipeRecommendations.js — same fallback in fetchRecipePages,
-//    using `recipeContext.language` (or the `language` dep) and `deadline.signal`.
-//
-// Add RECIPE_TEXT_EXTRACTION=false to disable, and RECIPE_TEXT_EXTRACTION_MODEL
-// to change the model. Keep the call linked to the existing deadline signal so
-// a disconnected client cancels the request.
+// RECIPE_TEXT_EXTRACTION=false disables the text pass; RECIPE_TEXT_EXTRACTION_MODEL
+// overrides the model. Keep it linked to the request deadline so a disconnected
+// client cancels the call.

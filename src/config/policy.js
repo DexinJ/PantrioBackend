@@ -21,20 +21,160 @@ export const ALLOWED_MODELS_AUTHED = new Set(CHAT_MODELS_ALLOWED);
   ]);
 
   // Models that accept a top-level `reasoning_effort` field in Chat Completions.
-  // gpt-5.6-luna does not support effort when tools are present and errors if
-  // the field is sent, so it is deliberately excluded here (free users stay on
-  // Luna and simply never receive the field). Earlier models are excluded too.
-  export const REASONING_EFFORT_MODELS = new Set([
+  //
+  // Verified against the live API on 2026-09-27: on the GPT-5.6 generation,
+  // Chat Completions rejects function tools unless `reasoning_effort` is
+  // explicitly "none". Omitting the field fails too, because the model defaults
+  // to "medium" — so the value must be sent, not left out. This applies to BOTH
+  // gpt-5.6-terra and gpt-5.6-luna; there is no Luna-only exception.
+  //
+  // gpt-6-astra is deliberately excluded: it requires the Responses API for
+  // tool calling and returns HTTP 400 for "none" effort. Earlier models
+  // (gpt-4o / gpt-4o-mini) reject the field entirely.
+  export const CHAT_REASONING_EFFORT_MODELS = new Set([
     "gpt-5.6-terra",
-    "gpt-6-astra",
+    "gpt-5.6-luna",
   ]);
 
-  // Default reasoning effort for models that support it.
+  // Effort Chat Completions requires whenever function tools are attached.
+  export const CHAT_TOOLS_REASONING_EFFORT = "none";
+
+  // Default reasoning effort for models that support it when no tools are sent.
   export const DEFAULT_REASONING_EFFORT = "medium";
+
+  // ---------------------------------------------------------------------------
+  // Interactive chat endpoint selection
+  // ---------------------------------------------------------------------------
+  //
+  // Chat Completions cannot run reasoning and function tools together on the
+  // GPT-5.6 generation (verified against the live API on 2026-09-27 — it
+  // returns 400 unless effort is forced to "none"). The Responses API has no
+  // such restriction, so these models route there.
+  export const RESPONSES_API_MODELS = new Set([
+    "gpt-5.6-terra",
+    "gpt-5.6-luna",
+  ]);
+
+  // Rollout switch. Set CHAT_RESPONSES_API=false to send these models back to
+  // Chat Completions (with effort forced to "none") without a code change.
+  export const RESPONSES_API_ENABLED = !/^(0|false|no)$/i.test(
+    String(process.env.CHAT_RESPONSES_API || "").trim()
+  );
+
+  export function usesResponsesApi(model) {
+    return (
+      RESPONSES_API_ENABLED === true &&
+      typeof model === "string" &&
+      RESPONSES_API_MODELS.has(model)
+    );
+  }
+
+  // ---------------------------------------------------------------------------
+  // Reasoning policy — STRUCTURE ONLY
+  // ---------------------------------------------------------------------------
+  //
+  // The free/paid effort split is still a product decision, so no tier values
+  // are hardcoded here. Everything below is deployment configuration, overridden
+  // per plan (or per model) with REASONING_POLICY_JSON, for example:
+  //   { "default": { "effort": "low", "rounds": "first" },
+  //     "pro":     { "effort": "medium" } }
+  //
+  // `rounds: "first"` applies reasoning to the opening round of a request and
+  // sends effort "none" on later tool-continuation rounds, which keeps the cost
+  // of a long tool loop bounded. `context` maps to reasoning.context; the GPT-5.6
+  // default is "all_turns", which renders earlier reasoning into later turns and
+  // grows input tokens, so "current_turn" is the cheaper starting point.
+  export const DEFAULT_REASONING_POLICY = Object.freeze({
+    enabled: true,
+    effort: "low",
+    context: "current_turn",
+    rounds: "first",
+  });
+
+  const REASONING_EFFORT_VALUES = new Set([
+    "none",
+    "minimal",
+    "low",
+    "medium",
+    "high",
+    "xhigh",
+    "max",
+  ]);
+
+  // Safety limit only: extra output budget so reasoning tokens do not consume
+  // the user-facing completion allowance. Quota is still governed by the plan's
+  // maxCompletionTokens; this only caps the provider request.
+  const configuredReasoningAllowance = Number.parseInt(
+    String(process.env.RESPONSES_REASONING_OUTPUT_ALLOWANCE || "").trim(),
+    10
+  );
+  export const RESPONSES_REASONING_OUTPUT_ALLOWANCE =
+    Number.isFinite(configuredReasoningAllowance) &&
+    configuredReasoningAllowance > 0
+      ? configuredReasoningAllowance
+      : 8_000;
+
+  // Read once at boot, like the other policy constants, so the effective
+  // configuration is reproducible for the life of the process.
+  const REASONING_POLICY_OVERRIDE = (() => {
+    try {
+      const raw = String(process.env.REASONING_POLICY_JSON || "").trim();
+      const parsed = raw ? JSON.parse(raw) : null;
+      return parsed && typeof parsed === "object" && !Array.isArray(parsed)
+        ? parsed
+        : {};
+    } catch {
+      return {};
+    }
+  })();
+
+  function policySection(container, key) {
+    const section = key ? container?.[key] : null;
+    return section && typeof section === "object" && !Array.isArray(section)
+      ? section
+      : {};
+  }
+
+  /**
+   * Resolve the reasoning settings for one request round.
+   * Returns `null` when reasoning should be omitted from the request.
+   */
+  export function resolveReasoningPolicy({ plan = null, model = null, round = 0 } = {}) {
+    const override = REASONING_POLICY_OVERRIDE;
+    const policy = {
+      ...DEFAULT_REASONING_POLICY,
+      ...policySection(override, "default"),
+      ...policySection(override?.models, model),
+      ...policySection(override, plan?.id),
+    };
+
+    if (policy.enabled !== true) return null;
+
+    const roundNumber = Number.isInteger(round) && round > 0 ? round : 0;
+    if (policy.rounds === "first" && roundNumber > 0) {
+      return { effort: "none" };
+    }
+
+    return {
+      effort: REASONING_EFFORT_VALUES.has(policy.effort)
+        ? policy.effort
+        : DEFAULT_REASONING_POLICY.effort,
+      context:
+        policy.context === "all_turns" ? "all_turns" : "current_turn",
+    };
+  }
 
   // Safety toggle for the backend's explicit cache boundary. Flip to false to
   // fall back to implicit caching without a redeploy.
   export const EXPLICIT_PROMPT_CACHE_ENABLED = true;
+
+  export function supportsExplicitCacheBreakpoints(model) {
+    return (
+      EXPLICIT_PROMPT_CACHE_ENABLED === true &&
+      typeof model === "string" &&
+      EXPLICIT_CACHE_BREAKPOINT_MODELS.has(model)
+    );
+  }
   
   // Tools allowed during trial
   export const TRIAL_ALLOWED_TOOLS = new Set([
@@ -52,6 +192,20 @@ export const ALLOWED_MODELS_AUTHED = new Set(CHAT_MODELS_ALLOWED);
     "proposeAddAllToFridge",
     "streamlineLists", // ✅ NEW (replaces listItemsAndUpdateTags)
   ]);
+
+  // Serper (web search) quota. Metering is implemented and always on; the
+  // limit is deliberately unset and enforcement is off, so no request is ever
+  // rejected for search volume yet. Flip these only after the recorded usage
+  // from /api/session and the recipe_tool_meta logs has been reviewed.
+  export const SERPER_QUOTA_ENFORCEMENT = false;
+  export const SERPER_DAILY_LIMIT = null;
+
+  // Client-side helper execution for BYO providers (custom API key / Apple AI).
+  // On by default: the server returns helper task descriptors instead of
+  // spending our OpenAI key on the user's behalf. Flip to false to fall back to
+  // the old behaviour — every helper runs server-side again — without shipping
+  // a new app build.
+  export const BYO_CLIENT_HELPERS = true;
   
   // Trial token budgets (SQLite-backed daily quota)
   // TEMP: effectively unlimited for testing. Restore a product value (e.g.

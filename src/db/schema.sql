@@ -159,6 +159,24 @@ CREATE TABLE IF NOT EXISTS usage_daily (
   UNIQUE(owner_type, owner_key, day_key)
 );
 
+-- Serper (web search) usage. Recorded so quota policy can be decided from real
+-- numbers later; nothing enforces it today and no request is ever rejected
+-- because of these counters. Every search is shared infrastructure: BYO
+-- providers and Apple AI spend this quota exactly like pantrio does.
+CREATE TABLE IF NOT EXISTS serper_usage_daily (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  owner_type TEXT NOT NULL CHECK(owner_type IN ('user','trial')),
+  owner_key TEXT NOT NULL,
+  day_key TEXT NOT NULL,                  -- 'YYYY-MM-DD' in server timezone
+  queries INTEGER NOT NULL DEFAULT 0,
+  results INTEGER NOT NULL DEFAULT 0,
+  recipe_dish INTEGER NOT NULL DEFAULT 0,
+  recipe_inventory INTEGER NOT NULL DEFAULT 0,
+  websearch_tool INTEGER NOT NULL DEFAULT 0,
+  updated_at INTEGER NOT NULL,
+  UNIQUE(owner_type, owner_key, day_key)
+);
+
 -- Legacy table kept for schema stability. Recipe history is no longer read
 -- or written; every request searches fresh and repeats are allowed.
 CREATE TABLE IF NOT EXISTS recipe_history (

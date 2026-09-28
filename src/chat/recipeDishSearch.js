@@ -29,12 +29,14 @@
 //   - Every fetch spent on a video, social or news host is budget not spent on
 //     a recipe, so those hosts are skipped before any page is fetched.
 //
-// Integration notes (not applied here):
-//   - Add `dishQuery` to RECOMMEND_RECIPES_TOOL in src/chat/tools.js and to
-//     the mirrored schema in fridge-manager/api/recipeAssistant.js.
-//   - Pass `language` (from buildRecipeContext) and call searchRecipesByDish
-//     from the recipe tool when dishQuery is present; otherwise keep calling
-//     recommendRecipes unchanged. searchRecipesWithDish does this dispatch.
+// Wiring: `dishQuery` is part of RECOMMEND_RECIPES_TOOL in src/chat/tools.js
+// and in the mirrored schema in fridge-manager/api/recipeAssistant.js.
+// `searchRecipesWithDish` dispatches to this pipeline when a dish is named and
+// to the inventory engine otherwise; the WS tool, the REST route, and both BYO
+// provider paths all go through it. When a BYO client supplies pre-search
+// hints, `expandDish` / `expandIngredients` resolve from those hints instead of
+// calling a model, so the pipeline itself never needs to know which provider is
+// active.
 
 import { OPENAI_API_KEY, SERPER_API_KEY } from "../config/env.js";
 import { fetchPublicTextPage } from "./safeWebFetch.js";
@@ -1192,7 +1194,7 @@ function createJsonChatClient({
   };
 }
 
-const ALIAS_SYSTEM_PROMPT = `You give alternative names for a dish so a recipe search can recognise it in other languages.
+export const ALIAS_SYSTEM_PROMPT = `You give alternative names for a dish so a recipe search can recognise it in other languages.
 Rules:
 - Return the dish name in English plus at most 3 other common names.
 - Also return up to 2 same-language variants publishers actually use for the SAME dish, for example 清蒸鱼 -> 清蒸鲈鱼, 清蒸黄鱼, or mapo tofu -> spicy mapo tofu.
@@ -1272,7 +1274,7 @@ export function createDishAliasExpander(options = {}) {
   };
 }
 
-const TRANSLATION_SYSTEM_PROMPT = `You adapt published recipe content to the language the user set in their app.
+export const TRANSLATION_SYSTEM_PROMPT = `You adapt published recipe content to the language the user set in their app.
 Rules:
 - If a string is written in another language, translate it into the requested language.
 - If a string is Chinese but written in Traditional characters and the requested language is zh, convert it to Simplified characters. Do not otherwise change Chinese that is already in the requested form.
@@ -1499,7 +1501,7 @@ export function createRecipeTranslator(options = {}) {
 export const expandDishAliases = createDishAliasExpander();
 export const translateRecipes = createRecipeTranslator();
 
-const INGREDIENT_VARIANTS_SYSTEM_PROMPT = `You prepare ingredient names so a matcher can recognise the same ingredient however a recipe writes it.
+export const INGREDIENT_VARIANTS_SYSTEM_PROMPT = `You prepare ingredient names so a matcher can recognise the same ingredient however a recipe writes it.
 For each ingredient return two lists:
 
 same - up to 6 other names that mean this ingredient:
@@ -1854,6 +1856,9 @@ export async function searchRecipesByDish(
     translate = translateRecipes,
     translationEnabled = recipeTranslationEnabled(),
     aliasExpansionEnabled = true,
+    // BYO providers hand the text pass to the client through a collector.
+    extractPageRecipes = extractRecipesFromPage,
+    llmDedupeEnabled = true,
   } = {}
 ) {
   if (typeof search !== "function" || typeof fetchPage !== "function") {
@@ -2126,7 +2131,7 @@ export async function searchRecipesByDish(
                 maxRecipes: limits.maxRecipesPerPage,
               })?.recipes || [];
             if (recipes.length === 0) {
-              recipes = await extractRecipesFromPage(fetched.text, {
+              recipes = await extractPageRecipes(fetched.text, {
                 pageUrl: fetched.url || page.link,
                 language: normalizedLanguage,
                 signal: deadline.signal,
@@ -2318,6 +2323,7 @@ export async function searchRecipesByDish(
     const dishDedup = await dedupeSimilarDishes([...scored, ...scoredNear], {
       language: normalizedLanguage,
       signal,
+      llmEnabled: llmDedupeEnabled,
     });
     const dedupeDropped = dishDedup.dropped;
     const selectedReal = selectDiverse(
@@ -2535,6 +2541,8 @@ export async function searchRecipesWithDish(
       translate: deps.translate,
       translationEnabled: deps.translationEnabled,
       aliasExpansionEnabled: deps.aliasExpansionEnabled,
+      extractPageRecipes: deps.extractPageRecipes,
+      llmDedupeEnabled: deps.llmDedupeEnabled,
     }
   );
 }

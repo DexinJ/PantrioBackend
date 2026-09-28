@@ -258,7 +258,7 @@ export function dedupeModel(env = process.env) {
   );
 }
 
-const DEDUPE_SYSTEM_PROMPT = `You find duplicate dishes in a list of recipes so a user never sees the same dish twice from different websites.
+export const DEDUPE_SYSTEM_PROMPT = `You find duplicate dishes in a list of recipes so a user never sees the same dish twice from different websites.
 Rules:
 - Group ids that are the same dish, including the same dish written in another language, a different spelling, or with minor wording differences.
 - Do NOT group two different dishes that merely share ingredients, cuisine, or a method.
@@ -444,38 +444,16 @@ export async function dedupeSimilarDishes(
 }
 
 // ---------------------------------------------------------------------------
-// Integration notes (not applied)
+// Wiring
 // ---------------------------------------------------------------------------
 //
-// 1. src/chat/recipeRecommendations.js — run after the existing URL/domain
-//    dedupe, before the meal-type/requested gates and selectDiverse:
+// Both engines call `dedupeSimilarDishes` after scoring and before selection
+// (see the `dedupeSimilarDishes` call sites in recipeDishSearch.js and
+// recipeRecommendations.js). The deterministic clustering always runs.
 //
-//      import { dedupeSimilarDishes } from "./recipeDedup.js";
-//      ...
-//      const deduped = dedupeCandidates(
-//        scoreCandidates(constrained.recipes, inputs, ideaPlan || [])
-//      );
-//      const dedupResult = await dedupeSimilarDishes(deduped, {
-//        language: targetLanguage,
-//        signal,
-//      });
-//      let pool = dedupResult.recipes;
-//      // optional: surface dedupResult.dropped in meta
-//
-// 2. src/chat/recipeDishSearch.js — run after `scored` and before
-//    `selectDiverse`:
-//
-//      import { dedupeSimilarDishes } from "./recipeDedup.js";
-//      ...
-//      const dedupResult = await dedupeSimilarDishes(scored, {
-//        language: normalizedLanguage,
-//        signal,
-//      });
-//      const selected = selectDiverse(
-//        dedupResult.recipes,
-//        wanted
-//      ).map((candidate) => publicRecipe(...));
-//
-// The model pass is opt-out via RECIPE_DEDUPE_LLM=false; the deterministic
-// pass always runs. Keep the call inside the existing abortable deadline so a
-// disconnected client cancels the LLM request.
+// The model pass is opt-out via RECIPE_DEDUPE_LLM=false and is also switched
+// off for BYO providers — `llmEnabled` comes from the request's
+// `llmDedupeEnabled` dependency — because the user's own provider would
+// otherwise be spent on a refinement the deterministic pass already covers.
+// Keep the call inside the existing abortable deadline so a disconnected client
+// cancels the LLM request.

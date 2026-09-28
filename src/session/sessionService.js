@@ -7,6 +7,7 @@ import {
   subscriptionToEntitlement,
 } from "../subscriptions/entitlementPolicy.js";
 import { getQuotaSnapshot } from "../usage/quotaSnapshot.js";
+import { getSerperUsageSnapshot } from "../usage/serperUsageStore.js";
 import { getAppleSessionConfiguration } from "../subscriptions/appleConfig.js";
 import {
   AccountDeletionBlockedError,
@@ -110,6 +111,8 @@ export async function buildSession(
     plan,
   });
   const appleConfiguration = getAppleSessionConfiguration();
+  // Search usage is recorded for visibility only; it never gates a request.
+  const serper = await getSerperUsageSnapshot(db, "user", decoded.uid);
   const finalDeletion = await getAccountDeletion(db, decoded.uid);
   if (finalDeletion) throw new AccountDeletionBlockedError(finalDeletion);
 
@@ -117,6 +120,7 @@ export async function buildSession(
     user,
     entitlement: subscriptionToEntitlement(subscription),
     quota,
+    serper,
     model: {
       requested: null,
       effective: modelResolution.model,

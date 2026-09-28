@@ -16,6 +16,7 @@ import {
   translateRecipes,
 } from "./recipeDishSearch.js";
 import { withMissingItems } from "./recipeMissingItems.js";
+import { recordSerperUsage, withSerperMetering } from "../usage/serperUsageStore.js";
 import {
   estimateAndApplyRecipeMetadata,
   recipeEstimationEnabled,
@@ -178,8 +179,16 @@ export function createRecommendRecipesTool({
 
   return async function recommendRecipesTool(args, ctx) {
     const recipeContext = ctx?.recipeContext || {};
+    const isDishQuery =
+      typeof args?.dishQuery === "string" && Boolean(args.dishQuery.trim());
     const dependencies = {
-      search: search || TOOLS.webSearch,
+      // Serper is shared infrastructure, so every query is metered against the
+      // caller even when the model itself runs on the user's own key.
+      search: withSerperMetering(
+        search || TOOLS.webSearch,
+        ctx,
+        isDishQuery ? "recipe_dish" : "recipe_inventory"
+      ),
       fetchPage,
       signal: ctx?.signal,
       estimateMeta,
@@ -198,7 +207,7 @@ export function createRecommendRecipesTool({
     // the inventory engine unchanged.
     const startedAt = Date.now();
     const result =
-      typeof args?.dishQuery === "string" && args.dishQuery.trim()
+      isDishQuery
         ? await searchRecipesWithDish(args, recipeContext, dependencies)
         : await recommendRecipesFn(args, recipeContext, dependencies);
     logRecipeToolMeta({ args, result, startedAt });
@@ -241,6 +250,7 @@ export const TOOLS = {
         { signal: ctx?.signal }
       );
     } catch {
+      await recordSerperUsage(ctx, { error: true }, "websearch_tool");
       return {
         error: "Web search is temporarily unavailable.",
         query: q,
@@ -249,6 +259,7 @@ export const TOOLS = {
     }
 
     if (!resp.ok) {
+      await recordSerperUsage(ctx, { error: true }, "websearch_tool");
       return {
         error: `Serper error ${resp.status}`,
         query: q,
@@ -265,7 +276,9 @@ export const TOOLS = {
       snippet: r?.snippet || "",
     }));
 
-    return { query: q, results };
+    const response = { query: q, results };
+    await recordSerperUsage(ctx, response, "websearch_tool");
+    return response;
   },
 
   recommendRecipes: createRecommendRecipesTool(),

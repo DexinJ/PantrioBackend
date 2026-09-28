@@ -3,10 +3,10 @@ import { OPENAI_API_KEY } from "../config/env.js";
 import { OPENAI_TOOLS } from "./tools.js";
 import { safeJsonParse } from "../utils/json.js";
 import {
+  CHAT_REASONING_EFFORT_MODELS,
+  CHAT_TOOLS_REASONING_EFFORT,
   DEFAULT_REASONING_EFFORT,
-  EXPLICIT_CACHE_BREAKPOINT_MODELS,
-  EXPLICIT_PROMPT_CACHE_ENABLED,
-  REASONING_EFFORT_MODELS,
+  supportsExplicitCacheBreakpoints,
 } from "../config/policy.js";
 
 function upsertToolCalls(toolCallState, toolCallsDelta) {
@@ -30,7 +30,7 @@ function upsertToolCalls(toolCallState, toolCallsDelta) {
   }
 }
 
-async function withAbortTimeout(controller, timeoutMs, operation) {
+export async function withAbortTimeout(controller, timeoutMs, operation) {
   const normalizedTimeoutMs =
     Number.isFinite(timeoutMs) && timeoutMs > 0
       ? Math.min(Math.trunc(timeoutMs), 300_000)
@@ -61,18 +61,10 @@ async function withAbortTimeout(controller, timeoutMs, operation) {
 
 const EXPLICIT_CACHE_BREAKPOINT = Object.freeze({ mode: "explicit" });
 
-function supportsExplicitCacheBreakpoints(model) {
-  return (
-    EXPLICIT_PROMPT_CACHE_ENABLED === true &&
-    typeof model === "string" &&
-    EXPLICIT_CACHE_BREAKPOINT_MODELS.has(model)
-  );
-}
-
 function supportsReasoningEffort(model) {
   return (
     typeof model === "string" &&
-    REASONING_EFFORT_MODELS.has(model)
+    CHAT_REASONING_EFFORT_MODELS.has(model)
   );
 }
 
@@ -143,6 +135,7 @@ export async function streamOpenAIOnce({
   const requestMessages = explicitCache
     ? markSystemCacheBreakpoint(messages)
     : messages;
+  const hasTools = Array.isArray(tools) && tools.length > 0;
   const resp = await fetch("https://api.openai.com/v1/chat/completions", {
     method: "POST",
     headers: {
@@ -158,9 +151,16 @@ export async function streamOpenAIOnce({
         ? { prompt_cache_options: { mode: "explicit", ttl: "30m" } }
         : {}),
       ...(supportsReasoningEffort(model)
-        ? { reasoning_effort: DEFAULT_REASONING_EFFORT }
+        ? {
+            // GPT-5.6 rejects tools with any effort other than "none", and
+            // omitting the field fails too because the model defaults to
+            // "medium". Without tools the default effort is still allowed.
+            reasoning_effort: hasTools
+              ? CHAT_TOOLS_REASONING_EFFORT
+              : DEFAULT_REASONING_EFFORT,
+          }
         : {}),
-      ...(Array.isArray(tools) && tools.length
+      ...(hasTools
         ? {
             tools,
             tool_choice: toolChoice,

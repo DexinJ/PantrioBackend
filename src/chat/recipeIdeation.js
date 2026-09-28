@@ -17,7 +17,7 @@ const MAX_IDEATION_OUTPUT_TOKENS = 1_600;
 const MAX_INVENTORY_ITEMS_IN_PROMPT = 20;
 const MAX_EXCLUDED_TERMS_IN_PROMPT = 20;
 
-const IDEATION_SYSTEM_PROMPT = `You turn a home fridge inventory into concrete meal ideas that exist as real published recipes.
+export const IDEATION_SYSTEM_PROMPT = `You turn a home fridge inventory into concrete meal ideas that exist as real published recipes.
 
 Rules:
 - Propose 3 to 5 distinct ideas. Cover as many fridge items as practical across the ideas, but do not force every item into one dish.

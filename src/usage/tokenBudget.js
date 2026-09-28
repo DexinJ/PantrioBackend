@@ -67,6 +67,21 @@ function normalizePayloadForBudget(value, seen, counters) {
     return normalizedImagePart;
   }
 
+  // Responses API image parts: { type: "input_image", image_url: "<data uri>" }.
+  if (
+    !Array.isArray(value) &&
+    value.type === "input_image" &&
+    typeof value.image_url === "string"
+  ) {
+    counters.images += 1;
+    const normalizedImagePart = {
+      ...value,
+      image_url: "[image omitted from text-token reservation]",
+    };
+    seen.delete(value);
+    return normalizedImagePart;
+  }
+
   let normalized;
 
   if (Array.isArray(value)) {
