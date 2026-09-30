@@ -351,20 +351,36 @@ records at most 60 seconds at 32 kbps.
 
 ## AI request logging
 
-Set `LOG_AI_REQUESTS=true` to log every chat round the backend sends to the AI
-provider as one structured JSON line to stdout. Each line contains the request
-id, authenticated user id, effective model, round, intent, and the sanitized
-message payload. Images are replaced with a short placeholder (data URIs are
-never echoed), and text longer than 4,000 characters is truncated, so enabling
-this for debugging does not copy image bytes into logs.
+Set `LOG_AI_REQUESTS=true` to log Pantrio AI traffic as structured JSON lines on
+stdout. Images are replaced with a short placeholder (data URIs are never
+echoed) and text longer than 4,000 characters is truncated, so enabling this for
+debugging does not copy image bytes into logs.
+
+Every line carries a stable `event` name, which is how you filter with it. On a
+platform that parses JSON logs (Railway, for example) the fields appear under
+`attributes` and the message column stays blank, so read `attributes.event`
+rather than the message text.
+
+```text
+pantrio_ai_chat_start   every chat attempt, before auth and quota. A refused
+                        message still leaves a line.
+pantrio_ai_request      one per round, before the provider call. Session,
+                        connection age, cache mode/breakpoint/TTL.
+pantrio_ai_round_usage  one per round, after it returns. Prompt, completion,
+                        reasoning and cached tokens, cache hit ratio, TTFT.
+pantrio_ai_error_frame  every error frame sent to a client, with its code.
+pantrio_ai_prewarm      reserved for a real warm-up request; nothing emits it.
+```
 
 ```text
 LOG_AI_REQUESTS=false
 ```
 
 This is off by default because message text can contain personal content. It
-only covers backend AI requests (OpenAI-backed chat and tools); on-device Apple
-Intelligence never reaches the backend, so it is not part of this log.
+only covers requests the backend makes with its own key: chat over the WebSocket
+gateway and the backend recipe pipeline (which also emits `recipe_*` events).
+Bring-your-own-key traffic runs on the client and on-device Apple Intelligence
+never reaches the backend, so neither is part of this log.
 
 ## Deployment note
 

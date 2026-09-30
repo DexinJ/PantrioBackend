@@ -73,7 +73,12 @@ import {
   SUBSCRIBER_MAX_RESULT_COUNT,
 } from "../chat/recipeRecommendations.js";
 import { compactRecipeResultsForChat } from "../chat/recipeCompact.js";
-import { logAiRequest, logAiRoundUsage } from "../chat/aiRequestLog.js";
+import {
+  logAiChatStart,
+  logAiErrorFrame,
+  logAiRequest,
+  logAiRoundUsage,
+} from "../chat/aiRequestLog.js";
 import { noteRequest } from "../chat/cacheWindow.js";
 
 let activeChatRequests = 0;
@@ -126,6 +131,17 @@ function acquirePendingChatStartSlot(pendingForConnection) {
 }
 
 function send(ws, obj) {
+  // Every refused request reaches the client as an error frame and, before
+  // this, nothing reached stdout. Log before the readyState check so a
+  // rejection is recorded even if the socket has already gone away.
+  if (obj?.type === "error") {
+    logAiErrorFrame({
+      requestId: obj.requestId,
+      code: obj.code,
+      message: obj.message,
+      sessionId: ws?.pantrioSessionId || "",
+    });
+  }
   if (ws.readyState !== ws.OPEN) return false;
   try {
     ws.send(JSON.stringify(obj));
@@ -351,6 +367,7 @@ export function attachChatGateway(
     // LOG_AI_REQUESTS, which is read once at boot.
     logAiRequestFn = logAiRequest,
     logAiRoundUsageFn = logAiRoundUsage,
+    logAiChatStartFn = logAiChatStart,
   } = {}
 ) {
   let draining = false;
@@ -388,6 +405,8 @@ export function attachChatGateway(
     const sessionId = `c-${(connectionSequence += 1)}`;
     const connectionStartedAt = Date.now();
     let sawFirstRequest = false;
+    // Lets the module-level `send` attach the session to error-frame logs.
+    ws.pantrioSessionId = sessionId;
 
     function deleteActiveRequest(requestId, { abort = false } = {}) {
       const state = active.get(requestId);
@@ -1279,6 +1298,19 @@ export function attachChatGateway(
         return;
       }
       const requestId = msg.requestId || newId();
+
+      // Every chat attempt is recorded here, before duplicate checks, auth, and
+      // quota, so a message that is rejected or never reaches the provider is
+      // still visible. See logAiChatStart.
+      logAiChatStartFn({
+        requestId,
+        model: typeof msg.model === "string" ? msg.model : "",
+        sessionId,
+        connectionAgeMs: Date.now() - connectionStartedAt,
+        uiAction: typeof msg.uiAction === "string" ? msg.uiAction : "",
+        legacyIntent: typeof msg.intent === "string" ? msg.intent : "",
+        messages: Array.isArray(msg.messages) ? msg.messages : [],
+      });
 
       if (active.has(requestId) || starting.has(requestId)) {
         send(ws, {

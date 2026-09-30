@@ -253,3 +253,78 @@ export function logAiPrewarm(
     })
   );
 }
+
+/**
+ * Emitted the moment a WebSocket `start` frame arrives, before validation,
+ * authentication, or quota checks.
+ *
+ * This is what makes "I sent a message and saw nothing" answerable. The round
+ * line (`pantrio_ai_request`) only exists once a request survives every
+ * pre-flight check, so a rejected chat used to be indistinguishable from a chat
+ * that never arrived. Every attempt now leaves a line here.
+ *
+ * Payloads are sanitized exactly like the round line: images become
+ * placeholders and long text is truncated, so enabling this never copies image
+ * bytes into logs.
+ */
+export function logAiChatStart(
+  entry,
+  { enabled = LOG_AI_REQUESTS, logger = console.log } = {}
+) {
+  if (!enabled) return;
+
+  const {
+    requestId = "",
+    uid = "",
+    model = "",
+    sessionId = "",
+    connectionAgeMs = null,
+    uiAction = "",
+    legacyIntent = "",
+    messages = [],
+  } = entry || {};
+
+  logger(
+    JSON.stringify({
+      event: "pantrio_ai_chat_start",
+      timestamp: new Date().toISOString(),
+      requestId,
+      uid,
+      model,
+      sessionId,
+      connectionAgeMs: Number.isFinite(connectionAgeMs) ? connectionAgeMs : null,
+      messageCount: Array.isArray(messages) ? messages.length : 0,
+      uiAction,
+      legacyIntent,
+      messages: sanitizeMessagesForLog(messages),
+    })
+  );
+}
+
+/**
+ * Emitted for every error frame the gateway sends a client. Rejections used to
+ * be invisible to operators: they reach the app as a frame and nothing reaches
+ * stdout, so a quota or auth refusal looked identical to silence. The frame's
+ * own message is user-facing copy rather than user content, so it is safe to
+ * record verbatim.
+ */
+export function logAiErrorFrame(
+  entry,
+  { enabled = LOG_AI_REQUESTS, logger = console.log } = {}
+) {
+  if (!enabled) return;
+
+  const { requestId = "", code = "", message = "", sessionId = "" } = entry || {};
+
+  logger(
+    JSON.stringify({
+      event: "pantrio_ai_error_frame",
+      timestamp: new Date().toISOString(),
+      requestId,
+      sessionId,
+      code,
+      message:
+        typeof message === "string" ? message.slice(0, 300) : "",
+    })
+  );
+}
