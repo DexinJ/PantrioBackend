@@ -6,6 +6,7 @@
 // becomes an unbounded mirror of user or image data.
 
 import { LOG_AI_REQUESTS } from "../config/env.js";
+import { cacheHitRatio } from "./usageShape.js";
 
 const MAX_TEXT_CHARS = 4_000;
 const MAX_IMAGE_URL_CHARS = 300;
@@ -125,6 +126,15 @@ export function logAiRequest(
     round = 0,
     intent = "",
     intentSource = "",
+    reasoningEffort = "",
+    sessionId = "",
+    firstRequestOfSession = false,
+    connectionAgeMs = null,
+    cacheMode = "",
+    cacheBreakpoint = false,
+    cacheTtl = "",
+    previousRequestAgeMs = null,
+    cacheWindowExpired = null,
     messages = [],
   } = entry || {};
 
@@ -138,7 +148,108 @@ export function logAiRequest(
       round: Number.isInteger(round) ? round : 0,
       intent,
       intentSource,
+      // Empty for the Chat Completions transport, which pins its own effort.
+      reasoningEffort,
+      sessionId,
+      firstRequestOfSession,
+      // Time between the socket opening and this request. A large value means
+      // the client prewarmed the connection well before the user sent anything.
+      connectionAgeMs: Number.isFinite(connectionAgeMs) ? connectionAgeMs : null,
+      cacheMode,
+      cacheBreakpoint,
+      cacheTtl,
+      // Null on a user's first request: there is no previous window to measure.
+      previousRequestAgeMs: Number.isFinite(previousRequestAgeMs)
+        ? previousRequestAgeMs
+        : null,
+      cacheWindowExpired:
+        typeof cacheWindowExpired === "boolean" ? cacheWindowExpired : null,
       messages: sanitizeMessagesForLog(messages),
+    })
+  );
+}
+
+/**
+ * Emits one JSON line with the provider's token accounting for a finished
+ * round. Separate from the request line because reasoning tokens are only known
+ * after the round returns. No-op unless enabled.
+ */
+export function logAiRoundUsage(
+  entry,
+  { enabled = LOG_AI_REQUESTS, logger = console.log } = {}
+) {
+  if (!enabled) return;
+
+  const {
+    requestId = "",
+    uid = "",
+    model = "",
+    round = 0,
+    intent = "",
+    reasoningEffort = "",
+    sessionId = "",
+    ttftMs = null,
+    usage = null,
+  } = entry || {};
+
+  const count = (value) =>
+    Number.isFinite(value) && value > 0 ? Math.trunc(value) : 0;
+
+  logger(
+    JSON.stringify({
+      event: "pantrio_ai_round_usage",
+      timestamp: new Date().toISOString(),
+      requestId,
+      uid,
+      model,
+      round: Number.isInteger(round) ? round : 0,
+      intent,
+      reasoningEffort,
+      sessionId,
+      promptTokens: count(usage?.prompt_tokens),
+      completionTokens: count(usage?.completion_tokens),
+      totalTokens: count(usage?.total_tokens),
+      reasoningTokens: count(usage?.reasoning_tokens),
+      cachedTokens: count(usage?.cached_tokens),
+      cacheHitRatio: cacheHitRatio(usage),
+      ttftMs: Number.isFinite(ttftMs) ? ttftMs : null,
+    })
+  );
+}
+
+/**
+ * Emits one JSON line when a warm-up request is issued against the provider.
+ * Reserved for prompt prewarming: nothing calls it yet, because the only
+ * warm-up in the product today is the client opening its socket early, which
+ * shows up as `connectionAgeMs` on the first request of a session instead.
+ */
+export function logAiPrewarm(
+  entry,
+  { enabled = LOG_AI_REQUESTS, logger = console.log } = {}
+) {
+  if (!enabled) return;
+
+  const {
+    requestId = "",
+    uid = "",
+    model = "",
+    sessionId = "",
+    reason = "",
+    cacheTtl = "",
+    ok = null,
+  } = entry || {};
+
+  logger(
+    JSON.stringify({
+      event: "pantrio_ai_prewarm",
+      timestamp: new Date().toISOString(),
+      requestId,
+      uid,
+      model,
+      sessionId,
+      reason,
+      cacheTtl,
+      ok: typeof ok === "boolean" ? ok : null,
     })
   );
 }

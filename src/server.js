@@ -4,6 +4,7 @@ import express from "express";
 import { WebSocketServer } from "ws";
 
 import { PORT } from "./config/env.js";
+import { resolveSqlitePath } from "./config/runtimeConfig.js";
 import { initFirebaseAdmin } from "./auth/firebase.js";
 import { attachRoutes } from "./http/routes.js";
 import { attachChatGateway } from "./ws/chatGateway.js";
@@ -21,6 +22,11 @@ initFirebaseAdmin();
 const app = express();
 
 await initDb();
+console.log(
+  `Storage: NODE_ENV=${process.env.NODE_ENV} ` +
+    `SQLITE_PATH=${resolveSqlitePath(process.env)} ` +
+    `volume=${process.env.RAILWAY_VOLUME_MOUNT_PATH || "(none)"}`
+);
 const appleConfiguration = initializeAppleSubscriptions();
 console.log(
   appleConfiguration.enabled

@@ -81,9 +81,15 @@ CREATE TABLE IF NOT EXISTS apple_subscriptions (
   FOREIGN KEY(firebase_uid) REFERENCES users(uid) ON DELETE CASCADE
 );
 
--- Pseudonymous ownership tombstone. It contains no Firebase UID and
--- intentionally survives account deletion so an App Store transaction chain
--- cannot later be claimed by a different app account.
+-- Pseudonymous ownership record for an App Store transaction chain. It contains
+-- no Firebase UID and survives account deletion as provenance: which token
+-- originally claimed the chain. Since the token is immutable and is never used
+-- to gate a claim, the row no longer blocks anything by itself. Live-owner
+-- blocking is derived from apple_subscriptions, which cascades when the owning
+-- account is deleted, and an ownership row with no live subscription row means
+-- the chain is released and may be adopted by the next account that can present
+-- an Apple-verified transaction for it. See
+-- docs/apple-subscription-claim-redesign.md section 3.
 CREATE TABLE IF NOT EXISTS apple_subscription_ownership (
   environment TEXT NOT NULL CHECK(environment IN ('Production', 'Sandbox')),
   original_transaction_id TEXT NOT NULL,

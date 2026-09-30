@@ -19,27 +19,9 @@ import { OPENAI_API_KEY } from "../config/env.js";
 import { safeJsonParse } from "../utils/json.js";
 import { toResponsesTools } from "./responsesAdapter.js";
 import { withAbortTimeout } from "./openaiStream.js";
+import { normalizeUsage } from "./usageShape.js";
 
 const RESPONSES_ENDPOINT = "https://api.openai.com/v1/responses";
-
-function toCount(value) {
-  return Number.isFinite(value) && value > 0 ? Math.max(0, Math.trunc(value)) : 0;
-}
-
-/**
- * Normalize Responses usage onto the Chat Completions field names the gateway
- * already accounts with, while keeping the reasoning and cache counters.
- */
-function normalizeUsage(usage) {
-  if (!usage || typeof usage.total_tokens !== "number") return null;
-  return {
-    prompt_tokens: toCount(usage.input_tokens),
-    completion_tokens: toCount(usage.output_tokens),
-    total_tokens: toCount(usage.total_tokens),
-    reasoning_tokens: toCount(usage.output_tokens_details?.reasoning_tokens),
-    cached_tokens: toCount(usage.input_tokens_details?.cached_tokens),
-  };
-}
 
 /**
  * Normalize a Responses `function_call` item into the Chat-shaped tool call the
@@ -144,6 +126,7 @@ export async function streamResponsesOnce({
     let responseObject = null;
     let failure = null;
     let textProduced = false;
+    let firstTokenAt = null;
     let lastToolProgressSignature = "";
     const streamedItems = [];
 
@@ -173,7 +156,8 @@ export async function streamResponsesOnce({
             if (typeof delta === "string" && delta.length) {
               if (!textProduced) {
                 textProduced = true;
-                console.log(`[RESPONSES TTFT] ${Date.now() - t0} ms`);
+                // Reported on the opt-in round-usage line rather than here.
+                firstTokenAt = Date.now();
               }
               send(ws, { type: "delta", requestId, text: delta });
             }
@@ -254,6 +238,7 @@ export async function streamResponsesOnce({
       outputItems,
       usage,
       textProduced,
+      ttftMs: firstTokenAt ? firstTokenAt - t0 : null,
     };
   });
 }

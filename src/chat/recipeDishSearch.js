@@ -2188,6 +2188,9 @@ export async function searchRecipesByDish(
       if (deadline.signal.aborted) break;
       const wave = pages.slice(start, start + limits.fetchConcurrency);
       const waveStartedAt = Date.now();
+      // Extractions inside a wave run in parallel, so their durations must not
+      // be summed: the wave's wall-clock contribution is the slowest one.
+      let waveExtractionMs = 0;
       const waveRecipes = await Promise.all(
         wave.map(async (page) => {
           const pageStartedAt = Date.now();
@@ -2227,7 +2230,10 @@ export async function searchRecipesByDish(
                 language: normalizedLanguage,
                 signal: deadline.signal,
               });
-              phases.extractionsMs += Date.now() - extractionStartedAt;
+              waveExtractionMs = Math.max(
+                waveExtractionMs,
+                Date.now() - extractionStartedAt
+              );
             }
             trace("recipe_page", {
               host,
@@ -2255,6 +2261,7 @@ export async function searchRecipesByDish(
         })
       );
       phases.fetchesMs += Date.now() - waveStartedAt;
+      phases.extractionsMs += waveExtractionMs;
       notePhase("fetches");
       parsed.push(...waveRecipes.flat());
 

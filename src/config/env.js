@@ -3,6 +3,7 @@ import dotenv from "dotenv";
 import {
   parsePort,
   requireNodeEnvironment,
+  validatePersistentStorageEnvironment,
   validateSingleReplicaEnvironment,
 } from "./runtimeConfig.js";
 import {
@@ -36,4 +37,5 @@ export const LOG_AI_REQUESTS = /^(1|true|yes)$/i.test(
 );
 
 validateSingleReplicaEnvironment(process.env);
+validatePersistentStorageEnvironment(process.env);
 if (!OPENAI_API_KEY) throw new Error("Missing OPENAI_API_KEY in .env");

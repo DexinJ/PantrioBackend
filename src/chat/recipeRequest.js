@@ -3,6 +3,7 @@ import {
   OPENAI_TOOLS,
   RECOMMEND_RECIPES_TOOL,
 } from "./tools.js";
+import { RECOMMEND_RECIPES_TOOL_NAME } from "./toolNames.js";
 
 const RECIPE_INTENT = "recipe_recommendation";
 const MAX_INVENTORY_ITEMS = 100;
@@ -390,7 +391,7 @@ export function resolveRoundToolPolicy({ intent, round = 0 } = {}) {
     tools: [RECOMMEND_RECIPES_TOOL],
     toolChoice: {
       type: "function",
-      function: { name: "recommendRecipes" },
+      function: { name: RECOMMEND_RECIPES_TOOL_NAME },
     },
     parallelToolCalls: false,
   };

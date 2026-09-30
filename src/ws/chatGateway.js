@@ -73,11 +73,13 @@ import {
   SUBSCRIBER_MAX_RESULT_COUNT,
 } from "../chat/recipeRecommendations.js";
 import { compactRecipeResultsForChat } from "../chat/recipeCompact.js";
-import { logAiRequest } from "../chat/aiRequestLog.js";
+import { logAiRequest, logAiRoundUsage } from "../chat/aiRequestLog.js";
+import { noteRequest } from "../chat/cacheWindow.js";
 
 let activeChatRequests = 0;
 const activeChatRequestsByUser = new Map();
 let pendingChatStarts = 0;
+let connectionSequence = 0;
 
 function acquireChatRequestSlot(uid) {
   const activeForUser = activeChatRequestsByUser.get(uid) || 0;
@@ -345,6 +347,10 @@ export function attachChatGateway(
     runToolCallsFn = runToolCalls,
     serverToolTimeoutMs = 25_000,
     toolResultsTimeoutMs = 30_000,
+    // Injectable so tests can assert the diagnostic payloads without touching
+    // LOG_AI_REQUESTS, which is read once at boot.
+    logAiRequestFn = logAiRequest,
+    logAiRoundUsageFn = logAiRoundUsage,
   } = {}
 ) {
   let draining = false;
@@ -376,6 +382,12 @@ export function attachChatGateway(
     const starting = new Map();
     let pendingStartsForConnection = 0;
     let connectionClosed = false;
+    // Pantrio AI only: the client routes BYO and on-device providers away from
+    // this socket, but it does open the socket early on screen focus, so the
+    // session is only reported once a real request arrives (see the log below).
+    const sessionId = `c-${(connectionSequence += 1)}`;
+    const connectionStartedAt = Date.now();
+    let sawFirstRequest = false;
 
     function deleteActiveRequest(requestId, { abort = false } = {}) {
       const state = active.get(requestId);
@@ -691,17 +703,49 @@ export function attachChatGateway(
       */
       let one;
 
-      logAiRequest({
+      const useResponses = usesResponsesApiFn(model);
+      // Resolved once per round and reused for both the request and the log
+      // line. `forcedTool` is what makes the recommendRecipes round the only
+      // one that reasons in recipe mode; see config/policy.js.
+      const reasoning = useResponses
+        ? resolveReasoningPolicy({
+            plan,
+            model,
+            round: state.round || 0,
+            forcedTool: toolPolicy.toolChoice?.function?.name ?? null,
+          })
+        : null;
+      // Empty for the Chat Completions transport, which pins its own effort;
+      // "off" when the policy is disabled and the field is omitted entirely.
+      const reasoningEffort = !useResponses
+        ? ""
+        : reasoning
+          ? reasoning.effort
+          : "off";
+      // Both transports attach the explicit cache breakpoint under the same
+      // predicate, so one evaluation covers the request and the log.
+      const explicitCache = supportsExplicitCacheBreakpoints(model);
+
+      logAiRequestFn({
         requestId,
         uid: state.userId,
         model,
         round: state.round || 0,
         intent: state.intent,
         intentSource: state.intentSource,
+        reasoningEffort,
+        sessionId: state.sessionId,
+        // Only the opening round of the opening request carries these.
+        firstRequestOfSession:
+          state.firstRequestOfSession === true && (state.round || 0) === 0,
+        connectionAgeMs: state.connectionAgeMs,
+        cacheMode: explicitCache ? "explicit" : "none",
+        cacheBreakpoint: explicitCache,
+        cacheTtl: explicitCache ? "30m" : "",
+        previousRequestAgeMs: state.previousRequestAgeMs,
+        cacheWindowExpired: state.cacheWindowExpired,
         messages: state.workingMessages,
       });
-
-      const useResponses = usesResponsesApiFn(model);
 
       try {
         if (useResponses) {
@@ -715,7 +759,7 @@ export function attachChatGateway(
           const { instructions, input } = buildResponsesInput({
             messages: state.workingMessages,
             roundOutputs: state.roundOutputs,
-            explicitCache: supportsExplicitCacheBreakpoints(model),
+            explicitCache,
           });
 
           one = await streamResponsesOnceFn({
@@ -727,11 +771,7 @@ export function attachChatGateway(
             input,
             controller,
             maxTokens: responseMaxTokens,
-            reasoning: resolveReasoningPolicy({
-              plan,
-              model,
-              round: state.round || 0,
-            }),
+            reasoning,
             tools: toolPolicy.tools,
             toolChoice: toolPolicy.toolChoice,
             parallelToolCalls: toolPolicy.parallelToolCalls,
@@ -835,6 +875,20 @@ export function attachChatGateway(
         );
         state.usage.totalTokens += addTokenCount(one.usage.total_tokens);
       }
+
+      // Reasoning tokens, cache hits, and first-token time are only known once
+      // the round returns, so they ride on their own opt-in line.
+      logAiRoundUsageFn({
+        requestId,
+        uid: state.userId,
+        model,
+        round: state.round || 0,
+        intent: state.intent,
+        reasoningEffort,
+        sessionId: state.sessionId,
+        ttftMs: one?.ttftMs,
+        usage: one?.usage,
+      });
 
       /* Previous post-hoc guest accounting. This allowed concurrent requests
          and interrupted streams to consume tokens before anything was charged.
@@ -1517,10 +1571,25 @@ export function attachChatGateway(
         return;
       }
 
+      // Session diagnostics. The socket is opened on screen focus, so this is
+      // the first point where we know a Pantrio AI request actually happened;
+      // BYO and on-device providers never reach this code.
+      const firstRequestOfSession = !sawFirstRequest;
+      sawFirstRequest = true;
+      const connectionAgeMs = Date.now() - connectionStartedAt;
+      // Gap since this user's previous request, which is what makes a
+      // `cachedTokens: 0` line interpretable.
+      const { previousRequestAgeMs, cacheWindowExpired } = noteRequest(userId);
+
       // Store full state for hybrid tool execution
       active.set(requestId, {
         controller,
         releaseConcurrency,
+        sessionId,
+        firstRequestOfSession,
+        connectionAgeMs,
+        previousRequestAgeMs,
+        cacheWindowExpired,
         workingMessages: [
           { role: "system", content: systemPrompt },
           ...messages,

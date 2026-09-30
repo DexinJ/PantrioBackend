@@ -1,6 +1,7 @@
 // src/config/policy.js
 import { parseNodeEnvironment } from "./runtimeConfig.js";
 import { CHAT_MODEL_FREE, CHAT_MODELS_ALLOWED } from "./models.js";
+import { RECOMMEND_RECIPES_TOOL_NAME } from "../chat/toolNames.js";
 
 // Full access models (signed-in users)
 // Non-subscribers are narrowed to NON_SUBSCRIBER_CHAT_MODEL below.
@@ -76,19 +77,32 @@ export const ALLOWED_MODELS_AUTHED = new Set(CHAT_MODELS_ALLOWED);
   // The free/paid effort split is still a product decision, so no tier values
   // are hardcoded here. Everything below is deployment configuration, overridden
   // per plan (or per model) with REASONING_POLICY_JSON, for example:
-  //   { "default": { "effort": "low", "rounds": "first" },
+  //   { "default": { "effort": "low", "applyTo": "recommendRecipes" },
   //     "pro":     { "effort": "medium" } }
   //
-  // `rounds: "first"` applies reasoning to the opening round of a request and
-  // sends effort "none" on later tool-continuation rounds, which keeps the cost
-  // of a long tool loop bounded. `context` maps to reasoning.context; the GPT-5.6
-  // default is "all_turns", which renders earlier reasoning into later turns and
-  // grows input tokens, so "current_turn" is the cheaper starting point.
+  // `applyTo` decides which rounds may reason. Everything it does not select is
+  // sent as an explicit effort of "none", which keeps the cost of a long tool
+  // loop bounded:
+  //   * "recommendRecipes" (default) - only the round that forces the
+  //     recommendRecipes tool. Recipe mode pins its tool ladder, so round 0
+  //     (getFridgeContents) takes no arguments and has nothing to reason about,
+  //     while the recommendRecipes round has to build real arguments from the
+  //     fridge inventory.
+  //   * "first" - the original behaviour: reason on round 0 only.
+  //   * "all" - every round.
+  //
+  // `context` maps to reasoning.context; the GPT-5.6 default is "all_turns",
+  // which renders earlier reasoning into later turns and grows input tokens, so
+  // "current_turn" is the cheaper starting point.
+  //
+  // Note: none of the RESPONSES_API_MODELS reject "none". gpt-6-astra does
+  // (HTTP 400), so routing it here would require sending "minimal" on the
+  // non-selected rounds instead.
   export const DEFAULT_REASONING_POLICY = Object.freeze({
     enabled: true,
     effort: "low",
     context: "current_turn",
-    rounds: "first",
+    applyTo: "recommendRecipes",
   });
 
   const REASONING_EFFORT_VALUES = new Set([
@@ -99,6 +113,12 @@ export const ALLOWED_MODELS_AUTHED = new Set(CHAT_MODELS_ALLOWED);
     "high",
     "xhigh",
     "max",
+  ]);
+
+  const REASONING_APPLY_TO_VALUES = new Set([
+    "recommendRecipes",
+    "first",
+    "all",
   ]);
 
   // Safety limit only: extra output budget so reasoning tokens do not consume
@@ -135,23 +155,57 @@ export const ALLOWED_MODELS_AUTHED = new Set(CHAT_MODELS_ALLOWED);
       : {};
   }
 
+  function reasoningApplies({ applyTo, roundNumber, forcedTool }) {
+    switch (applyTo) {
+      case "all":
+        return true;
+      case "first":
+        return roundNumber === 0;
+      case "recommendRecipes":
+      default:
+        return forcedTool === RECOMMEND_RECIPES_TOOL_NAME;
+    }
+  }
+
   /**
    * Resolve the reasoning settings for one request round.
    * Returns `null` when reasoning should be omitted from the request.
    */
-  export function resolveReasoningPolicy({ plan = null, model = null, round = 0 } = {}) {
+  export function resolveReasoningPolicy({
+    plan = null,
+    model = null,
+    round = 0,
+    forcedTool = null,
+  } = {}) {
     const override = REASONING_POLICY_OVERRIDE;
-    const policy = {
-      ...DEFAULT_REASONING_POLICY,
+    // Only the explicitly configured layers, so a legacy `rounds` key can be
+    // told apart from the default `applyTo`.
+    const overridePolicy = {
       ...policySection(override, "default"),
       ...policySection(override?.models, model),
       ...policySection(override, plan?.id),
     };
+    const policy = { ...DEFAULT_REASONING_POLICY, ...overridePolicy };
 
     if (policy.enabled !== true) return null;
 
     const roundNumber = Number.isInteger(round) && round > 0 ? round : 0;
-    if (policy.rounds === "first" && roundNumber > 0) {
+    // `rounds` was the original key name. Keep honouring it so an override
+    // already deployed as REASONING_POLICY_JSON keeps its behaviour.
+    const requestedApplyTo =
+      overridePolicy.applyTo ??
+      (overridePolicy.rounds === "first" ? "first" : undefined);
+    const applyTo = REASONING_APPLY_TO_VALUES.has(requestedApplyTo)
+      ? requestedApplyTo
+      : DEFAULT_REASONING_POLICY.applyTo;
+
+    if (
+      !reasoningApplies({
+        applyTo,
+        roundNumber,
+        forcedTool: typeof forcedTool === "string" ? forcedTool : null,
+      })
+    ) {
       return { effort: "none" };
     }
 

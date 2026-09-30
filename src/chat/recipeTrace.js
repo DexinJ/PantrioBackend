@@ -15,6 +15,7 @@
 //   railway logs | Select-String '"event":"recipe_engine_decision"'
 
 import { LOG_AI_REQUESTS } from "../config/env.js";
+import { createHash } from "node:crypto";
 
 // Bounds. A trace must never be able to grow a log line without limit, and it
 // must never be able to flood a request's log output.
@@ -82,6 +83,17 @@ export function dishQueryShape(value) {
     length: typeof value === "string" ? value.length : 0,
     value: text ? clip(text, 200) : "",
   };
+}
+
+/**
+ * Stable pseudonym for an owner key. Support still needs to recognize "the same
+ * account", but a raw Firebase uid in a log line is a durable identifier that
+ * has no business living in an observability sink.
+ */
+export function ownerKeyHash(value) {
+  const text = typeof value === "string" ? value.trim() : "";
+  if (!text) return "";
+  return createHash("sha256").update(text).digest("hex").slice(0, 16);
 }
 
 /** Summarizes a model-supplied argument object without logging the whole thing. */
@@ -153,5 +165,6 @@ export function createRecipeTrace({
   recipeTrace.enabled = true;
   recipeTrace.traceId = boundId;
   recipeTrace.requestId = requestId || boundId;
+  recipeTrace.path = path || "";
   return recipeTrace;
 }

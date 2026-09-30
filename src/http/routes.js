@@ -56,6 +56,7 @@ import {
   argsShape,
   createRecipeTrace,
   dishQueryShape,
+  ownerKeyHash,
 } from "../chat/recipeTrace.js";
 import { newId } from "../utils/ids.js";
 import { sanitizeRecipeContext } from "../chat/recipeRequest.js";
@@ -506,7 +507,7 @@ export function createRecipeRecommendationHandler({
       const trace = createRecipeTrace({
         traceId,
         path: "rest",
-        userId: req.authenticatedUser.uid,
+        userId: ownerKeyHash(req.authenticatedUser.uid),
       });
       trace("recipe_engine_decision", {
         engine: dishQuery ? "dish" : "inventory",
@@ -529,7 +530,13 @@ export function createRecipeRecommendationHandler({
       // Search is shared infrastructure: it is metered for every provider, and
       // it is the only dependency that stays ours on a BYO request.
       const meteredSearch = withSerperMetering(
-        search,
+        // The engines call `search(query, {signal})`, so the trace has to ride
+        // along in the options object to keep the transport log attributable.
+        // Only wrapped while tracing is on, so the dependency handed to the
+        // engine is identical to before when the flag is off.
+        trace.enabled
+          ? (args, options) => search(args, { ...(options || {}), trace })
+          : search,
         ownerCtx,
         dishQuery ? "recipe_dish" : "recipe_inventory"
       );

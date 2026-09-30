@@ -37,22 +37,33 @@ success returns every safe-to-finish transaction ID plus entries shaped as
 never echoes signed JWS data. If no evidence can be accepted, the endpoint
 returns an appropriate non-2xx error with the same safe rejection metadata.
 
-Deleting an app account still proceeds normally. A pseudonymous ownership
-tombstone containing only the Apple environment, original transaction ID, and
-random app account token survives deletion so the same transaction chain cannot
-later be claimed by a different Firebase account. Document this retained
-anti-fraud binding in the privacy policy and define an appropriate retention
-period.
+Claim rules are chain-based, not token-based
+(`docs/apple-subscription-claim-redesign.md` section 3):
 
-There is intentionally no tokenless legacy-purchase claim path. A restored
-transaction without this user's token is rejected. This is appropriate before
-the first public release; adding legacy support later requires an explicit
-ownership-migration design. The verifier also requires StoreKit ownership type
-`PURCHASED`; leave Family Sharing disabled for these products unless a separate
-family entitlement policy is implemented.
+| Chain state | Outcome |
+| --- | --- |
+| `apple_subscriptions` row owned by this account | Accept (renewal, re-subscribe, refresh) |
+| `apple_subscriptions` row owned by another live account | `409 APPLE_PURCHASE_ACCOUNT_CONFLICT` |
+| No subscription row, ownership record exists | Adopt - the previous owner's account was deleted |
+| No subscription row, no ownership record | First claim; requires the transaction's `appAccountToken` to match the account |
 
-`POST /api/subscriptions/apple/refresh` requeries an already-linked
-subscription for the authenticated user. Configure App Store Server
+Deleting an app account cascades its `apple_subscriptions` and
+`apple_transactions` rows, which is what releases its chains for adoption. A
+pseudonymous ownership row (environment, original transaction ID, original
+account token) survives deletion as provenance only: its token is immutable and
+never gates a claim, so deleting an account no longer strands a subscription the
+user is still paying for. Document this retained binding, and its retention
+period, in the privacy policy.
+
+The verifier still requires StoreKit ownership type `PURCHASED`; leave Family
+Sharing disabled for these products unless a separate family entitlement policy
+is implemented. Because the transaction token is the only first-claim proof, an
+account can never absorb a chain that a live account already owns - that remains
+a deliberate support operation rather than a self-service path.
+
+`POST /api/subscriptions/apple/refresh` requeries every chain the authenticated
+user owns (an account can hold more than one, for example an adopted chain plus
+a later purchase). Configure App Store Server
 Notifications V2 to call:
 
 ```text
@@ -374,6 +385,13 @@ visible in deployment configuration and fails startup before unsafe production
 traffic is accepted. Use `/live` for process liveness and `/ready` (or the
 backward-compatible `/health`) for traffic readiness; readiness returns 503
 while draining or when SQLite cannot answer.
+
+`validatePersistentStorageEnvironment()` additionally fails startup in
+production when a volume mount is advertised (`RAILWAY_VOLUME_MOUNT_PATH`) but
+`SQLITE_PATH` points outside it, and otherwise logs the resolved absolute path.
+An ephemeral database loses every user, entitlement, and Apple ownership binding
+on each deploy, which also invalidates the account token that App Store
+purchases are bound to.
 
 This service uses Firebase Admin Authentication only, so production installs
 may use `npm ci --omit=dev --omit=optional` to exclude Firebase's unused

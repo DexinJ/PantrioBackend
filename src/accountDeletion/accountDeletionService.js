@@ -210,6 +210,12 @@ async function purgeLocalAccountData(db, deletion, { nowFn }) {
         WHERE owner_type = 'user' AND owner_key = ?`,
       [uid]
     );
+    // Deleting the users row cascades apple_subscriptions and apple_transactions
+    // (foreign_keys is ON), which is what releases this account's App Store
+    // subscription chains for adoption by the same person on a new account.
+    // apple_subscription_ownership deliberately survives as provenance; it does
+    // not block adoption. Do not replace this statement with a manual cleanup
+    // that leaves the entitlement rows behind.
     await db.run("DELETE FROM users WHERE uid = ?", [uid]);
     return markLocalDataDeleted(db, uid, { nowMs: nowFn() });
   } catch (error) {

@@ -8,8 +8,12 @@ import {
 
 import { getAppleRuntime } from "./appleConfig.js";
 import {
+  AppleSubscriptionOwnershipError,
+  classifyAppleChainClaim,
   findUserByAppleAccountToken,
-  getAppleSubscriptionRefreshTarget,
+  findUserByAppleChain,
+  getAppleChainClaimState,
+  getAppleSubscriptionRefreshTargets,
   hasProcessedAppleNotification,
   recordProcessedAppleNotification,
   saveVerifiedAppleState,
@@ -196,11 +200,30 @@ function requireTransactionFields(transaction, environment) {
   return plan;
 }
 
-function requireMatchingAccountToken(transaction, expectedToken) {
-  if (
-    transaction.appAccountToken.toLowerCase() !==
-    String(expectedToken || "").toLowerCase()
-  ) {
+/**
+ * Claim rules from docs/apple-subscription-claim-redesign.md section 3. The
+ * chain decides; the transaction token only matters when a chain has no owner
+ * and no ownership record yet (a first claim).
+ */
+async function resolveAppleChainClaim(
+  db,
+  { uid, accountToken, environment, transaction }
+) {
+  const state = await getAppleChainClaimState(db, {
+    environment,
+    originalTransactionId: transaction.originalTransactionId,
+  });
+  return classifyAppleChainClaim({
+    state,
+    uid,
+    transactionToken: transaction.appAccountToken,
+    accountToken,
+  });
+}
+
+function requireClaimAllowed(outcome) {
+  if (outcome === "conflict") throw new AppleSubscriptionOwnershipError();
+  if (outcome === "mismatch") {
     fail(
       "APPLE_PURCHASE_ACCOUNT_MISMATCH",
       "This purchase was not created for the signed-in account.",
@@ -464,6 +487,9 @@ export async function verifyAppleEvidenceForUser(
   const request = normalizeAppleVerificationEnvelope(body);
   const verified = [];
   const failures = [];
+  // The claim decision is per chain, not per evidence item: several items
+  // commonly share one chain, and resolving per item would repeat the error.
+  const claimOutcomes = new Map();
 
   for (let index = 0; index < request.evidence.length; index += 1) {
     try {
@@ -474,7 +500,19 @@ export async function verifyAppleEvidenceForUser(
         item.signedTransactionInfo
       );
       requireTransactionFields(result.decoded, result.environment);
-      requireMatchingAccountToken(result.decoded, appAccountToken);
+      const chainKey = `${result.environment}:${result.decoded.originalTransactionId}`;
+      if (!claimOutcomes.has(chainKey)) {
+        claimOutcomes.set(
+          chainKey,
+          await resolveAppleChainClaim(db, {
+            uid,
+            accountToken: appAccountToken,
+            environment: result.environment,
+            transaction: result.decoded,
+          })
+        );
+      }
+      requireClaimAllowed(claimOutcomes.get(chainKey));
       const renewal = await decodeRenewal(
         result.verifier,
         item.signedRenewalInfo,
@@ -555,17 +593,32 @@ export async function refreshAppleSubscriptionForUser(
   db,
   { uid, appAccountToken, runtime = getAppleRuntime() }
 ) {
-  const target = await getAppleSubscriptionRefreshTarget(db, uid);
-  if (!target) return { refreshed: false };
-  await fetchAndPersistCurrentStatus(db, {
-    uid,
-    appAccountToken,
-    environment: target.environment,
-    transactionId: target.latest_transaction_id,
-    originalTransactionId: target.original_transaction_id,
-    runtime,
-  });
-  return { refreshed: true };
+  // An account can own more than one chain (an adopted chain plus a later
+  // purchase, or two products), and only re-querying the newest leaves the
+  // others stale. Attempt every chain; fail only if none could be refreshed.
+  const targets = await getAppleSubscriptionRefreshTargets(db, uid);
+  if (!targets.length) return { refreshed: false, chains: 0 };
+
+  let refreshed = 0;
+  let lastError = null;
+  for (const target of targets) {
+    try {
+      await fetchAndPersistCurrentStatus(db, {
+        uid,
+        appAccountToken,
+        environment: target.environment,
+        transactionId: target.latest_transaction_id,
+        originalTransactionId: target.original_transaction_id,
+        runtime,
+      });
+      refreshed += 1;
+    } catch (error) {
+      lastError = lastError || error;
+    }
+  }
+
+  if (refreshed === 0 && lastError) throw lastError;
+  return { refreshed: refreshed > 0, chains: refreshed };
 }
 
 function statusFromNotification(notification, transaction) {
@@ -625,6 +678,7 @@ export async function processAppleNotification(
     }
 
     let uid = null;
+    let matchedBy = null;
     const signedTransactionInfo = notification.data?.signedTransactionInfo;
     if (signedTransactionInfo) {
       let transaction;
@@ -648,12 +702,21 @@ export async function processAppleNotification(
         );
       }
       requireTransactionFields(transaction, result.environment);
-      const user = await findUserByAppleAccountToken(
-        db,
-        transaction.appAccountToken
-      );
+      // Resolve by chain first: after adoption the chain's token belongs to the
+      // deleted account while the subscription row belongs to the new one, so a
+      // token-only lookup would drop every renewal and refund. The token
+      // fallback still covers the first SUBSCRIBED event, which can arrive
+      // before the client uploads evidence and before any row exists.
+      const chainOwner = await findUserByAppleChain(db, {
+        environment: result.environment,
+        originalTransactionId: transaction.originalTransactionId,
+      });
+      const user =
+        chainOwner ||
+        (await findUserByAppleAccountToken(db, transaction.appAccountToken));
       if (user) {
         uid = user.uid;
+        matchedBy = chainOwner ? "chain" : "token";
         await saveVerifiedAppleState(
           db,
           recordFromApple({
@@ -676,7 +739,12 @@ export async function processAppleNotification(
       uid,
       signedDate: notification.signedDate,
     });
-    return { duplicate: false, notificationUUID, matchedUser: Boolean(uid) };
+    return {
+      duplicate: false,
+      notificationUUID,
+      matchedUser: Boolean(uid),
+      matchedBy,
+    };
   } finally {
     release();
   }

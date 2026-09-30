@@ -17,6 +17,7 @@ import {
 } from "./recipeDishSearch.js";
 import { withMissingItems } from "./recipeMissingItems.js";
 import { recordSerperUsage, withSerperMetering } from "../usage/serperUsageStore.js";
+import { RECOMMEND_RECIPES_TOOL_NAME } from "./toolNames.js";
 import {
   estimateAndApplyRecipeMetadata,
   recipeEstimationEnabled,
@@ -29,6 +30,7 @@ import {
   argsShape,
   createRecipeTrace,
   dishQueryShape,
+  ownerKeyHash,
 } from "./recipeTrace.js";
 
 // ✅ Single source of truth for what GPT is allowed to send
@@ -204,7 +206,7 @@ export function createRecommendRecipesTool({
       traceId: ctx?.requestId || "",
       requestId: ctx?.requestId || "",
       path: "ws",
-      userId: ctx?.userId || "",
+      userId: ownerKeyHash(ctx?.userId),
     });
     trace("recipe_engine_decision", {
       engine: isDishQuery ? "dish" : "inventory",
@@ -219,11 +221,18 @@ export function createRecommendRecipesTool({
         : 0,
       isAuthed: Boolean(ctx?.isAuthed),
     });
+    const baseSearch = search || TOOLS.webSearch;
     const dependencies = {
       // Serper is shared infrastructure, so every query is metered against the
       // caller even when the model itself runs on the user's own key.
       search: withSerperMetering(
-        search || TOOLS.webSearch,
+        // Hand the trace down: the recipe engines call `search(query, {signal})`
+        // and nothing in that signature carries the turn, so the transport-level
+        // log would otherwise be unattributable. Only wrapped while tracing is
+        // on, so the dependency object is untouched when the flag is off.
+        trace.enabled
+          ? (args, options) => baseSearch(args, { ...(options || {}), trace })
+          : baseSearch,
         ctx,
         isDishQuery ? "recipe_dish" : "recipe_inventory"
       ),
@@ -277,12 +286,15 @@ export const TOOLS = {
     // The recipe engines hand this function {query, k, hl, gl}, but only
     // {q, num} is put on the wire. Logging the body that is actually sent is
     // what makes a missing locale observable instead of invisible.
-    const transport = createRecipeTrace({
-      traceId: ctx?.requestId || "",
-      requestId: ctx?.requestId || "",
-      path: "ws",
-      userId: ctx?.userId || "",
-    });
+    const transport =
+      typeof ctx?.trace === "function"
+        ? ctx.trace
+        : createRecipeTrace({
+            traceId: ctx?.requestId || "",
+            requestId: ctx?.requestId || "",
+            path: "ws",
+            userId: ownerKeyHash(ctx?.userId),
+          });
     transport("websearch_request", {
       query: q,
       k,
@@ -392,7 +404,7 @@ const EXPIRES_IN_DAYS_SCHEMA = {
 export const RECOMMEND_RECIPES_TOOL = {
   type: "function",
   function: {
-    name: "recommendRecipes",
+    name: RECOMMEND_RECIPES_TOOL_NAME,
     description:
       "Find and rank real recipes from the user's fridge inventory and saved preferences. Search fresh each request; never skip a recipe shown before. Use for recipe/meal/'what can I cook?' requests. Call once per request. A follow-up is a new request: pass only the latest message's constraints. If the user names an ingredient (or selects one fridge item), return only recipes containing it. The app supplies saved defaults and fridge items; pass only current-meal constraints.",
     parameters: {

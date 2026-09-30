@@ -82,3 +82,50 @@ export function validateSingleReplicaEnvironment(environment) {
     );
   }
 }
+
+/**
+ * A production backend must keep its SQLite file on persistent storage. Without
+ * this check an ephemeral container filesystem silently discards every user,
+ * entitlement, and ownership binding on each deploy - which also breaks the App
+ * Store token binding, because tokens are regenerated with the users rows.
+ *
+ * Fails closed when a volume mount is configured but the database is pointed
+ * elsewhere. When no volume mount variable exists (another host, or a volume
+ * that is not advertised through the environment) it logs the resolved path
+ * rather than blocking startup.
+ */
+export function validatePersistentStorageEnvironment(environment = process.env) {
+  if (parseNodeEnvironment(environment.NODE_ENV) !== "production") return;
+
+  const configuredPath = String(environment.SQLITE_PATH || "").trim();
+  const volumeRoot = String(environment.RAILWAY_VOLUME_MOUNT_PATH || "").trim();
+
+  if (!volumeRoot) {
+    if (configuredPath) {
+      console.warn(
+        `[config] NODE_ENV=production without RAILWAY_VOLUME_MOUNT_PATH: ` +
+          `SQLITE_PATH resolves to ${path.resolve(configuredPath)}. ` +
+          "Confirm that path is on persistent storage."
+      );
+    }
+    return;
+  }
+
+  if (!configuredPath || !path.isAbsolute(configuredPath)) {
+    throw new Error(
+      "Production requires an absolute SQLITE_PATH inside the mounted volume."
+    );
+  }
+
+  const resolvedPath = path.resolve(configuredPath);
+  const resolvedRoot = path.resolve(volumeRoot);
+  if (
+    resolvedPath !== resolvedRoot &&
+    !resolvedPath.startsWith(resolvedRoot + path.sep)
+  ) {
+    throw new Error(
+      `SQLITE_PATH (${resolvedPath}) must live inside the mounted volume ` +
+        `(${resolvedRoot}); otherwise every deploy starts with an empty database.`
+    );
+  }
+}

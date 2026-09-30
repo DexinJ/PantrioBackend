@@ -2,6 +2,7 @@
 import { OPENAI_API_KEY } from "../config/env.js";
 import { OPENAI_TOOLS } from "./tools.js";
 import { safeJsonParse } from "../utils/json.js";
+import { normalizeUsage } from "./usageShape.js";
 import {
   CHAT_REASONING_EFFORT_MODELS,
   CHAT_TOOLS_REASONING_EFFORT,
@@ -230,18 +231,14 @@ export async function streamOpenAIOnce({
 
         // usage appears near the end when include_usage is enabled
         if (evt?.usage && typeof evt.usage.total_tokens === "number") {
-          usage = evt.usage;
-          send(ws, { type: "usage", requestId, usage });
+          usage = normalizeUsage(evt.usage);
+          if (usage) send(ws, { type: "usage", requestId, usage });
         }
 
         const text = choice?.delta?.content;
         if (typeof text === "string" && text.length) {
-          if (!firstTokenAt) {
-            firstTokenAt = Date.now();
-            console.log(
-              `[OPENAI TTFT] ${firstTokenAt - t0} ms`
-            );
-          }
+          // Reported on the opt-in round-usage line rather than logged here.
+          if (!firstTokenAt) firstTokenAt = Date.now();
           send(ws, { type: "delta", requestId, text });
         }
 
@@ -276,6 +273,7 @@ export async function streamOpenAIOnce({
     needsTools,
     toolCalls,
     usage,
+    ttftMs: firstTokenAt ? firstTokenAt - t0 : null,
   };
   });
 }
