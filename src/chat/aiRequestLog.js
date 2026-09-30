@@ -328,3 +328,43 @@ export function logAiErrorFrame(
     })
   );
 }
+
+/**
+ * Emitted when a WebSocket is opened or closed.
+ *
+ * Chat traffic is the only way to observe the gateway from outside, so without
+ * this a client that never connects looks exactly like a client that connects
+ * and sends nothing. Like every other Pantrio AI line this carries no message
+ * content.
+ *
+ * Note: the client opens this socket on chat-screen focus regardless of the
+ * selected provider, so with the flag on you may also see opens from
+ * bring-your-own-key users who never send a request. That is the price of being
+ * able to tell "no socket" apart from "socket, no traffic"; the flag is a
+ * debugging switch and stays off by default.
+ */
+export function logAiSocketEvent(
+  entry,
+  { enabled = LOG_AI_REQUESTS, logger = console.log } = {}
+) {
+  if (!enabled) return;
+
+  const {
+    phase = "open",
+    sessionId = "",
+    uid = "",
+    durationMs = null,
+    closeCode = null,
+  } = entry || {};
+
+  logger(
+    JSON.stringify({
+      event: phase === "close" ? "pantrio_ai_ws_close" : "pantrio_ai_ws_open",
+      timestamp: new Date().toISOString(),
+      sessionId,
+      uid,
+      durationMs: Number.isFinite(durationMs) ? durationMs : null,
+      closeCode: Number.isFinite(closeCode) ? closeCode : null,
+    })
+  );
+}

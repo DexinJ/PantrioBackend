@@ -78,6 +78,7 @@ import {
   logAiErrorFrame,
   logAiRequest,
   logAiRoundUsage,
+  logAiSocketEvent,
 } from "../chat/aiRequestLog.js";
 import { noteRequest } from "../chat/cacheWindow.js";
 
@@ -368,6 +369,7 @@ export function attachChatGateway(
     logAiRequestFn = logAiRequest,
     logAiRoundUsageFn = logAiRoundUsage,
     logAiChatStartFn = logAiChatStart,
+    logAiSocketEventFn = logAiSocketEvent,
   } = {}
 ) {
   let draining = false;
@@ -407,6 +409,9 @@ export function attachChatGateway(
     let sawFirstRequest = false;
     // Lets the module-level `send` attach the session to error-frame logs.
     ws.pantrioSessionId = sessionId;
+    // Proves the client reached this deployment at all, which is the one thing
+    // the message logs cannot show.
+    logAiSocketEventFn({ phase: "open", sessionId });
 
     function deleteActiveRequest(requestId, { abort = false } = {}) {
       const state = active.get(requestId);
@@ -1713,6 +1718,11 @@ export function attachChatGateway(
 
     ws.on("close", () => {
       connectionClosed = true;
+      logAiSocketEventFn({
+        phase: "close",
+        sessionId,
+        durationMs: Date.now() - connectionStartedAt,
+      });
       for (const pendingStart of starting.values()) {
         pendingStart.cancelled = true;
         pendingStart.controller.abort();
