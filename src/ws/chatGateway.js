@@ -59,6 +59,7 @@ import { streamResponsesOnce } from "../chat/responsesStream.js";
 import { buildResponsesInput } from "../chat/responsesAdapter.js";
 import { resolveChatModel } from "../chat/modelPolicy.js";
 import {
+  lockedRoundToolPolicy,
   normalizeRecipeUiAction,
   RECIPE_UI_ACTIONS,
   resolveRequestRoutingWithReason,
@@ -298,6 +299,32 @@ function splitToolCalls(toolCalls) {
   return { serverCalls, clientCalls };
 }
 
+/**
+ * Splits the model's calls against the round's allowlist. `allowedToolNames` of
+ * null/undefined means every offered tool is callable (the chat default); an
+ * empty array means the round may call nothing.
+ *
+ * This is the enforcement half of keeping the `tools` array stable: the array
+ * no longer varies per round, so "this round may not do X" has to be checked
+ * rather than made structurally impossible.
+ */
+function partitionToolCallsByPolicy(toolCalls, allowedToolNames) {
+  const calls = Array.isArray(toolCalls) ? toolCalls : [];
+  if (!Array.isArray(allowedToolNames)) {
+    return { allowedCalls: calls, refusedCalls: [] };
+  }
+
+  const allowed = new Set(allowedToolNames);
+  const allowedCalls = [];
+  const refusedCalls = [];
+  for (const call of calls) {
+    const name = call?.function?.name;
+    if (name && allowed.has(name)) allowedCalls.push(call);
+    else refusedCalls.push(call);
+  }
+  return { allowedCalls, refusedCalls };
+}
+
 async function withAbortDeadline({
   parentSignal,
   timeoutMs,
@@ -407,6 +434,7 @@ export function attachChatGateway(
     const sessionId = `c-${(connectionSequence += 1)}`;
     const connectionStartedAt = Date.now();
     let sawFirstRequest = false;
+    let framesReceived = 0;
     // Lets the module-level `send` attach the session to error-frame logs.
     ws.pantrioSessionId = sessionId;
     // Proves the client reached this deployment at all, which is the one thing
@@ -577,11 +605,7 @@ export function attachChatGateway(
       let maxTokensForThisRound = plan.maxCompletionTokens;
       let quotaReservation = null;
       const toolPolicy = state.toolsLockedAfterIsolatedAction
-        ? {
-            tools: [],
-            toolChoice: undefined,
-            parallelToolCalls: undefined,
-          }
+        ? lockedRoundToolPolicy()
         : resolveRoundToolPolicy({
             intent: state.intent,
             round: state.round || 0,
@@ -1001,18 +1025,34 @@ export function attachChatGateway(
       // Tool calls required
       state.awaitingTools = true;
       state.acceptingClientToolResults = false;
-      state.toolCalls = one.toolCalls || [];
+      // The tool array is the same on every round, so the round's policy is
+      // enforced here instead of by removing tools from the request.
+      // `state.toolCalls` keeps every call so the replayed assistant message
+      // matches the tool messages below; only `allowedCalls` may execute.
+      const { allowedCalls, refusedCalls } = partitionToolCallsByPolicy(
+        one.toolCalls,
+        toolPolicy.allowedToolNames
+      );
+      state.toolCalls = Array.isArray(one.toolCalls) ? one.toolCalls : [];
       const recipeRecommendationCall = state.toolCalls.find(
-        (call) => call?.function?.name === "recommendRecipes"
+        (call) =>
+          allowedCalls.includes(call) &&
+          call?.function?.name === "recommendRecipes"
       );
       const preferenceProposalCall = state.toolCalls.find(
-        (call) => call?.function?.name === "proposeRecipePreferenceUpdate"
+        (call) =>
+          allowedCalls.includes(call) &&
+          call?.function?.name === "proposeRecipePreferenceUpdate"
       );
       const fridgeProposalCall = state.toolCalls.find(
-        (call) => call?.function?.name === "proposeAddAllToFridge"
+        (call) =>
+          allowedCalls.includes(call) &&
+          call?.function?.name === "proposeAddAllToFridge"
       );
       const bulkEditProposalCall = state.toolCalls.find(
-        (call) => call?.function?.name === "proposeBulkFridgeUpdate"
+        (call) =>
+          allowedCalls.includes(call) &&
+          call?.function?.name === "proposeBulkFridgeUpdate"
       );
       const isolatedToolCall =
         recipeRecommendationCall ||
@@ -1031,6 +1071,26 @@ export function attachChatGateway(
       state.clientToolCallIds = new Set();
       state.round = (state.round || 0) + 1;
 
+      // A refused call still needs a tool message, otherwise the next round
+      // would replay the assistant's call with nothing answering it.
+      if (refusedCalls.length) {
+        state.collectedToolMsgs.push(
+          ...refusedCalls
+            .filter((call) => call?.id)
+            .map((call) => ({
+              role: "tool",
+              tool_call_id: call.id,
+              content: JSON.stringify({
+                ok: false,
+                skipped: true,
+                reason: `Tool not available for this request: ${
+                  call?.function?.name || "unknown"
+                }.`,
+              }),
+            }))
+        );
+      }
+
       // Keep this round's raw output items (reasoning + function calls) so the
       // next Responses round can replay them; the Chat-shaped transcript drops
       // reasoning entirely. Lookup is by call id, so trimming a round removes
@@ -1042,9 +1102,9 @@ export function attachChatGateway(
         });
       }
 
-      let { serverCalls, clientCalls } = splitToolCalls(state.toolCalls);
+      let { serverCalls, clientCalls } = splitToolCalls(allowedCalls);
       if (isolatedToolCall) {
-        const skippedCalls = state.toolCalls.filter(
+        const skippedCalls = allowedCalls.filter(
           (call) => call !== isolatedToolCall
         );
         ({ serverCalls, clientCalls } = splitToolCalls([isolatedToolCall]));
@@ -1692,6 +1752,7 @@ export function attachChatGateway(
     }
 
     ws.on("message", (raw) => {
+      framesReceived += 1;
       if (draining || connectionClosed) {
         send(ws, {
           type: "error",
@@ -1716,12 +1777,14 @@ export function attachChatGateway(
       );
     });
 
-    ws.on("close", () => {
+    ws.on("close", (closeCode) => {
       connectionClosed = true;
       logAiSocketEventFn({
         phase: "close",
         sessionId,
         durationMs: Date.now() - connectionStartedAt,
+        closeCode,
+        framesReceived,
       });
       for (const pendingStart of starting.values()) {
         pendingStart.cancelled = true;

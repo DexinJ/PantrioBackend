@@ -222,6 +222,19 @@ export const ALLOWED_MODELS_AUTHED = new Set(CHAT_MODELS_ALLOWED);
   // fall back to implicit caching without a redeploy.
   export const EXPLICIT_PROMPT_CACHE_ENABLED = true;
 
+  // Keep every round's tool array identical so the request prefix stays
+  // byte-identical and mid-turn rounds can reuse the cached prefix. The model's
+  // `tools` list participates in the cached prefix, so shrinking it per round
+  // (the previous behaviour) made every tool round a cache miss.
+  //
+  // With this on, which tools a round may *call* is narrowed by toolChoice and
+  // an explicit allowlist instead of by removing them from the array. Flip to
+  // false to restore the per-round arrays: a smaller prompt, but a cache miss
+  // whenever the tool set changes.
+  export const STABLE_TOOL_ARRAY_ENABLED = !/^(0|false|no)$/i.test(
+    String(process.env.STABLE_TOOL_ARRAY || "").trim()
+  );
+
   export function supportsExplicitCacheBreakpoints(model) {
     return (
       EXPLICIT_PROMPT_CACHE_ENABLED === true &&

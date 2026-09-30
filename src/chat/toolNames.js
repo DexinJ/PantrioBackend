@@ -5,3 +5,5 @@
 // module that only needs policy constants.
 
 export const RECOMMEND_RECIPES_TOOL_NAME = "recommendRecipes";
+
+export const GET_FRIDGE_CONTENTS_TOOL_NAME = "getFridgeContents";

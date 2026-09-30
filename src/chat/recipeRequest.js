@@ -3,7 +3,11 @@ import {
   OPENAI_TOOLS,
   RECOMMEND_RECIPES_TOOL,
 } from "./tools.js";
-import { RECOMMEND_RECIPES_TOOL_NAME } from "./toolNames.js";
+import {
+  GET_FRIDGE_CONTENTS_TOOL_NAME,
+  RECOMMEND_RECIPES_TOOL_NAME,
+} from "./toolNames.js";
+import { STABLE_TOOL_ARRAY_ENABLED } from "../config/policy.js";
 
 const RECIPE_INTENT = "recipe_recommendation";
 const MAX_INVENTORY_ITEMS = 100;
@@ -366,12 +370,85 @@ export function sanitizeRecipeContext(value) {
  * the first round may only read the fridge, the second may only recommend.
  * `tool_choice` pins a function, so each round is deterministic; the API has no
  * way to force a sequence in a single request.
+ *
+ * Every round offers the same `tools` array so the request prefix stays stable
+ * and mid-turn rounds can reuse the cached prefix. What a round may *call* is
+ * narrowed with `toolChoice` plus `allowedToolNames`, which the gateway
+ * enforces against the model's calls. `allowedToolNames: null` means every
+ * offered tool is callable.
  */
 export function resolveRoundToolPolicy({ intent, round = 0 } = {}) {
+  if (!STABLE_TOOL_ARRAY_ENABLED) {
+    return legacyRoundToolPolicy({ intent, round });
+  }
+
   if (normalizeChatIntent(intent) !== RECIPE_INTENT) {
     return {
       tools: OPENAI_TOOLS,
       toolChoice: "auto",
+      allowedToolNames: null,
+      parallelToolCalls: false,
+    };
+  }
+
+  if (round <= 0) {
+    return {
+      tools: OPENAI_TOOLS,
+      toolChoice: {
+        type: "function",
+        function: { name: GET_FRIDGE_CONTENTS_TOOL_NAME },
+      },
+      allowedToolNames: [GET_FRIDGE_CONTENTS_TOOL_NAME],
+      parallelToolCalls: false,
+    };
+  }
+
+  return {
+    tools: OPENAI_TOOLS,
+    toolChoice: {
+      type: "function",
+      function: { name: RECOMMEND_RECIPES_TOOL_NAME },
+    },
+    allowedToolNames: [RECOMMEND_RECIPES_TOOL_NAME],
+    parallelToolCalls: false,
+  };
+}
+
+/**
+ * The round after a confirmation-style action: nothing may be called. The tool
+ * array still matches every other round so the cached prefix survives, and
+ * `tool_choice: "none"` is the documented way to imitate passing no functions.
+ */
+export function lockedRoundToolPolicy() {
+  if (!STABLE_TOOL_ARRAY_ENABLED) {
+    return {
+      tools: [],
+      toolChoice: undefined,
+      // No allowlist in the rollback path: the round offering no tools is what
+      // stops calls there, exactly as before this change.
+      allowedToolNames: null,
+      parallelToolCalls: undefined,
+    };
+  }
+
+  return {
+    tools: OPENAI_TOOLS,
+    toolChoice: "none",
+    allowedToolNames: [],
+    parallelToolCalls: false,
+  };
+}
+
+/**
+ * Previously shipped behaviour, kept for the STABLE_TOOL_ARRAY rollback: shrink
+ * the array per round instead of narrowing what may be called.
+ */
+function legacyRoundToolPolicy({ intent, round = 0 }) {
+  if (normalizeChatIntent(intent) !== RECIPE_INTENT) {
+    return {
+      tools: OPENAI_TOOLS,
+      toolChoice: "auto",
+      allowedToolNames: null,
       parallelToolCalls: false,
     };
   }
@@ -381,8 +458,11 @@ export function resolveRoundToolPolicy({ intent, round = 0 } = {}) {
       tools: [GET_FRIDGE_CONTENTS_TOOL],
       toolChoice: {
         type: "function",
-        function: { name: "getFridgeContents" },
+        function: { name: GET_FRIDGE_CONTENTS_TOOL_NAME },
       },
+      // Rollback path: restore the previous behaviour exactly. Shrinking the
+      // array is what constrains the round, so nothing is filtered here.
+      allowedToolNames: null,
       parallelToolCalls: false,
     };
   }
@@ -393,6 +473,7 @@ export function resolveRoundToolPolicy({ intent, round = 0 } = {}) {
       type: "function",
       function: { name: RECOMMEND_RECIPES_TOOL_NAME },
     },
+    allowedToolNames: null,
     parallelToolCalls: false,
   };
 }

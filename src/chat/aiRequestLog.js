@@ -355,6 +355,7 @@ export function logAiSocketEvent(
     uid = "",
     durationMs = null,
     closeCode = null,
+    framesReceived = null,
   } = entry || {};
 
   logger(
@@ -365,6 +366,9 @@ export function logAiSocketEvent(
       uid,
       durationMs: Number.isFinite(durationMs) ? durationMs : null,
       closeCode: Number.isFinite(closeCode) ? closeCode : null,
+      // Zero on a socket the client opened and never used, which is how a
+      // provider-independent prewarm is told apart from real chat traffic.
+      framesReceived: Number.isFinite(framesReceived) ? framesReceived : null,
     })
   );
 }
