@@ -263,6 +263,103 @@ async function readBodyWithLimit(body, maxBytes) {
   return { text, truncated };
 }
 
+// ---------------------------------------------------------------------------
+// robots.txt
+// ---------------------------------------------------------------------------
+//
+// Publishers that forbid automated access say so in robots.txt, and honouring
+// it is a contract obligation that exists independently of copyright. Only the
+// `User-agent: *` blocks are honoured; a failed robots fetch is cached as
+// "allowed" for the TTL so a transient outage does not turn into a permanent
+// block, and the cache is bounded so a long-lived process cannot grow without
+// limit.
+
+const ROBOTS_CACHE_MS = 30 * 60 * 1000;
+const ROBOTS_CACHE_MAX = 200;
+const robotsCache = new Map();
+
+export function resetRobotsCache() {
+  robotsCache.clear();
+}
+
+/**
+ * Conservative robots subset: longest-prefix wins between Allow and Disallow,
+ * wildcards are stripped rather than expanded. Anything ambiguous is treated as
+ * "allowed", which keeps the check from blocking on rules it cannot parse.
+ */
+export function robotsAllows(robotsText, pathname = "/") {
+  const lines = String(robotsText || "").split(/\r?\n/);
+  let applies = false;
+  let best = null;
+  let bestAllowed = true;
+  for (const line of lines) {
+    const clean = line.replace(/#.*$/, "").trim();
+    if (!clean) continue;
+    const separator = clean.indexOf(":");
+    if (separator < 0) continue;
+    const key = clean.slice(0, separator).trim().toLowerCase();
+    const value = clean.slice(separator + 1).trim();
+    if (key === "user-agent") {
+      applies = value === "*";
+      continue;
+    }
+    if (!applies || !value) continue;
+    if (key !== "disallow" && key !== "allow") continue;
+    const prefix = value.replace(/\*+$/, "").replace(/\*+/g, "");
+    if (!prefix) continue;
+    if (!pathname.startsWith(prefix)) continue;
+    // Longer prefixes are more specific; `allow` beats `disallow` on a tie.
+    if (
+      !best ||
+      prefix.length > best.length ||
+      (prefix.length === best.length && key === "allow")
+    ) {
+      best = prefix;
+      bestAllowed = key === "allow";
+    }
+  }
+  return best === null ? true : bestAllowed;
+}
+
+async function assertRobotsAllows(url, { fetchImpl, signal }) {
+  const host = url.hostname.replace(/^www\./i, "").toLowerCase();
+  const now = Date.now();
+  const cached = robotsCache.get(host);
+  if (cached && now - cached.fetchedAt < ROBOTS_CACHE_MS) {
+    if (!robotsAllows(cached.text, url.pathname)) {
+      throw new SafeWebFetchError(
+        "ROBOTS_DISALLOWED",
+        "This publisher's robots.txt disallows automated access."
+      );
+    }
+    return;
+  }
+
+  const response = await fetchImpl(new URL("/robots.txt", url.origin), {
+    method: "GET",
+    redirect: "manual",
+    signal,
+    headers: { Accept: "text/plain" },
+  }).catch(() => null);
+  let text = "";
+  if (response?.ok && typeof response.text === "function") {
+    text = await response.text().catch(() => "");
+  }
+
+  if (robotsCache.size >= ROBOTS_CACHE_MAX) {
+    const oldest = robotsCache.keys().next().value;
+    if (oldest !== undefined) robotsCache.delete(oldest);
+  }
+  robotsCache.set(host, { text, fetchedAt: now });
+
+  if (!robotsAllows(text, url.pathname)) {
+    throw new SafeWebFetchError(
+      "ROBOTS_DISALLOWED",
+      "This publisher's robots.txt disallows automated access."
+    );
+  }
+}
+
 export async function fetchPublicTextPage(
   input,
   {
@@ -289,6 +386,12 @@ export async function fetchPublicTextPage(
   try {
     let target = await validatePublicUrl(input, lookupFn);
     for (let redirectCount = 0; ; redirectCount += 1) {
+      // Checked per hop: a redirect can land on a different host with its own
+      // robots policy.
+      await assertRobotsAllows(target.url, {
+        fetchImpl: fetchFn,
+        signal: linked.controller.signal,
+      });
       const agent = createPinnedAgent(target.url, target.addresses);
       let response;
       try {

@@ -24,6 +24,8 @@ import {
   looksLikeRecipePage,
   stripHtmlToText,
 } from "../src/chat/recipeTextExtract.js";
+import { shingleOverlap } from "../src/chat/recipeMethodGuard.js";
+import { summarizeRecipeMethods } from "../src/chat/recipeMethodSummary.js";
 
 function parseArgs(argv) {
   const args = {};
@@ -52,6 +54,25 @@ function summarize(recipe) {
     title: recipe.title || "",
     ingredients: (recipe.ingredients || []).length,
     instructions: (recipe.instructions || []).length,
+  };
+}
+
+/**
+ * The method layer is the thing that ships, so it is measured alongside the
+ * extraction. `worstOverlap` is the highest shingle overlap between a generated
+ * bullet and the publisher's own steps: it should sit at or near zero, and
+ * anything above METHOD_OVERLAP_THRESHOLD means the guard is doing work.
+ */
+function summarizeMethod(recipe) {
+  if (!recipe) return null;
+  const source = (recipe.instructions || []).join(" ");
+  const bullets = Array.isArray(recipe.method) ? recipe.method : [];
+  return {
+    title: recipe.title || "",
+    bullets: bullets.length,
+    worstOverlap: bullets.length
+      ? Math.max(...bullets.map((bullet) => shingleOverlap(bullet, source)))
+      : 0,
   };
 }
 
@@ -99,6 +120,11 @@ for (const entry of entries) {
       language: entry.language,
     });
     record.extracted = recipes.map(summarize);
+    const withMethod =
+      recipes.length > 0
+        ? await summarizeRecipeMethods(recipes, entry.language)
+        : [];
+    record.method = withMethod.map(summarizeMethod);
     if (recipes.length > 0) extracted += 1;
     else failed += 1;
     record.ok = true;

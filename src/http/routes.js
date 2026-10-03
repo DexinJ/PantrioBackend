@@ -73,6 +73,10 @@ import {
   MAX_APPLY_RECIPES,
 } from "../chat/recipeExtractionApply.js";
 import {
+  recipeMethodSummaryEnabled,
+  summarizeRecipeMethods,
+} from "../chat/recipeMethodSummary.js";
+import {
   byoUnsupportedBody,
   isByoProvider,
   normalizeProvider,
@@ -572,6 +576,11 @@ export function createRecipeRecommendationHandler({
         ideationEnabled: byo ? false : ideationEnabled,
         translate: byo ? null : translateRecipes,
         translationEnabled: byo ? false : recipeTranslationEnabled(),
+        summarize: byo ? null : summarizeRecipeMethods,
+        methodSummaryEnabled: byo ? false : recipeMethodSummaryEnabled(),
+        // BYO does not run the summarizer here, so the engine hands us the
+        // source steps and the client summarizes them on its own provider.
+        collectMethodSource: byo,
         // BYO hints replace the pre-search helpers: the client already ran the
         // same prompts on the user's provider. Hints are untrusted input, so
         // aliases pass the same usability guard the model output does.
@@ -596,17 +605,32 @@ export function createRecipeRecommendationHandler({
       const rawResult = dishQuery
         ? await searchRecipesWithDishFn(overrides, safeRecipeContext, dependencies)
         : await recommendRecipesFn(overrides, safeRecipeContext, dependencies);
-      // The engine result is returned untouched. On the pantrio path the tool
-      // wrapper adds shopping-list items; on a BYO path the client does it, so
-      // nothing here needs to run a model of ours.
-      const result = rawResult;
+      // `helperMethodSource` is an internal side-channel carrying the publisher
+      // steps the BYO client needs to summarize. It is split off here so it can
+      // never reach the response. Everything else is returned untouched: on the
+      // pantrio path the tool wrapper adds shopping-list items, and on a BYO
+      // path the client does it, so nothing here runs a model of ours.
+      const raw = rawResult || {};
+      const helperMethodSource = Array.isArray(raw.helperMethodSource)
+        ? raw.helperMethodSource
+        : [];
+      // Only clone when the side-channel is actually present, so a path that
+      // never produced one still returns the engine's own object.
+      let result = raw;
+      if (raw.helperMethodSource !== undefined) {
+        const { helperMethodSource: _omit, ...rest } = raw;
+        result = rest;
+      }
       const withTasks = byo
         ? {
             ...result,
             provider: provider.kind,
             helperTaskVersion: HELPER_TASK_VERSION,
             helperTasks: [
-              ...buildPostSearchTasksFn(result, { language }),
+              ...buildPostSearchTasksFn(result, {
+                language,
+                methodSource: helperMethodSource,
+              }),
               ...(extraction ? extraction.tasks : []),
             ],
           }

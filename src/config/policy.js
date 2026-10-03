@@ -273,6 +273,20 @@ export const ALLOWED_MODELS_AUTHED = new Set(CHAT_MODELS_ALLOWED);
   // the old behaviour — every helper runs server-side again — without shipping
   // a new app build.
   export const BYO_CLIENT_HELPERS = true;
+
+  // Recipe method policy.
+  //
+  // The engines never return the publisher's instruction steps. What they
+  // return is `method` — a short summary the model writes in its own words,
+  // checked against the source for verbatim reuse (recipeMethodGuard.js) — plus
+  // `stepCount` and a link to the source page.
+  //
+  //   RECIPE_METHOD_SUMMARY=false  disables the summary entirely: cards then
+  //                                show facts, the step count, and the link.
+  //   RECIPE_METHOD_MODEL=...      overrides the summarizer model.
+  //
+  // The switch itself lives with the module that owns the prompt
+  // (chat/recipeMethodSummary.js) so there is exactly one source of truth.
   
   // Trial token budgets (SQLite-backed daily quota)
   // TEMP: effectively unlimited for testing. Restore a product value (e.g.

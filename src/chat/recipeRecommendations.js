@@ -1,13 +1,21 @@
 import { fetchPublicTextPage } from "./safeWebFetch.js";
 import { parseRecipeJsonLd } from "./recipeJsonLd.js";
 import {
+  DEFAULT_DENIED_HOST_PATTERNS,
   countTranslatableStrings,
   ingredientMatchesTerm,
+  isDeniedHost,
   recipeTranslationEnabled,
   translateRecipes,
 } from "./recipeDishSearch.js";
 import { dedupeSimilarDishes } from "./recipeDedup.js";
 import { extractRecipesFromPage } from "./recipeTextExtract.js";
+import {
+  MAX_METHOD_BULLETS,
+  applyMethodSummaries,
+  recipeMethodSummaryEnabled,
+  summarizeRecipeMethods,
+} from "./recipeMethodSummary.js";
 
 const ENERGY_PREFERENCES = new Set(["any", "light", "balanced", "hearty"]);
 const SKILL_LEVELS = new Set(["beginner", "intermediate", "advanced"]);
@@ -742,6 +750,15 @@ function normalizedSearchResults(value) {
   return results;
 }
 
+// Host used by the pre-fetch deny-list; an unparseable URL is never denied.
+function hostOfUrl(value) {
+  try {
+    return new URL(value).hostname.replace(/^www\./i, "").toLowerCase();
+  } catch {
+    return "";
+  }
+}
+
 function canonicalUrl(value) {
   try {
     const url = new URL(value);
@@ -762,7 +779,10 @@ async function searchForPages(
   limits,
   deadline,
   warnings,
-  { exclude = new Set() } = {}
+  {
+    exclude = new Set(),
+    deniedHosts = DEFAULT_DENIED_HOST_PATTERNS,
+  } = {}
 ) {
   const unique = new Map();
   let failedSearches = 0;
@@ -782,6 +802,11 @@ async function searchForPages(
         0,
         limits.searchResultsPerQuery
       )) {
+        // Video, social, forum and portal hosts almost never carry a recipe,
+        // so they are dropped before any page budget is spent on them.
+        if (isDeniedHost(hostOfUrl(result.link), deniedHosts)) {
+          continue;
+        }
         const key = canonicalUrl(result.link);
         if (!unique.has(key) && !exclude.has(key)) unique.set(key, result);
         if (unique.size >= limits.maxPages) break;
@@ -1595,13 +1620,14 @@ function selectDiverse(candidates, count) {
 }
 
 function publicRecipe(recipe) {
-  const { _index, _tokenSet, ...output } = recipe;
+  const { _index, _tokenSet, instructions, description, ...output } = recipe;
   return {
     ...output,
     ingredients: (output.ingredients || []).slice(0, 30),
-    instructions: (output.instructions || [])
-      .slice(0, 12)
-      .map((step) => clip(step, 300)),
+    // Publisher step prose is never returned. The count is a fact the card can
+    // show; the method itself stays on the source page behind the link.
+    stepCount: Array.isArray(instructions) ? instructions.length : 0,
+    method: (output.method || []).slice(0, MAX_METHOD_BULLETS),
     usedIngredients: output.usedIngredients.slice(0, 20),
     missingIngredients: output.missingIngredients.slice(0, 30),
     matchedRequestedIngredients: output.matchedRequestedIngredients.slice(0, 40),
@@ -1638,6 +1664,12 @@ export async function recommendRecipes(
     maxResultCount = MAX_RESULT_COUNT,
     translate = translateRecipes,
     translationEnabled = recipeTranslationEnabled(),
+    summarize = summarizeRecipeMethods,
+    methodSummaryEnabled = recipeMethodSummaryEnabled(),
+    // BYO providers run the summarizer on the user's own key, so the engine
+    // hands the source steps to the caller instead of summarizing itself.
+    collectMethodSource = false,
+    deniedHosts = DEFAULT_DENIED_HOST_PATTERNS,
     language,
     // BYO providers replace this with a collector that hands the text pass to
     // the client instead of calling a model of ours.
@@ -1709,7 +1741,7 @@ export async function recommendRecipes(
           limits,
           deadline,
           warnings,
-          { exclude: seenUrls }
+          { exclude: seenUrls, deniedHosts }
         );
         if (wavePages.length === 0) break;
         for (const page of wavePages) {
@@ -1874,6 +1906,11 @@ export async function recommendRecipes(
     const ideaGate = applyIdeaVerification(pool, ideaPlan, inputs);
     pool = ideaGate.pool;
     const selectedRaw = selectDiverse(pool, inputs.resultCount);
+    // The summary is written from the publisher's steps, and `publicRecipe`
+    // strips them, so they are captured here for the method step below.
+    const methodSource = selectedRaw.map((recipe) =>
+      (recipe.instructions || []).slice(0, 12)
+    );
     const selected = selectedRaw.map(publicRecipe);
     if (selected.length === 0) {
       if (requestedGate.required.length > 0) {
@@ -1932,9 +1969,37 @@ export async function recommendRecipes(
       }
     }
 
+    // The method layer is authored, never copied. Runs after translation so it
+    // can never starve it of budget, and is skipped when too little time is
+    // left: a card with no method beats a card carrying publisher steps.
+    let methodSummaryApplied = 0;
+    if (methodSummaryEnabled) {
+      const withMethod = await applyMethodSummaries(returnedRecipes, {
+        language: targetLanguage,
+        enabled: true,
+        summarize,
+        signal: deadline.signal,
+        sourceSteps: methodSource,
+      });
+      methodSummaryApplied = withMethod.filter((recipe) =>
+        Array.isArray(recipe?.method) && recipe.method.length > 0
+      ).length;
+      returnedRecipes = withMethod;
+    }
+
     return {
       recipes: returnedRecipes,
       warnings: warnings.slice(0, 12),
+      // BYO only: the caller turns these into a methodSummary helper task and
+      // must strip the field before the payload reaches the client.
+      ...(collectMethodSource
+        ? {
+            helperMethodSource: methodSource.map((steps, index) => ({
+              index,
+              steps,
+            })),
+          }
+        : {}),
       meta: {
         queryCount: queryPlan.length,
         queriesRun: searchesRun,
@@ -1963,6 +2028,10 @@ export async function recommendRecipes(
           applied: translationApplied,
           failed:
             translatableCount > 0 && translationApplied === 0 ? 1 : 0,
+        },
+        methodSummary: {
+          enabled: Boolean(methodSummaryEnabled),
+          applied: methodSummaryApplied,
         },
         dedupe: {
           nearDuplicateDropped: dedupeDropped,

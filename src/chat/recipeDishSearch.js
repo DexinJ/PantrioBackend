@@ -43,6 +43,12 @@ import { fetchPublicTextPage } from "./safeWebFetch.js";
 import { parseRecipeJsonLd } from "./recipeJsonLd.js";
 import { dedupeSimilarDishes } from "./recipeDedup.js";
 import { extractRecipesFromPage } from "./recipeTextExtract.js";
+import {
+  MAX_METHOD_BULLETS,
+  applyMethodSummaries,
+  recipeMethodSummaryEnabled,
+  summarizeRecipeMethods,
+} from "./recipeMethodSummary.js";
 import { MODEL_RECIPE_TRANSLATION } from "../config/models.js";
 import {
   clip,
@@ -1297,8 +1303,6 @@ const TRANSLATION_FIELD_ORDER = Object.freeze([
   "title",
   "ingredients",
   "missingIngredients",
-  "description",
-  "instructions",
   "whyRecommended",
 ]);
 
@@ -1714,9 +1718,11 @@ function createDeadline(parentSignal, timeoutMs) {
 // ---------------------------------------------------------------------------
 
 function qualityScore(recipe) {
+  const hasMethod =
+    (recipe.instructions || []).length > 0 || (recipe.method || []).length > 0;
   return (
     0.3 +
-    ((recipe.instructions || []).length > 0 ? 0.25 : 0) +
+    (hasMethod ? 0.25 : 0) +
     (recipe.caloriesPerServing != null ? 0.2 : 0) +
     (recipe.totalMinutes != null ? 0.15 : 0) +
     ((recipe.cuisines || []).length > 0 ? 0.1 : 0)
@@ -1758,13 +1764,24 @@ function buildWhyRecommended(recipe, { used, dishQuery, language }) {
 }
 
 function publicRecipe(candidate, context) {
-  const { dishMatch, score, scoreBreakdown, _index, ...recipe } = candidate;
+  const {
+    dishMatch,
+    score,
+    scoreBreakdown,
+    _index,
+    instructions,
+    description,
+    ...recipe
+  } = candidate;
   const used = candidate.usedIngredients || [];
   const missing = candidate.missingIngredients || [];
   return {
     ...recipe,
     ingredients: (recipe.ingredients || []).slice(0, 30),
-    instructions: (recipe.instructions || []).slice(0, 12),
+    // Publisher step prose is never returned. The count is a fact the card can
+    // show; the method itself stays on the source page behind the link.
+    stepCount: Array.isArray(instructions) ? instructions.length : 0,
+    method: (recipe.method || []).slice(0, MAX_METHOD_BULLETS),
     usedIngredients: used.slice(0, 20),
     missingIngredients: missing.slice(0, 30),
     dish: {
@@ -1863,6 +1880,11 @@ export async function searchRecipesByDish(
     expandIngredients = expandIngredientNames,
     translate = translateRecipes,
     translationEnabled = recipeTranslationEnabled(),
+    summarize = summarizeRecipeMethods,
+    methodSummaryEnabled = recipeMethodSummaryEnabled(),
+    // BYO providers run the summarizer on the user's own key, so the engine
+    // hands the source steps to the caller instead of summarizing itself.
+    collectMethodSource = false,
     aliasExpansionEnabled = true,
     // BYO providers hand the text pass to the client through a collector.
     extractPageRecipes = extractRecipesFromPage,
@@ -2492,7 +2514,13 @@ export async function searchRecipesByDish(
           wanted - selectedReal.length
         )
       : [];
-    const selected = [...selectedReal, ...selectedNear].map((candidate) =>
+    const selectedCandidates = [...selectedReal, ...selectedNear];
+    // The summary is written from the publisher's steps, and `publicRecipe`
+    // strips them, so they are captured here for the method step below.
+    const methodSource = selectedCandidates.map((candidate) =>
+      (candidate.instructions || []).slice(0, 12)
+    );
+    const selected = selectedCandidates.map((candidate) =>
       publicRecipe(candidate, {
         dishQuery: dish,
         language: normalizedLanguage,
@@ -2566,6 +2594,26 @@ export async function searchRecipesByDish(
       };
     }
 
+    // 7. The method layer is authored, never copied. Runs after translation so
+    //    it can never starve it of budget, and is skipped when too little time
+    //    is left: a card with no method beats a card carrying publisher steps.
+    if (methodSummaryEnabled) {
+      if (remainingMs() > MIN_TRANSLATION_BUDGET_MS) {
+        returned = await applyMethodSummaries(returned, {
+          language: normalizedLanguage,
+          enabled: true,
+          summarize,
+          signal,
+          sourceSteps: methodSource,
+        });
+      } else {
+        pushWarning(
+          "METHOD_SUMMARY_SKIPPED",
+          "The recipe method summary was skipped because the request ran out of time."
+        );
+      }
+    }
+
     if (selected.length === 0) {
       pushWarning(
         "NO_MATCHING_DISH",
@@ -2615,6 +2663,16 @@ export async function searchRecipesByDish(
     return {
       recipes: returned,
       warnings: warnings.slice(0, 12),
+      // BYO only: the caller turns these into a methodSummary helper task and
+      // must strip the field before the payload reaches the client.
+      ...(collectMethodSource
+        ? {
+            helperMethodSource: methodSource.map((steps, index) => ({
+              index,
+              steps,
+            })),
+          }
+        : {}),
       meta: {
         language: normalizedLanguage,
         dishQuery: dish,
@@ -2737,6 +2795,9 @@ export async function searchRecipesWithDish(
       expandIngredients: deps.expandIngredients,
       translate: deps.translate,
       translationEnabled: deps.translationEnabled,
+      summarize: deps.summarize,
+      methodSummaryEnabled: deps.methodSummaryEnabled,
+      collectMethodSource: deps.collectMethodSource,
       aliasExpansionEnabled: deps.aliasExpansionEnabled,
       extractPageRecipes: deps.extractPageRecipes,
       llmDedupeEnabled: deps.llmDedupeEnabled,

@@ -29,19 +29,24 @@ import {
   MAX_PAGE_TEXT_CHARS,
   looksLikeRecipePage,
 } from "./recipeTextExtract.js";
+import { METHOD_SUMMARY_SYSTEM_PROMPT } from "./recipeMethodSummary.js";
 
 /**
  * Bumped whenever a prompt or an input shape changes. A client that does not
  * recognise the version must fall back to deterministic behaviour rather than
  * sending a mismatched shape.
  */
-export const HELPER_TASK_VERSION = 1;
+// 3: the method moved from verbatim publisher steps to an authored,
+//    overlap-checked summary. A client built for v2 must not be handed v3
+//    tasks, so the version gate below invalidates its cached manifest.
+export const HELPER_TASK_VERSION = 3;
 
 export const HELPER_TASK_KINDS = Object.freeze([
   "dishAliases",
   "ingredientVariants",
   "mealIdeas",
   "missingItems",
+  "methodSummary",
   "translation",
   "estimation",
   "dedupe",
@@ -53,6 +58,11 @@ export const MAX_HELPER_TASKS = 12;
 export const MAX_EXTRACTION_TASKS = 3;
 export const EXTRACTION_EXCERPT_CHARS = 8_000;
 export const MAX_TRANSLATION_STRINGS = 240;
+// Long single strings (some publishers ship the whole method as one step) were
+// clipped to 400 chars, which broke the client's exact-string lookup and left
+// those steps untranslated. This covers realistic steps while still bounding
+// what one BYO request can carry.
+const MAX_TRANSLATABLE_STRING_CHARS = 1_200;
 
 /**
  * Pre-search tasks. The client must run these before it can call search, so
@@ -118,12 +128,18 @@ function missingLinesOf(recipe) {
 /**
  * Translation input mirrors the server translator: field-major, deduplicated,
  * and only strings written in the other script.
+ *
+ * Only the fields the recipe card actually renders are collected. The full
+ * `ingredients` list is deliberately excluded: the card draws "you have" from
+ * usedIngredients and "missing" from missingIngredients, and the card
+ * normalizer drops the full list, so translating it spends the user's tokens
+ * on text that never reaches the screen.
  */
 export function collectTranslatableStrings(recipes, language) {
   const seen = new Set();
   const output = [];
   const push = (value) => {
-    const text = clip(String(value ?? ""), 400);
+    const text = clip(String(value ?? ""), MAX_TRANSLATABLE_STRING_CHARS);
     if (!text || seen.has(text)) return;
     if (!needsTranslation(text, language)) return;
     seen.add(text);
@@ -134,10 +150,7 @@ export function collectTranslatableStrings(recipes, language) {
     push(recipe?.source);
   }
   for (const recipe of Array.isArray(recipes) ? recipes : []) {
-    for (const line of recipe?.ingredients || []) push(line);
-  }
-  for (const recipe of Array.isArray(recipes) ? recipes : []) {
-    for (const step of recipe?.instructions || []) push(step);
+    for (const line of recipe?.missingIngredients || []) push(line);
   }
   return output.slice(0, MAX_TRANSLATION_STRINGS);
 }
@@ -205,23 +218,65 @@ export function sanitizeRecipeHints(value) {
   return { aliases, variantTable, ideas };
 }
 
-function estimationInput(recipes) {
+/**
+ * `index` is the position within this filtered list, because that is what the
+ * client's `applyEstimation` indexes into. The publisher steps are no longer on
+ * the public recipe, so they arrive through `methodSource` instead.
+ */
+function estimationInput(recipes, methodSource = []) {
+  const stepsByIndex = new Map(
+    (Array.isArray(methodSource) ? methodSource : []).map((entry) => [
+      Number(entry?.index),
+      Array.isArray(entry?.steps) ? entry.steps : [],
+    ])
+  );
   return (Array.isArray(recipes) ? recipes : [])
+    .map((recipe, recipeIndex) => ({ recipe, recipeIndex }))
     .filter(
-      (recipe) =>
+      ({ recipe }) =>
         recipe?.caloriesPerServing == null || recipe?.totalMinutes == null
     )
     .slice(0, 12)
-    .map((recipe, index) => ({
+    .map(({ recipe, recipeIndex }, index) => ({
       index,
       title: clip(recipe?.title, 180),
       servings: Number.isFinite(recipe?.servings) ? recipe.servings : null,
       ingredients: (recipe?.ingredients || [])
         .slice(0, 20)
         .map((line) => clip(String(line ?? ""), 120)),
-      instructions: (recipe?.instructions || [])
+      instructions: (stepsByIndex.get(recipeIndex) || [])
         .slice(0, 12)
         .map((step) => clip(String(step ?? ""), 160)),
+    }));
+}
+
+/**
+ * The method a BYO client should summarize. Built from the engine's step
+ * side-channel because the public recipe no longer carries the steps.
+ */
+function methodSummaryInputs(recipes, methodSource) {
+  const list = Array.isArray(recipes) ? recipes : [];
+  return (Array.isArray(methodSource) ? methodSource : [])
+    .map((entry) => ({ index: Number(entry?.index), steps: entry?.steps }))
+    .filter(
+      ({ index, steps }) =>
+        Number.isInteger(index) &&
+        index >= 0 &&
+        index < list.length &&
+        Array.isArray(steps) &&
+        steps.length > 0
+    )
+    .slice(0, 6)
+    .map(({ index, steps }) => ({
+      index,
+      title: clip(list[index]?.title, 180),
+      servings: Number.isFinite(list[index]?.servings)
+        ? list[index].servings
+        : null,
+      ingredients: (list[index]?.ingredients || [])
+        .slice(0, 20)
+        .map((line) => clip(String(line ?? ""), 120)),
+      steps: steps.slice(0, 12).map((step) => clip(String(step ?? ""), 300)),
     }));
 }
 
@@ -240,7 +295,10 @@ function dedupeInput(recipes) {
  * search response so the client can run whichever ones it supports; anything it
  * skips simply keeps the deterministic result the server already produced.
  */
-export function buildPostSearchTasks(result, { language = "en" } = {}) {
+export function buildPostSearchTasks(
+  result,
+  { language = "en", methodSource = [] } = {}
+) {
   const recipes = Array.isArray(result?.recipes) ? result.recipes : [];
   const tasks = [];
   if (recipes.length === 0) return tasks;
@@ -271,7 +329,20 @@ export function buildPostSearchTasks(result, { language = "en" } = {}) {
     });
   }
 
-  const estimates = estimationInput(recipes);
+  const methodRecipes = methodSummaryInputs(recipes, methodSource);
+  if (methodRecipes.length > 0) {
+    tasks.push({
+      id: "methodSummary",
+      kind: "methodSummary",
+      version: HELPER_TASK_VERSION,
+      prompt: METHOD_SUMMARY_SYSTEM_PROMPT,
+      expects: "json",
+      maxOutputTokens: 1_600,
+      input: { language, recipes: methodRecipes },
+    });
+  }
+
+  const estimates = estimationInput(recipes, methodSource);
   if (estimates.length > 0) {
     tasks.push({
       id: "estimation",

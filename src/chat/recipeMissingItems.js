@@ -33,7 +33,8 @@ Rules:
 - Never invent an ingredient that is not in the line.
 - quantity is only the purchasable amount. Leave parenthetical alternatives, brand notes, and commentary out of both fields rather than moving them into quantity.
 - Keep a preparation note out of the name only when the ingredient still reads correctly without it ("1 lb flank steak, cut into strips" -> name "flank steak").
-- Keep the line you were given in "line", unchanged.
+- Write name in the language of the "language" field, so a shopper reads the item in their own language.
+- Keep the line you were given in "line", unchanged and in the publisher's original language.
 Respond with ONLY JSON: {"items":[{"line":"...","name":"...","quantity":"..."}]}`;
 
 /**

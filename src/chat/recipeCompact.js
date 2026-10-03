@@ -17,6 +17,10 @@ export function compactRecipeResultsForChat(result) {
       timeConfidence: recipe.timeConfidence,
       usedIngredients: recipe.usedIngredients,
       missingIngredients: recipe.missingIngredients,
+      // The authored summary, not the publisher's steps — the steps are never
+      // part of the result at all.
+      method: recipe.method,
+      stepCount: recipe.stepCount,
       matchedRequestedIngredients: recipe.matchedRequestedIngredients,
       unmatchedRequestedIngredients: recipe.unmatchedRequestedIngredients,
       whyRecommended: recipe.whyRecommended,
