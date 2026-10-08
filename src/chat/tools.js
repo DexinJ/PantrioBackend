@@ -17,7 +17,10 @@ import {
 } from "./recipeDishSearch.js";
 import { withMissingItems } from "./recipeMissingItems.js";
 import { recordSerperUsage, withSerperMetering } from "../usage/serperUsageStore.js";
-import { RECOMMEND_RECIPES_TOOL_NAME } from "./toolNames.js";
+import {
+  MASS_ADD_SHOPPING_ITEMS_TOOL_NAME,
+  RECOMMEND_RECIPES_TOOL_NAME,
+} from "./toolNames.js";
 import {
   estimateAndApplyRecipeMetadata,
   recipeEstimationEnabled,
@@ -655,6 +658,40 @@ export const OPENAI_TOOLS = [
           categories: CATEGORY_SCHEMA,
         },
         required: ["name", "categories"],
+        additionalProperties: false,
+      },
+    },
+  },
+
+  {
+    type: "function",
+    function: {
+      name: MASS_ADD_SHOPPING_ITEMS_TOOL_NAME,
+      description:
+        "Add several items to the shopping list in one call. Use this instead of calling addShoppingItem more than once. Items already on the list are skipped.",
+      parameters: {
+        type: "object",
+        properties: {
+          items: {
+            type: "array",
+            minItems: 1,
+            maxItems: 40,
+            items: {
+              type: "object",
+              properties: {
+                name: { type: "string", description: "Item name (e.g., 'eggs')." },
+                quantity: {
+                  type: "string",
+                  description: "Amount (e.g., 'dozen'). Default '1'.",
+                },
+                categories: CATEGORY_SCHEMA,
+              },
+              required: ["name", "categories"],
+              additionalProperties: false,
+            },
+          },
+        },
+        required: ["items"],
         additionalProperties: false,
       },
     },

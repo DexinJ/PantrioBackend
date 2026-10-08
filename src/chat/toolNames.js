@@ -7,3 +7,7 @@
 export const RECOMMEND_RECIPES_TOOL_NAME = "recommendRecipes";
 
 export const GET_FRIDGE_CONTENTS_TOOL_NAME = "getFridgeContents";
+
+// Client-owned batch shopping add. The schema is offered only to clients that
+// advertise the matching capability (see clientCapabilities.js).
+export const MASS_ADD_SHOPPING_ITEMS_TOOL_NAME = "massAddShoppingItems";

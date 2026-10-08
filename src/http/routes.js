@@ -813,7 +813,10 @@ export function attachRoutes(app) {
       const extractions = Array.isArray(body.extractions)
         ? body.extractions.slice(0, MAX_APPLY_EXTRACTIONS)
         : [];
-      const preferences = sanitizeRecipeContextFn({
+      // This inline route lives in attachRoutes, outside the scope of
+      // createRecipeRecommendationHandler's sanitizeRecipeContextFn parameter,
+      // so it must call the imported function directly.
+      const preferences = sanitizeRecipeContext({
         preferences: body.recipeContext?.preferences,
       }).preferences;
       const result = applyClientExtractions({

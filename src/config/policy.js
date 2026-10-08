@@ -1,7 +1,10 @@
 // src/config/policy.js
 import { parseNodeEnvironment } from "./runtimeConfig.js";
 import { CHAT_MODEL_FREE, CHAT_MODELS_ALLOWED } from "./models.js";
-import { RECOMMEND_RECIPES_TOOL_NAME } from "../chat/toolNames.js";
+import {
+  MASS_ADD_SHOPPING_ITEMS_TOOL_NAME,
+  RECOMMEND_RECIPES_TOOL_NAME,
+} from "../chat/toolNames.js";
 
 // Full access models (signed-in users)
 // Non-subscribers are narrowed to NON_SUBSCRIBER_CHAT_MODEL below.
@@ -250,6 +253,7 @@ export const ALLOWED_MODELS_AUTHED = new Set(CHAT_MODELS_ALLOWED);
     "proposeRecipePreferenceUpdate",
     "addFridgeItem",
     "addShoppingItem",
+    MASS_ADD_SHOPPING_ITEMS_TOOL_NAME,
     "removeFridgeItem",
     "removeShoppingItem",
     "findInFridge",

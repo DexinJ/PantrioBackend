@@ -121,6 +121,29 @@ export function toResponsesTools(tools) {
 }
 
 /**
+ * Map a Chat Completions tool_choice onto the Responses shape.
+ *
+ * Chat nests a pinned function under `function`; Responses is internally
+ * tagged, so the name sits at the top level. The API rejects the nested form
+ * with "Missing required parameter: 'tool_choice.name'.", which is exactly what
+ * every forced recipe round hit. String forms ("auto" | "none" | "required")
+ * and anything unrecognized pass through untouched rather than being guessed
+ * at, so a future tool_choice variant cannot be silently rewritten.
+ */
+export function toResponsesToolChoice(toolChoice) {
+  if (!toolChoice || typeof toolChoice !== "object" || Array.isArray(toolChoice)) {
+    return toolChoice;
+  }
+  const name =
+    typeof toolChoice?.function?.name === "string"
+      ? toolChoice.function.name
+      : typeof toolChoice.name === "string"
+        ? toolChoice.name
+        : "";
+  return name ? { type: "function", name } : toolChoice;
+}
+
+/**
  * Build the Responses request payload from the gateway transcript.
  *
  * @param {object} options

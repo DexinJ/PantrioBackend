@@ -1001,24 +1001,20 @@ export function matchesEnergyPreference(recipe, energyPreference) {
 }
 
 /**
- * A stated ceiling is a filter, not a tunable penalty: recipes that break it
+ * Calorie and ingredient ceilings are hard filters: recipes that break them
  * are dropped when enough alternatives remain, and otherwise ranked last.
+ *
+ * The time ceiling is deliberately absent here. It is a soft preference, so
+ * over-time recipes still surface — scoreRecipe ranks them down instead.
  */
 export function violatesLimits(
   recipe,
-  { maxCaloriesPerServing, maxPrepMinutes, maxIngredients } = {}
+  { maxCaloriesPerServing, maxIngredients } = {}
 ) {
   if (
     maxCaloriesPerServing != null &&
     recipe.caloriesPerServing != null &&
     recipe.caloriesPerServing > maxCaloriesPerServing
-  ) {
-    return true;
-  }
-  if (
-    maxPrepMinutes != null &&
-    recipe.totalMinutes != null &&
-    recipe.totalMinutes > maxPrepMinutes
   ) {
     return true;
   }
@@ -2465,6 +2461,12 @@ export async function searchRecipesByDish(
         cuisine: matchesPreferredCuisine(recipe, cuisines) ? 1 : 0,
         energy: matchesEnergyPreference(recipe, energy) === true ? 1 : 0,
         overLimit: violatesLimits(recipe, preferenceLimits) ? 1 : 0,
+        overTime:
+          preferenceLimits.maxPrepMinutes != null &&
+          recipe.totalMinutes != null &&
+          recipe.totalMinutes > preferenceLimits.maxPrepMinutes
+            ? 1
+            : 0,
         disliked: dislikedIngredientPenalty(
           recipe,
           dislikes,
@@ -2480,6 +2482,7 @@ export async function searchRecipesByDish(
           breakdown.mealType * 0.05 +
           breakdown.energy * 0.05 -
           breakdown.overLimit * 0.15 -
+          breakdown.overTime * 0.15 -
           breakdown.disliked
       );
       return {

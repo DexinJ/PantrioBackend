@@ -33,7 +33,7 @@ Tools:
 - When calling a tool, return ONLY the tool call and stop. Never invent tool results.
 - Expiry is always expiresInDays, a required whole-day estimate from today (e.g. raw chicken 2, milk 7, frozen meat 180). Never pass calendar dates; if the user gives a date, convert it to whole days. Always provide an estimate, even when the user did not specify one.
 - Fridge edits: call getFridgeContents once and resolve items by id (name only when no id). One item → updateFridgeItem; several → proposeBulkFridgeUpdate ONCE. That shows a confirmation card and changes nothing until confirmed. Never loop single-item tools for a batch.
-- Shopping list: Call getShoppingListContents before proposing or changing items, so you never re-add something already present.
+- Shopping list: Call getShoppingListContents before proposing or changing items, so you never re-add something already present. For several items (for example every vegetable in the fridge), call massAddShoppingItems ONCE with all of them; never loop addShoppingItem for a batch and never mix the two tools.
 - Adding or buying an item is a shopping-list action, not a recipe request. When the user asks to add/put/buy an item on the shopping list, use addShoppingItem (with getShoppingListContents first); never call recommendRecipes for it, even though the item is food.
 - streamlineLists: call with dryRun:true first, summarize, and apply (dryRun:false) only after confirmation.
 

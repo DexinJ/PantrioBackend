@@ -67,6 +67,7 @@ import {
   sanitizeRecipeContext,
 } from "../chat/recipeRequest.js";
 import { runToolCalls } from "../chat/toolRunner.js"; // ✅ HYBRID: enable server-side tools
+import { filterToolsForClientCapabilities } from "../chat/clientCapabilities.js";
 import { trimWorkingMessagesToFit } from "../chat/messageTrimmer.js";
 import { buildSystemMessage } from "../chat/systemPrompt.js";
 import {
@@ -604,12 +605,21 @@ export function attachChatGateway(
 
       let maxTokensForThisRound = plan.maxCompletionTokens;
       let quotaReservation = null;
-      const toolPolicy = state.toolsLockedAfterIsolatedAction
+      const baseToolPolicy = state.toolsLockedAfterIsolatedAction
         ? lockedRoundToolPolicy()
         : resolveRoundToolPolicy({
             intent: state.intent,
             round: state.round || 0,
           });
+      // Client-owned tools are only offered to builds that advertise them, so an
+      // older app never receives a call its handler map cannot execute.
+      const toolPolicy = {
+        ...baseToolPolicy,
+        tools: filterToolsForClientCapabilities(
+          baseToolPolicy.tools,
+          state.clientCapabilities
+        ),
+      };
       const toolDefinitionMessages = toolPolicy.tools.length
         ? [{ role: "system", content: { tools: toolPolicy.tools } }]
         : [];
@@ -1483,6 +1493,13 @@ export function attachChatGateway(
 
       const isAuthed = true;
       const messages = msg.messages;
+      // Client-owned tools the app build can execute. Unknown or malformed
+      // values are dropped rather than trusted.
+      const clientCapabilities = Array.isArray(msg.clientCapabilities)
+        ? msg.clientCapabilities
+            .filter((value) => typeof value === "string")
+            .slice(0, 20)
+        : [];
 
       const { ownerType, ownerKey } = parseOwner(userId, true);
       const subscription = await getUserSubscription(db, userId);
@@ -1696,6 +1713,7 @@ export function attachChatGateway(
         intent,
         intentSource,
         recipeContext,
+        clientCapabilities,
         isAuthed,
         userId,
         db,

@@ -17,7 +17,10 @@
 
 import { OPENAI_API_KEY } from "../config/env.js";
 import { safeJsonParse } from "../utils/json.js";
-import { toResponsesTools } from "./responsesAdapter.js";
+import {
+  toResponsesToolChoice,
+  toResponsesTools,
+} from "./responsesAdapter.js";
 import { withAbortTimeout } from "./openaiStream.js";
 import { normalizeUsage } from "./usageShape.js";
 
@@ -84,7 +87,7 @@ export async function streamResponsesOnce({
         ...(hasTools
           ? {
               tools: responsesTools,
-              tool_choice: toolChoice,
+              tool_choice: toResponsesToolChoice(toolChoice),
               ...(typeof parallelToolCalls === "boolean"
                 ? { parallel_tool_calls: parallelToolCalls }
                 : {}),
