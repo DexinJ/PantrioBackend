@@ -6,7 +6,6 @@
 // user. Ideas themselves are never returned as recommendations.
 import {
   OPENAI_API_KEY,
-  RECIPE_IDEATION_ENABLED,
   RECIPE_IDEATION_MODEL,
 } from "../config/env.js";
 import { safeJsonParse } from "../utils/json.js";
@@ -22,12 +21,12 @@ export const IDEATION_SYSTEM_PROMPT = `You turn a home fridge inventory into con
 Rules:
 - Propose 3 to 5 distinct ideas. Cover as many fridge items as practical across the ideas, but do not force every item into one dish.
 - Respect the requested meal type: dinner ideas must be main dishes, not beverages, snacks, or desserts unless the user asked for them.
-- Use canonical English dish and ingredient names. If the user's items or constraints are in another language (for example Chinese), translate them: 番茄炒蛋 -> tomato and egg; 鸡肉 -> chicken.
+- Write the dish name, the search query, and the core ingredients in the same language the user is using (the payload's "language"). Never translate them into English: 番茄炒蛋 stays 番茄炒蛋, 鸡肉 stays 鸡肉.
 - Never propose a dish containing an excluded ingredient, an allergen, or an ingredient the user's saved diet forbids.
 - For every idea return:
   - dish: a short display name,
-  - query: ONE specific English web-search query that will find a real recipe for this dish (for example "yogurt marinated chicken recipe"). Never a raw list of fridge items.
-  - coreIngredients: 1-4 canonical English ingredients that must appear in the recipe.
+  - query: ONE specific web-search query in the user's language that will find a real recipe for this dish (for example "yogurt marinated chicken recipe"). Never a raw list of fridge items.
+  - coreIngredients: 1-4 ingredients, written in the user's language, that must appear in the recipe.
 - Never invent brand names, restaurants, or recipe sources.
 
 Respond with ONLY JSON shaped like:
@@ -40,7 +39,9 @@ function clip(value, maxLength = 120) {
 }
 
 export function recipeIdeationEnabled() {
-  return RECIPE_IDEATION_ENABLED;
+  // Ideation is the required first step for inventory/breadth recipe search, so
+  // there is no longer a flag. Kept as a stable export for existing callers.
+  return true;
 }
 
 function cleanIdea(value) {
@@ -113,6 +114,7 @@ function buildIdeationPayload(inputs) {
 
   return {
     inventory: safeList(inputs?.inventory, MAX_INVENTORY_ITEMS_IN_PROMPT),
+    language: clip(inputs?.language, 24) || null,
     mealType: inputs?.mealType || null,
     preferredCuisines: safeList(inputs?.requestedCuisines, 5),
     energyPreference: inputs?.energyPreference || "any",

@@ -24,9 +24,6 @@ export const RECIPE_AI_ESTIMATION_ENABLED = /^(1|true|yes)$/i.test(
 export const RECIPE_ESTIMATION_MODEL =
   String(process.env.RECIPE_ESTIMATION_MODEL || MODEL_RECIPE_ESTIMATION_DEFAULT).trim() ||
   MODEL_RECIPE_ESTIMATION_DEFAULT;
-export const RECIPE_IDEATION_ENABLED = /^(1|true|yes)$/i.test(
-  String(process.env.RECIPE_IDEATION || "")
-);
 export const RECIPE_IDEATION_MODEL =
   String(process.env.RECIPE_IDEATION_MODEL || MODEL_RECIPE_IDEATION_DEFAULT).trim() ||
   MODEL_RECIPE_IDEATION_DEFAULT;

@@ -28,14 +28,14 @@ const COOKING_METHODS = new Set([
   "stovetop",
   "oven",
 ]);
-const MAX_RESULT_COUNT = 6;
-const DEFAULT_RESULT_COUNT = 6;
+const MAX_RESULT_COUNT = 4;
+const DEFAULT_RESULT_COUNT = 4;
 const MAX_IDEATION_IDEAS = 5;
 const IDEA_MATCH_WEIGHT = 0.25;
 // How many viable candidates to gather before picking the final short list.
 // Selection returns at most MAX_RESULT_COUNT, but search keeps going until
 // roughly this many required/viable recipes are available (or the budget ends).
-const CANDIDATE_POOL_TARGET = 14;
+const CANDIDATE_POOL_TARGET = 10;
 // Search work is not charged against the user's token quota, so there is no
 // entitlement-specific search budget. These limits are server safety rails
 // (latency/load) only; entitlement now controls just the result-count cap.
@@ -1701,8 +1701,18 @@ export async function recommendRecipes(
     assertNotAborted(deadline);
     let ideaPlan = null;
     if (ideationEnabled && typeof ideate === "function") {
+      const ideationLanguage =
+        (typeof language === "string" && language.trim()) ||
+        recipeContext?.language ||
+        "en";
       const ideaResult = await awaitAbortable(
-        () => Promise.resolve(ideate(inputs, { signal: deadline.signal })),
+        () =>
+          Promise.resolve(
+            ideate(
+              { ...inputs, language: ideationLanguage },
+              { signal: deadline.signal }
+            )
+          ),
         deadline
       ).catch((error) => {
         if (deadline.signal.aborted) throw error;

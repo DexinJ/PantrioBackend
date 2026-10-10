@@ -498,8 +498,8 @@ export const RECOMMEND_RECIPES_TOOL = {
         resultCount: {
           type: "integer",
           minimum: 1,
-          maximum: 6,
-          description: "Number of recipe suggestions (1-6; default 6).",
+          maximum: 4,
+          description: "Number of recipe suggestions (1-4; default 4).",
         },
       },
       additionalProperties: false,

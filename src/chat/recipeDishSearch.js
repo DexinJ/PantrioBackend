@@ -60,8 +60,8 @@ import {
 // Limits
 // ---------------------------------------------------------------------------
 
-export const MAX_DISH_RESULT_COUNT = 6;
-export const DEFAULT_DISH_RESULT_COUNT = 6;
+export const MAX_DISH_RESULT_COUNT = 4;
+export const DEFAULT_DISH_RESULT_COUNT = 4;
 
 export const DEFAULT_DISH_LIMITS = Object.freeze({
   maxSearchQueries: 8,
