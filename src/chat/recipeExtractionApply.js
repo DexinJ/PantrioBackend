@@ -65,7 +65,6 @@ export function applyClientExtractions({
   extractions = [],
   dishQuery = "",
   preferences = {},
-  requiredIngredients = [],
 } = {}) {
   const warnings = [];
   const current = (Array.isArray(recipes) ? recipes : []).slice(
@@ -79,22 +78,11 @@ export function applyClientExtractions({
   if (incoming.length === 0) return { recipes: current, warnings };
 
   const terms = preferenceTerms(preferences);
-  // User-explicit required ingredients (typed must-use, or a single
-  // UI-selected fridge item) are a hard gate here too: a client extraction must
-  // not slip in a dish that omits what the user asked to use.
-  const requiredTerms = (Array.isArray(requiredIngredients)
-    ? requiredIngredients
-    : []
-  )
-    .map((entry) => cleanText(String(entry ?? ""), 80))
-    .filter(Boolean)
-    .slice(0, 20);
   const termSet = [
     ...new Set([
       ...terms.allergens,
       ...terms.excludedIngredients,
       ...terms.dislikedIngredients,
-      ...requiredTerms,
     ]),
   ];
   const rules = createConstraintRules(terms);
@@ -102,18 +90,10 @@ export function applyClientExtractions({
     buildIngredientVariants(termSet),
     buildIngredientExclusions(termSet)
   );
-  const satisfiesRequired = (recipe) =>
-    requiredTerms.length === 0 ||
-    requiredTerms.every((term) =>
-      (Array.isArray(recipe?.ingredients) ? recipe.ingredients : []).some(
-        (line) => matcher(term, line)
-      )
-    );
 
   const accepted = [];
   let refused = 0;
   let filtered = 0;
-  let missingRequired = 0;
   for (const entry of incoming) {
     const pageUrl = cleanText(entry?.pageUrl, 500);
     const recipe = normalizeExtractedRecipe(entry?.parsed, pageUrl);
@@ -123,10 +103,6 @@ export function applyClientExtractions({
     }
     if (findConstraintConflict(recipe, rules, matcher)) {
       filtered += 1;
-      continue;
-    }
-    if (!satisfiesRequired(recipe)) {
-      missingRequired += 1;
       continue;
     }
     accepted.push(recipe);
@@ -168,16 +144,6 @@ export function applyClientExtractions({
       warning(
         "EXTRACTION_FILTERED",
         `${filtered} extracted recipe${filtered === 1 ? "" : "s"} were filtered by the user's saved constraints.`
-      )
-    );
-  }
-  if (missingRequired > 0) {
-    warnings.push(
-      warning(
-        "NO_TARGET_INGREDIENT",
-        `${missingRequired} extracted recipe${
-          missingRequired === 1 ? "" : "s"
-        } were ignored because they do not contain ${requiredTerms.join(", ")}.`
       )
     );
   }

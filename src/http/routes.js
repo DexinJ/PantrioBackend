@@ -816,21 +816,14 @@ export function attachRoutes(app) {
       // This inline route lives in attachRoutes, outside the scope of
       // createRecipeRecommendationHandler's sanitizeRecipeContextFn parameter,
       // so it must call the imported function directly.
-      const safeContext = sanitizeRecipeContext({
+      const preferences = sanitizeRecipeContext({
         preferences: body.recipeContext?.preferences,
-        selectedIngredients: body.recipeContext?.selectedIngredients,
-      });
+      }).preferences;
       const result = applyClientExtractions({
         recipes,
         extractions,
         dishQuery: typeof body.dishQuery === "string" ? body.dishQuery : "",
-        preferences: safeContext.preferences,
-        // A single UI-selected fridge item is a hard requirement here too, so a
-        // client extraction cannot slip in a dish that omits it.
-        requiredIngredients:
-          safeContext.selectedIngredients.length === 1
-            ? safeContext.selectedIngredients
-            : [],
+        preferences,
       });
       return res.json(result);
     }

@@ -1849,7 +1849,6 @@ export async function searchRecipesByDish(
     dishQuery,
     language = "en",
     inventory = [],
-    requiredIngredients = [],
     resultCount = DEFAULT_DISH_RESULT_COUNT,
     maxResultCount = MAX_DISH_RESULT_COUNT,
     allergens = [],
@@ -1993,22 +1992,11 @@ export async function searchRecipesByDish(
     // 0. Language services start first and run while the search is in flight.
     //    Every translation-shaped decision is delegated: the built-in
     //    vocabulary is only a free fast path, never the ceiling.
-    // User-explicit required ingredients (typed must-use, or a single
-    // UI-selected fridge item) resolve through the same variant table so the
-    // matcher recognises the same ingredient however a publisher writes it.
-    const requiredTerms = (Array.isArray(requiredIngredients)
-      ? requiredIngredients
-      : []
-    )
-      .map((entry) => String(entry ?? "").trim())
-      .filter(Boolean)
-      .slice(0, 20);
     const termSet = [
       ...new Set([
         ...(Array.isArray(inventory) ? inventory.filter(Boolean) : []),
         ...(Array.isArray(dislikedIngredients) ? dislikedIngredients : []),
         ...constraints.flatMap((rule) => rule.terms),
-        ...requiredTerms,
       ]),
     ].map((entry) => String(entry).trim()).filter(Boolean);
 
@@ -2203,20 +2191,6 @@ export async function searchRecipesByDish(
       0
     );
 
-    // Hard gate: a dish that does not contain every user-required ingredient is
-    // dropped, exactly like the inventory engine's required-ingredient filter.
-    // An empty answer is preferred over one that ignores the ingredient the
-    // user asked to use.
-    const satisfiedRequired = (recipe) => {
-      if (requiredTerms.length === 0) return true;
-      const ingredients = Array.isArray(recipe?.ingredients)
-        ? recipe.ingredients
-        : [];
-      return requiredTerms.every((term) =>
-        ingredients.some((line) => matchesIngredient(term, line))
-      );
-    };
-
     // 4. Fetch pages in waves and stop early once the pool is deep enough. An
     //    easy dish costs one wave; a rare one may spend the whole page budget.
     const parsed = [];
@@ -2311,8 +2285,7 @@ export async function searchRecipesByDish(
 
       const safeWave = parsed.filter(
         (recipe) =>
-          !findConstraintConflict(recipe, constraints, matchesIngredient) &&
-          satisfiedRequired(recipe)
+          !findConstraintConflict(recipe, constraints, matchesIngredient)
       );
       const acceptedSoFar = filterByDish(safeWave, dish, {
         minimum: minimumVerdict,
@@ -2340,14 +2313,10 @@ export async function searchRecipesByDish(
     }
 
     // 5. Safety constraints, then the dish identity gate.
-    const constraintSafe = parsed.filter(
+    const safe = parsed.filter(
       (recipe) =>
         !findConstraintConflict(recipe, constraints, matchesIngredient)
     );
-    // Required ingredients drop a dish outright, before the dish gate, so near
-    // matches can never pad the answer with a dish that omits them either.
-    const safe = constraintSafe.filter(satisfiedRequired);
-    const candidatesMissingRequired = constraintSafe.length - safe.length;
     const gated = filterByDish(safe, dish, {
       minimum: minimumVerdict,
       aliases: aliasesUsed,
@@ -2649,26 +2618,10 @@ export async function searchRecipesByDish(
     }
 
     if (selected.length === 0) {
-      if (
-        requiredTerms.length > 0 &&
-        safe.length === 0 &&
-        constraintSafe.length > 0
-      ) {
-        // The dish was found but every candidate omitted a required
-        // ingredient: say so plainly instead of returning a dish that ignores
-        // what the user asked to use.
-        pushWarning(
-          "NO_TARGET_INGREDIENT",
-          `No recipes containing ${requiredTerms.join(", ")} were found.`
-        );
-      } else {
-        pushWarning(
-          "NO_MATCHING_DISH",
-          parsed.length === 0
-            ? messages.noStructured(dish)
-            : messages.noDish(dish)
-        );
-      }
+      pushWarning(
+        "NO_MATCHING_DISH",
+        parsed.length === 0 ? messages.noStructured(dish) : messages.noDish(dish)
+      );
     }
 
     // One line that answers "where did the turn go": phase durations, the
@@ -2694,7 +2647,6 @@ export async function searchRecipesByDish(
       gate: gateCounts,
       nearMatches: nearMatches.length,
       aliases: { source: aliasExpansion, names: aliasesUsed },
-      candidatesMissingRequired,
       hostFilter: {
         resultsSkipped: skippedHostResults,
         hostsSkipped: [...skippedHosts],
@@ -2757,10 +2709,6 @@ export async function searchRecipesByDish(
           derivativeExclusions: exclusionCount,
           serviceExpanded: Object.keys(variantTable).length > 0,
         },
-        requiredIngredients: {
-          terms: requiredTerms,
-          candidatesMissingRequired,
-        },
         translation: {
           enabled: Boolean(translationEnabled),
           requested: translation.requested,
@@ -2806,22 +2754,6 @@ export async function searchRecipesWithDish(
     return recommendRecipes(overrides, recipeContext, deps);
   }
   const saved = recipeContext?.preferences?.explicit || {};
-  // Mirrors the inventory engine's rule (effectiveRequiredIngredients): typed
-  // must-use ingredients are always required, and a single UI-selected fridge
-  // item is required too. Multi-item selections stay a soft "as many as
-  // practical" preference.
-  const mustUseIngredients = Array.isArray(overrides?.mustUseIngredients)
-    ? overrides.mustUseIngredients.filter(Boolean)
-    : [];
-  const selectedIngredients = Array.isArray(recipeContext?.selectedIngredients)
-    ? recipeContext.selectedIngredients.filter(Boolean)
-    : [];
-  const requiredIngredients =
-    mustUseIngredients.length > 0
-      ? mustUseIngredients
-      : selectedIngredients.length === 1
-        ? selectedIngredients
-        : [];
   return searchRecipesByDish(
     {
       dishQuery,
@@ -2832,7 +2764,6 @@ export async function searchRecipesWithDish(
       inventory: (recipeContext?.inventory || []).map((item) =>
         typeof item === "string" ? item : item?.name
       ).filter(Boolean),
-      requiredIngredients,
       resultCount: overrides?.resultCount,
       // Current-turn constraints from the model win over saved defaults, the
       // same precedence the inventory engine uses.
