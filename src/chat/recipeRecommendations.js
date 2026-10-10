@@ -1577,6 +1577,32 @@ function applyIdeaVerification(recipes, ideaPlan, inputs) {
   return { pool: recipes, verified: verified.length, fallback: true };
 }
 
+/**
+ * A relaxed substitution is only legitimate when an idea's canonical core
+ * ingredients both cover the required ingredient (the user term the token
+ * matcher could not match against any real ingredient list, e.g. a Chinese
+ * item name the English vocabulary does not know) and are backed by real
+ * recipes. Without that bridge the ingredient is simply absent, and the honest
+ * answer is an empty list plus a NO_TARGET_INGREDIENT warning -- never a dish
+ * that ignores the ingredient the user asked to use.
+ */
+function ideaBridgesRequiredIngredient(ideaPlan, pool, required) {
+  if (!Array.isArray(ideaPlan) || ideaPlan.length === 0) return false;
+  if (!Array.isArray(required) || required.length === 0) return false;
+  const candidates = Array.isArray(pool) ? pool : [];
+  const coversRequired = (idea) =>
+    required.every((term) =>
+      (idea?.coreIngredients || []).some(
+        (core) =>
+          ingredientMatchesTerm(stripTermStopWords(term), core) ||
+          ingredientMatchesTerm(stripTermStopWords(core), term)
+      )
+    );
+  const backedByRecipe = (idea) =>
+    candidates.some((recipe) => ideaQualifies(ideaCoreOverlap(recipe, idea)));
+  return ideaPlan.some((idea) => coversRequired(idea) && backedByRecipe(idea));
+}
+
 function selectDiverse(candidates, count) {
   const remaining = [...candidates];
   const selected = [];
@@ -1890,13 +1916,20 @@ export async function recommendRecipes(
       ideaPlan.length > 0 &&
       requestedGate.required.length > 0 &&
       requestedGate.pool.length === 0 &&
-      requestedGate.missingTotal > 0
-    ) {
+      requestedGate.missingTotal > 0 &&
       // The requested ingredient could not be matched against any real
-      // ingredient list (for example a Chinese dish name the English token
-      // pipeline cannot compare). When a generated idea's canonical core
-      // ingredients DO match real recipes, those recipes satisfy the user's
-      // intent and keep the request from returning empty.
+      // ingredient list (for example a Chinese item name the English token
+      // pipeline cannot compare). Only substitute when a generated idea's
+      // canonical core ingredients actually cover that term AND are backed by
+      // real recipes, so the user's intent is preserved. Otherwise the
+      // ingredient is genuinely absent and an empty result is the correct,
+      // honest answer instead of a dish that omits it.
+      ideaBridgesRequiredIngredient(
+        ideaPlan,
+        preGatePool,
+        requestedGate.required
+      )
+    ) {
       const relaxed = applyIdeaVerification(preGatePool, ideaPlan, inputs);
       if (relaxed.pool.length > 0) {
         pool = relaxed.pool;
