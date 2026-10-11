@@ -298,6 +298,29 @@ function normalizeText(value) {
     .trim();
 }
 
+/**
+ * Dedupe/matching key that keeps every letter and digit, including CJK.
+ *
+ * `normalizeText` above is Latin-only on purpose: it feeds token scoring, where
+ * an ASCII token stream is what the ranking expects. Using it as an *identity*
+ * key silently reduced every Chinese term to "", so distinct items compared
+ * equal (青椒 === 猪肉) and `normalizedStringList` collapsed a whole Chinese
+ * fridge to its first entry.
+ *
+ * Latin text still folds case, accents and diacritics, so "Café" and "cafe"
+ * stay one term; CJK and other scripts survive intact.
+ */
+function normalizeKey(value) {
+  return clip(String(value || ""), 400)
+    .normalize("NFKD")
+    .replace(/[\u0300-\u036f]/g, "")
+    .toLowerCase()
+    .replace(/&/g, " and ")
+    .replace(/[^\p{L}\p{N}]+/gu, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
 function singularizeToken(token) {
   if (token.length > 4 && token.endsWith("ies")) return `${token.slice(0, -3)}y`;
   if (token.length > 4 && token.endsWith("oes")) return token.slice(0, -2);
@@ -336,7 +359,9 @@ function normalizedStringList(value, { maxItems = 20, maxLength = 60 } = {}) {
   for (const entry of value) {
     const text = clip(typeof entry === "string" ? entry : entry?.name, maxLength);
     if (!text) continue;
-    if (!output.some((existing) => normalizeText(existing) === normalizeText(text))) {
+    // Identity, not scoring: a Chinese item must not compare equal to every
+    // other Chinese item just because normalizeText strips it to "".
+    if (!output.some((existing) => normalizeKey(existing) === normalizeKey(text))) {
       output.push(text);
     }
     if (output.length >= maxItems) break;
@@ -751,13 +776,17 @@ async function searchForPages(
   {
     exclude = new Set(),
     deniedHosts = DEFAULT_DENIED_HOST_PATTERNS,
-    locale = null,
+    language = "en",
   } = {}
 ) {
   const unique = new Map();
   let failedSearches = 0;
   for (const query of queries) {
     assertNotAborted(deadline);
+    // Locale follows the query, not the plan. A plan can mix an English idea
+    // query with a native Chinese fallback, and one locale for the whole wave
+    // sent 青椒 怎么做 with hl=en.
+    const locale = serperLocaleFor(detectTermLanguage(query, language));
     try {
       const response = await awaitAbortable(
         () =>
@@ -1375,6 +1404,15 @@ function buildQueryPlan(inputs, maxQueries, { language = "en" } = {}) {
     ? detectTermLanguage(term, language)
     : normalizeRecipeLanguage(language);
   const plan = term ? buildIngredientQueries(term, resolved) : [];
+  // A required ingredient has to appear in the recipe, so a generic query can
+  // never satisfy it: it only spends the deadline budget the ingredient's own
+  // variants need. Widen along the required term alone.
+  const hasRequiredIngredient =
+    inputs.mustUseIngredients.length > 0 ||
+    inputs.selectedIngredients.length === 1;
+  if (hasRequiredIngredient && plan.length > 0) {
+    return plan.slice(0, maxQueries);
+  }
   for (const query of GENERIC_QUERIES[resolved] ?? GENERIC_QUERIES.en) {
     if (plan.length >= maxQueries) break;
     if (!plan.includes(query)) plan.push(query);
@@ -1394,7 +1432,9 @@ function normalizeIdeaPlan(ideas) {
     const dish = clip(entry.dish, 100);
     const query = clip(entry.query, 200);
     if (!dish || !query) continue;
-    const key = normalizeText(query);
+    // normalizeKey keeps CJK, so a Chinese idea survives; with normalizeText
+    // every Chinese query was "" and the whole idea plan was discarded.
+    const key = normalizeKey(query);
     if (!key || seenQueries.has(key)) continue;
     seenQueries.add(key);
     const coreIngredients = normalizedStringList(entry.coreIngredients, {
@@ -1712,11 +1752,6 @@ export async function recommendRecipes(
     const queryPlan = ideaPlan
       ? buildIdeaQueryPlan(ideaPlan, legacyPlan, limits.maxSearchQueries)
       : legacyPlan;
-    // The first query decides the locale, so an ideation plan in the user's
-    // language and a native ingredient fallback both search in their own.
-    const searchLocale = serperLocaleFor(
-      detectTermLanguage(queryPlan[0] || "", appLanguage)
-    );
     const seenUrls = new Set();
     const aggregate = {
       pages: [],
@@ -1740,7 +1775,7 @@ export async function recommendRecipes(
           limits,
           deadline,
           warnings,
-          { exclude: seenUrls, deniedHosts, locale: searchLocale }
+          { exclude: seenUrls, deniedHosts, language: appLanguage }
         );
         if (wavePages.length === 0) break;
         for (const page of wavePages) {

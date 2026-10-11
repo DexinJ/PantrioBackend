@@ -9,7 +9,7 @@ import {
 } from "./toolNames.js";
 import { STABLE_TOOL_ARRAY_ENABLED } from "../config/policy.js";
 
-const RECIPE_INTENT = "recipe_recommendation";
+export const RECIPE_INTENT = "recipe_recommendation";
 const MAX_INVENTORY_ITEMS = 100;
 const MAX_SELECTED_INGREDIENTS = 30;
 

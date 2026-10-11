@@ -610,6 +610,29 @@ export function stripDishModifiers(value) {
   return text.replace(/\s+/g, " ").trim();
 }
 
+// Ask-style phrasings leak into dishQuery ("How to cook corn?"). They describe
+// the request, not the dish, so the scaffolding is removed before the name is
+// tokenized and templated — otherwise the templates stack onto the question
+// and produce queries like "how to make how to cook corn".
+const DISH_QUESTION_PREFIX =
+  /^(?:how\s+to\s+(?:cook|make|prepare|bake|fry|roast)\b|how\s+(?:do|can|should)\s+(?:i|we)\s+(?:cook|make)\b|what\s+(?:can|should)\s+(?:i|we)\s+(?:cook|make)\b|what(?:'s| is)\s+(?:a\s+)?(?:good\s+)?(?:recipe|dish|meal)\b(?:\s+for)?|recipe\s+for)\s*/i;
+
+/**
+ * Reduce an ask-style dish query to the dish itself. A bare interrogative
+ * leaves nothing, so the punctuation-trimmed original is returned and the
+ * caller can still reject it as an unusable dish.
+ */
+export function stripDishQuestion(value) {
+  const raw = String(value ?? "").replace(/\s+/g, " ").trim();
+  if (!raw) return "";
+  const withoutPunctuation = raw.replace(/[?？]+\s*$/u, "").trim();
+  const stripped = withoutPunctuation
+    .replace(DISH_QUESTION_PREFIX, "")
+    .replace(/\s+/g, " ")
+    .trim();
+  return stripped || withoutPunctuation;
+}
+
 function significantDishTokens(dishQuery) {
   return dishTokens(stripDishModifiers(dishQuery));
 }
@@ -1948,7 +1971,9 @@ export async function searchRecipesByDish(
     throw new TypeError("search and fetchPage must be functions");
   }
 
-  const dish = String(dishQuery ?? "").replace(/\s+/g, " ").trim().slice(0, 200);
+  // "How to cook corn?" is a request, not a dish; reduce it before it is
+  // tokenized, gated, and templated into queries.
+  const dish = stripDishQuestion(dishQuery).slice(0, 200);
   const normalizedLanguage = normalizeRecipeLanguage(language);
   const locale = serperLocaleFor(normalizedLanguage);
   const limits = {

@@ -11,6 +11,8 @@ import {
   MAX_PENDING_CHAT_STARTS,
   MAX_PENDING_CHAT_STARTS_PER_CONNECTION,
   MAX_TOOL_ROUNDS,
+  RECIPE_CONTEXT_COMPACT,
+  RECIPE_DROP_FRIDGE_ROUND,
   RESPONSES_REASONING_OUTPUT_ALLOWANCE,
   START_LIMIT_AUTHED,
   resolveReasoningPolicy,
@@ -61,6 +63,7 @@ import { resolveChatModel } from "../chat/modelPolicy.js";
 import {
   lockedRoundToolPolicy,
   normalizeRecipeUiAction,
+  RECIPE_INTENT,
   RECIPE_UI_ACTIONS,
   resolveRequestRoutingWithReason,
   resolveRoundToolPolicy,
@@ -68,13 +71,20 @@ import {
 } from "../chat/recipeRequest.js";
 import { runToolCalls } from "../chat/toolRunner.js"; // ✅ HYBRID: enable server-side tools
 import { filterToolsForClientCapabilities } from "../chat/clientCapabilities.js";
-import { trimWorkingMessagesToFit } from "../chat/messageTrimmer.js";
+import {
+  dropToolRoundSegments,
+  trimWorkingMessagesToFit,
+} from "../chat/messageTrimmer.js";
 import { buildSystemMessage } from "../chat/systemPrompt.js";
 import {
   FREE_MAX_RESULT_COUNT,
   SUBSCRIBER_MAX_RESULT_COUNT,
 } from "../chat/recipeRecommendations.js";
 import { compactRecipeResultsForChat } from "../chat/recipeCompact.js";
+import {
+  compactContextToolContent,
+  isRecipeReadToolName,
+} from "../chat/contextToolCompact.js";
 import {
   logAiChatStart,
   logAiErrorFrame,
@@ -280,6 +290,74 @@ function makeAssistantToolCallMsg(toolCalls) {
     tool_calls: Array.isArray(toolCalls) ? toolCalls : [],
     content: null,
   };
+}
+
+/**
+ * Shrink the fridge read that opens a recipe-mode turn before it becomes part
+ * of the transcript. Both tool owners funnel through here: server-owned results
+ * are collected with the call id the model already saw, and client-owned
+ * results are matched back to their call by the same id.
+ *
+ * Everything else is returned untouched. The same tool in chat mode keeps the
+ * full item shape, because those turns resolve items by id and reason about
+ * expiry.
+ */
+function compactRecipeRoundToolMsgs(state, toolMsgs) {
+  const msgs = Array.isArray(toolMsgs) ? toolMsgs : [];
+  if (state?.recipeReadRound !== true) return msgs;
+  const calls = Array.isArray(state?.toolCalls) ? state.toolCalls : [];
+  return msgs.map((toolMsg) => {
+    const call = calls.find((entry) => entry?.id === toolMsg?.tool_call_id);
+    const content = compactContextToolContent(
+      call?.function?.name,
+      toolMsg?.content
+    );
+    return content === toolMsg?.content ? toolMsg : { ...toolMsg, content };
+  });
+}
+
+/**
+ * Retire the fridge read once the recommendation that consumed it has run.
+ *
+ * The gateway promotes a turn into recipe mode and locks its tools the moment a
+ * recommendation call is allowed, so from then on the inventory cannot be read
+ * again: keeping it only makes the final round re-send it. The whole segment
+ * goes, which also keeps the transcript valid for both transports.
+ */
+function dropSpentRecipeFridgeRound(state) {
+  if (RECIPE_DROP_FRIDGE_ROUND !== true) return;
+  if (state?.recipeRecommendationRan !== true) return;
+
+  const before = state.workingMessages;
+  const dropped = dropToolRoundSegments(before, (call) =>
+    isRecipeReadToolName(call?.function?.name)
+  );
+  if (dropped === before) return;
+  // One line stands in for the retired read. Without it the model can no longer
+  // tell that the fridge was already read this turn, and the system prompt
+  // tells it to read the fridge before recommending — which would buy back the
+  // tokens this drop saves on the next round.
+  state.workingMessages = [
+    ...dropped,
+    {
+      role: "system",
+      content:
+        "The fridge was already read for this turn; do not call getFridgeContents again.",
+    },
+  ];
+
+  // The Responses transport replays a round's raw output items by call id.
+  // Dropping the messages above retires those ids, so their entries go too
+  // rather than lingering as state nothing can reach.
+  const liveCallIds = new Set();
+  for (const message of state.workingMessages) {
+    for (const call of message?.tool_calls || []) {
+      if (call?.id) liveCallIds.add(call.id);
+    }
+  }
+  state.roundOutputs = (state.roundOutputs || []).filter((round) =>
+    (round.callIds || []).some((id) => liveCallIds.has(id))
+  );
 }
 
 // ✅ HYBRID: server-only tools (secrets / internet)
@@ -567,13 +645,19 @@ export function attachChatGateway(
         state.toolResultsTimeout = null;
       }
 
-      // Append assistant tool_calls + all tool outputs
+      // Append assistant tool_calls + all tool outputs. The recipe-mode fridge
+      // read is shrunk on the way in (see compactRecipeRoundToolMsgs).
       const assistantToolCallMsg = makeAssistantToolCallMsg(state.toolCalls);
       state.workingMessages = [
         ...state.workingMessages,
         assistantToolCallMsg,
-        ...(state.collectedToolMsgs || []),
+        ...compactRecipeRoundToolMsgs(state, state.collectedToolMsgs || []),
       ];
+
+      // ... and retired once the round that consumed it has run. The flag it
+      // reads is set when a recommendation call is dispatched, so this has to
+      // happen before the tool state below is cleared.
+      dropSpentRecipeFridgeRound(state);
 
       // clear tool state
       state.awaitingTools = false;
@@ -620,6 +704,14 @@ export function attachChatGateway(
           state.clientCapabilities
         ),
       };
+      // The forced fridge read that opens a recipe-mode turn is round 0.
+      // Captured here because `round` has already advanced by the time the
+      // client returns tool results, and this flag is what lets the tool-result
+      // path shrink that read without touching any other reader of the fridge.
+      state.recipeReadRound =
+        RECIPE_CONTEXT_COMPACT === true &&
+        state.intent === RECIPE_INTENT &&
+        (state.round || 0) === 0;
       const toolDefinitionMessages = toolPolicy.tools.length
         ? [{ role: "system", content: { tools: toolPolicy.tools } }]
         : [];
@@ -1076,6 +1168,9 @@ export function attachChatGateway(
         // A recommendation result must be formatted next, never followed by a
         // second search.
         state.intent = "recipe_recommendation";
+        // Recorded so the tool-result path knows the fridge read is now spent
+        // (see dropSpentRecipeFridgeRound).
+        state.recipeRecommendationRan = true;
       }
       state.collectedToolMsgs = [];
       state.clientToolCallIds = new Set();
@@ -1731,6 +1826,8 @@ export function attachChatGateway(
           totalTokens: 0,
         },
         toolsLockedAfterIsolatedAction: false,
+        recipeReadRound: false,
+        recipeRecommendationRan: false,
 
         awaitingTools: false,
         acceptingClientToolResults: false,

@@ -238,6 +238,25 @@ export const ALLOWED_MODELS_AUTHED = new Set(CHAT_MODELS_ALLOWED);
     String(process.env.STABLE_TOOL_ARRAY || "").trim()
   );
 
+  // Recipe mode's forced fridge read is reduced to item names before it enters
+  // the transcript. That round cannot use the full item shape (recommendRecipes
+  // resolves its own inventory from the client's recipeContext, and the round
+  // allowlist blocks every other tool), while the same tool in chat mode still
+  // needs every field to resolve items by id and reason about expiry. Flip to
+  // false to restore the full payload without a redeploy.
+  export const RECIPE_CONTEXT_COMPACT = !/^(0|false|no)$/i.test(
+    String(process.env.RECIPE_CONTEXT_COMPACT || "").trim()
+  );
+
+  // Once the recipe round has run, the fridge read it was built from is spent:
+  // recipe mode offers no further tools and the system prompt forbids calling
+  // one after recommendRecipes, so the final round would only re-send the
+  // inventory to look at it. Flip to false to keep that round in the transcript
+  // without a redeploy.
+  export const RECIPE_DROP_FRIDGE_ROUND = !/^(0|false|no)$/i.test(
+    String(process.env.RECIPE_DROP_FRIDGE_ROUND || "").trim()
+  );
+
   export function supportsExplicitCacheBreakpoints(model) {
     return (
       EXPLICIT_PROMPT_CACHE_ENABLED === true &&

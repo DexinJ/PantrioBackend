@@ -39,7 +39,7 @@ import { METHOD_SUMMARY_SYSTEM_PROMPT } from "./recipeMethodSummary.js";
 // 3: the method moved from verbatim publisher steps to an authored,
 //    overlap-checked summary. A client built for v2 must not be handed v3
 //    tasks, so the version gate below invalidates its cached manifest.
-export const HELPER_TASK_VERSION = 3;
+export const HELPER_TASK_VERSION = 4;
 
 export const HELPER_TASK_KINDS = Object.freeze([
   "dishAliases",

@@ -47,6 +47,37 @@ export function findToolRoundSegments(messages) {
 }
 
 /**
+ * Remove every complete tool-round segment whose calls all satisfy
+ * `shouldDropCall`.
+ *
+ * A segment is removed whole — the assistant message carrying the calls and
+ * every tool message answering them — because both transports reject a
+ * dangling function_call_output. Segments with any call the predicate refuses
+ * are left alone, so a round that mixed a retired read with a live action
+ * survives intact.
+ *
+ * Returns the input array unchanged when nothing matches; otherwise returns a
+ * new array. The input is never mutated.
+ */
+export function dropToolRoundSegments(messages, shouldDropCall) {
+  if (!Array.isArray(messages) || messages.length === 0) return messages;
+  if (typeof shouldDropCall !== "function") return messages;
+
+  const doomed = new Set();
+  for (const segment of findToolRoundSegments(messages)) {
+    const calls = messages[segment.start]?.tool_calls;
+    if (!Array.isArray(calls) || calls.length === 0) continue;
+    if (!calls.every((call) => shouldDropCall(call))) continue;
+    for (let index = segment.start; index <= segment.end; index += 1) {
+      doomed.add(index);
+    }
+  }
+
+  if (doomed.size === 0) return messages;
+  return messages.filter((_message, index) => !doomed.has(index));
+}
+
+/**
  * Drop the oldest complete tool-round segments until the estimated prompt
  * tokens fit under maxTokens. Extra messages (for example the serialized tool
  * definitions) are included in the estimate but are never trimmed.
