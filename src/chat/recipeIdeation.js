@@ -192,7 +192,12 @@ export async function generateRecipeIdeas(inputs, { signal } = {}) {
       signal: linked.signal,
     });
     if (!response.ok) {
-      return { ok: false, ideas: [], error: `Ideation request failed (${response.status}).` };
+      return {
+        ok: false,
+        ideas: [],
+        error: `Ideation request failed (${response.status}).`,
+        model: RECIPE_IDEATION_MODEL,
+      };
     }
     const data = await response.json().catch(() => null);
     const content =
@@ -202,8 +207,13 @@ export async function generateRecipeIdeas(inputs, { signal } = {}) {
     const parsed = safeJsonParse(stripJsonFence(content));
     const ideas = normalizeIdeas(parsed.ok ? parsed.value : null);
     return ideas.length > 0
-      ? { ok: true, ideas }
-      : { ok: false, ideas: [], error: "Ideation returned no usable ideas." };
+      ? { ok: true, ideas, model: RECIPE_IDEATION_MODEL }
+      : {
+          ok: false,
+          ideas: [],
+          error: "Ideation returned no usable ideas.",
+          model: RECIPE_IDEATION_MODEL,
+        };
   } catch (error) {
     return {
       ok: false,
@@ -212,6 +222,7 @@ export async function generateRecipeIdeas(inputs, { signal } = {}) {
         linked.timedOut || linked.signal.aborted
           ? "Recipe ideation timed out."
           : "Recipe ideation is temporarily unavailable.",
+      model: RECIPE_IDEATION_MODEL,
     };
   } finally {
     linked.cleanup();

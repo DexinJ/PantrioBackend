@@ -2,14 +2,19 @@ import { fetchPublicTextPage } from "./safeWebFetch.js";
 import { parseRecipeJsonLd } from "./recipeJsonLd.js";
 import {
   DEFAULT_DENIED_HOST_PATTERNS,
+  buildIngredientQueries,
   countTranslatableStrings,
+  detectTermLanguage,
   ingredientMatchesTerm,
   isDeniedHost,
+  normalizeRecipeLanguage,
   recipeTranslationEnabled,
+  serperLocaleFor,
   translateRecipes,
 } from "./recipeDishSearch.js";
 import { dedupeSimilarDishes } from "./recipeDedup.js";
 import { extractRecipesFromPage } from "./recipeTextExtract.js";
+import { noopRecipeTrace } from "./recipeTrace.js";
 import {
   MAX_METHOD_BULLETS,
   applyMethodSummaries,
@@ -36,6 +41,27 @@ const IDEA_MATCH_WEIGHT = 0.25;
 // Selection returns at most MAX_RESULT_COUNT, but search keeps going until
 // roughly this many required/viable recipes are available (or the budget ends).
 const CANDIDATE_POOL_TARGET = 10;
+// Language-native filler so a request with no ingredient still has queries to
+// widen with. Constraints never appear in a query; they are applied after the
+// search as filters and ranking penalties.
+const GENERIC_QUERIES = Object.freeze({
+  en: [
+    "quick easy meal ideas",
+    "easy dinner recipes",
+    "home cooking recipes",
+    "simple recipes",
+    "weeknight dinner recipes",
+    "best recipes",
+  ],
+  zh: [
+    "家常菜 做法",
+    "简单晚餐 做法",
+    "下饭菜 食谱",
+    "快手菜 做法",
+    "晚餐 食谱",
+    "简单家常菜 怎么做",
+  ],
+});
 // Search work is not charged against the user's token quota, so there is no
 // entitlement-specific search budget. These limits are server safety rails
 // (latency/load) only; entitlement now controls just the result-count cap.
@@ -597,73 +623,16 @@ function createConstraintRules(inputs, warnings) {
   return rules;
 }
 
-function buildSearchQueries(inputs, limits) {
-  const preferenceParts = [];
-  const cuisines = inputs.requestedCuisines.length
-    ? inputs.requestedCuisines
-    : inputs.savedCuisines;
-  if (cuisines.length) preferenceParts.push(cuisines.slice(0, 2).join(" or "));
-  if (inputs.energyPreference === "light") preferenceParts.push("light low calorie");
-  if (inputs.energyPreference === "hearty") preferenceParts.push("hearty filling");
-  if (inputs.energyPreference === "balanced") preferenceParts.push("balanced");
-  if (inputs.mealType) preferenceParts.push(inputs.mealType);
-  if (inputs.skillLevel === "beginner") preferenceParts.push("easy");
-  else if (inputs.skillLevel === "advanced") preferenceParts.push("advanced");
-  if (inputs.cookingMethod) {
-    preferenceParts.push(inputs.cookingMethod.replace(/_/g, " "));
+// The inventory search is anchored on ONE ingredient: the required/selected one
+// when the user named it, otherwise the first fridge item.
+function primaryIngredientTerm(inputs) {
+  for (const term of inputs.requestedIngredients) {
+    if (term) return term;
   }
-  if (inputs.maxIngredients != null) {
-    preferenceParts.push(`under ${inputs.maxIngredients} ingredients`);
+  for (const term of inputs.inventory) {
+    if (term) return term;
   }
-  if (inputs.maxCaloriesPerServing != null) {
-    preferenceParts.push(`under ${inputs.maxCaloriesPerServing} calories per serving`);
-  }
-  if (inputs.maxPrepMinutes != null) {
-    preferenceParts.push(`under ${inputs.maxPrepMinutes} minutes`);
-  }
-  if (inputs.servings != null) preferenceParts.push(`${inputs.servings} servings`);
-
-  const requestedIngredients = inputs.requestedIngredients.slice(0, 8);
-  const requestedKeys = new Set(requestedIngredients.map(normalizeText));
-  const inventory = inputs.inventory
-    .filter((item) => !requestedKeys.has(normalizeText(item)))
-    .slice(0, 8);
-  const primary = clip(
-    [
-      requestedIngredients.length
-        ? `using ${requestedIngredients.join(" ")}`
-        : "",
-      ...preferenceParts,
-      !requestedIngredients.length && inventory.length
-        ? `using ${inventory.slice(0, 5).join(" ")}`
-        : "",
-      "recipe nutrition ingredients",
-    ]
-      .filter(Boolean)
-      .join(" "),
-    300
-  );
-  const secondary = clip(
-    [
-      "recipe",
-      requestedIngredients.length
-        ? `featuring ${requestedIngredients.join(" ")}`
-        : "",
-      inventory.length
-        ? `with ${inventory.slice(0, 8).join(" ")}`
-        : "easy meal ideas",
-      cuisines.slice(0, 2).join(" "),
-      inputs.energyPreference !== "any" ? inputs.energyPreference : "",
-      "calories total time",
-    ]
-      .filter(Boolean)
-      .join(" "),
-    300
-  );
-  return [...new Set([primary, secondary].filter(Boolean))].slice(
-    0,
-    limits.maxSearchQueries
-  );
+  return "";
 }
 
 function createLinkedDeadline(parentSignal, timeoutMs) {
@@ -782,6 +751,7 @@ async function searchForPages(
   {
     exclude = new Set(),
     deniedHosts = DEFAULT_DENIED_HOST_PATTERNS,
+    locale = null,
   } = {}
 ) {
   const unique = new Map();
@@ -792,7 +762,12 @@ async function searchForPages(
       const response = await awaitAbortable(
         () =>
           search(
-            { query, k: limits.searchResultsPerQuery },
+            {
+              query,
+              k: limits.searchResultsPerQuery,
+              ...(locale?.hl ? { hl: locale.hl } : {}),
+              ...(locale?.gl ? { gl: locale.gl } : {}),
+            },
             { signal: deadline.signal }
           ),
         deadline
@@ -1388,37 +1363,22 @@ function primaryCuisine(recipe) {
   return normalizeText(recipe.cuisines[0] || "unknown");
 }
 
-function buildQueryPlan(inputs, maxQueries) {
-  const base = buildSearchQueries(inputs, {
-    maxSearchQueries: Math.min(2, maxQueries),
-  });
-  const plan = [...base];
-  const pushQuery = (parts) => {
-    const query = clip(parts.filter((part) => part).join(" "), 300);
-    if (!query || plan.includes(query)) return;
-    plan.push(query);
-  };
-  const cuisine = inputs.requestedCuisines[0] || inputs.savedCuisines[0] || "";
-  const meal = inputs.mealType || "";
-  const requestedFocus = inputs.requestedIngredients.slice(0, 2);
-
-  // Widening should chase what the user explicitly asked for first; fridge
-  // items only drive widening when no ingredient was requested.
-  if (requestedFocus.length > 0) {
-    for (const item of requestedFocus) {
-      pushQuery([item, meal ? `${meal} recipe ideas` : "recipe ideas"]);
-    }
+// The plan is language-native and constraint-free: the ingredient's own "how do
+// I cook this" query first, then more ways to ask about the same ingredient,
+// then generic queries in the same language to widen a thin result set. Meal
+// type, energy, skill, method, servings and the calorie/minute caps are applied
+// after the search as filters and ranking penalties instead of being stacked
+// into the query text.
+function buildQueryPlan(inputs, maxQueries, { language = "en" } = {}) {
+  const term = primaryIngredientTerm(inputs);
+  const resolved = term
+    ? detectTermLanguage(term, language)
+    : normalizeRecipeLanguage(language);
+  const plan = term ? buildIngredientQueries(term, resolved) : [];
+  for (const query of GENERIC_QUERIES[resolved] ?? GENERIC_QUERIES.en) {
+    if (plan.length >= maxQueries) break;
+    if (!plan.includes(query)) plan.push(query);
   }
-  if (meal || cuisine) pushQuery([meal, "recipes", cuisine]);
-  if (inputs.energyPreference !== "any") {
-    pushQuery([inputs.energyPreference, meal || "easy", "recipes"]);
-  }
-  if (requestedFocus.length === 0) {
-    for (const item of inputs.inventory.slice(0, 2)) {
-      pushQuery([item, meal ? `${meal} recipe ideas` : "recipe ideas"]);
-    }
-  }
-  pushQuery(meal ? [`best ${meal} recipes`] : ["quick easy meal ideas"]);
   return plan.slice(0, maxQueries);
 }
 
@@ -1661,6 +1621,8 @@ export async function recommendRecipes(
     estimationEnabled = false,
     ideate,
     ideationEnabled = false,
+    ideationSource = "server",
+    trace = noopRecipeTrace,
     maxResultCount = MAX_RESULT_COUNT,
     translate = translateRecipes,
     translationEnabled = recipeTranslationEnabled(),
@@ -1700,34 +1662,61 @@ export async function recommendRecipes(
   try {
     assertNotAborted(deadline);
     let ideaPlan = null;
-    if (ideationEnabled && typeof ideate === "function") {
-      const ideationLanguage =
-        (typeof language === "string" && language.trim()) ||
-        recipeContext?.language ||
-        "en";
-      const ideaResult = await awaitAbortable(
-        () =>
-          Promise.resolve(
-            ideate(
-              { ...inputs, language: ideationLanguage },
-              { signal: deadline.signal }
-            )
-          ),
-        deadline
-      ).catch((error) => {
+    const appLanguage =
+      (typeof language === "string" && language.trim()) ||
+      recipeContext?.language ||
+      "en";
+    const ideationActive = ideationEnabled && typeof ideate === "function";
+    const ideationStartedAt = Date.now();
+    let ideaResult = null;
+    if (ideationActive) {
+      try {
+        ideaResult = await awaitAbortable(
+          () =>
+            Promise.resolve(
+              ideate(
+                { ...inputs, language: appLanguage },
+                { signal: deadline.signal }
+              )
+            ),
+          deadline
+        );
+      } catch (error) {
         if (deadline.signal.aborted) throw error;
-        return null;
-      });
+        ideaResult = null;
+      }
       const normalized =
         ideaResult && Array.isArray(ideaResult.ideas)
           ? normalizeIdeaPlan(ideaResult.ideas)
           : [];
       if (normalized.length > 0) ideaPlan = normalized;
     }
-    const legacyPlan = buildQueryPlan(inputs, limits.maxSearchQueries);
+    trace("recipe_ideation", {
+      enabled: ideationActive,
+      source: ideationActive ? ideationSource : "disabled",
+      ok: Boolean(ideaResult?.ok),
+      rawIdeaCount: Array.isArray(ideaResult?.ideas) ? ideaResult.ideas.length : 0,
+      ideaCount: ideaPlan ? ideaPlan.length : 0,
+      fallbackUsed: !ideaPlan,
+      error: ideaResult?.error || null,
+      model: ideaResult?.model || null,
+      ms: Date.now() - ideationStartedAt,
+      language: appLanguage,
+      inventoryCount: inputs.inventory.length,
+      mustUseCount: inputs.mustUseIngredients.length,
+      mealType: inputs.mealType || null,
+    });
+    const legacyPlan = buildQueryPlan(inputs, limits.maxSearchQueries, {
+      language: appLanguage,
+    });
     const queryPlan = ideaPlan
       ? buildIdeaQueryPlan(ideaPlan, legacyPlan, limits.maxSearchQueries)
       : legacyPlan;
+    // The first query decides the locale, so an ideation plan in the user's
+    // language and a native ingredient fallback both search in their own.
+    const searchLocale = serperLocaleFor(
+      detectTermLanguage(queryPlan[0] || "", appLanguage)
+    );
     const seenUrls = new Set();
     const aggregate = {
       pages: [],
@@ -1751,7 +1740,7 @@ export async function recommendRecipes(
           limits,
           deadline,
           warnings,
-          { exclude: seenUrls, deniedHosts }
+          { exclude: seenUrls, deniedHosts, locale: searchLocale }
         );
         if (wavePages.length === 0) break;
         for (const page of wavePages) {

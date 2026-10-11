@@ -271,6 +271,18 @@ export function createRecommendRecipesTool({
   };
 }
 
+/**
+ * Serper accepts a BCP-47-ish host language (`hl`) and a short country code
+ * (`gl`). The recipe engines build these from their own locale table, but they
+ * still cross this transport, so they are bounded to a short token before they
+ * reach the wire.
+ */
+function clipLocale(value) {
+  const text = typeof value === "string" ? value.trim() : "";
+  if (!text || text.length > 12) return "";
+  return /^[a-z]{2}(-[a-z]{2,4})?$/i.test(text) ? text : "";
+}
+
 export const TOOLS = {
   /**
    * Web search via Serper.dev
@@ -286,9 +298,18 @@ export const TOOLS = {
       return { error: "Missing SERPER_API_KEY on server", query: q, results: [] };
     }
 
-    // The recipe engines hand this function {query, k, hl, gl}, but only
-    // {q, num} is put on the wire. Logging the body that is actually sent is
-    // what makes a missing locale observable instead of invisible.
+    // The recipe engines hand this function {query, k, hl, gl} so a non-English
+    // search keeps its host language and country. Forwarding them is what makes
+    // the dish engine's locale table actually reach Serper; dropping them here
+    // silently biased localized queries back to en/us.
+    const hl = clipLocale(args?.hl);
+    const gl = clipLocale(args?.gl);
+    const body = {
+      q,
+      num: k,
+      ...(hl ? { hl } : {}),
+      ...(gl ? { gl } : {}),
+    };
     const transport =
       typeof ctx?.trace === "function"
         ? ctx.trace
@@ -301,13 +322,10 @@ export const TOOLS = {
     transport("websearch_request", {
       query: q,
       k,
-      requestedHl: typeof args?.hl === "string" ? args.hl : null,
-      requestedGl: typeof args?.gl === "string" ? args.gl : null,
-      sentBody: { q, num: k },
-      dropped: [
-        ...(args?.hl ? ["hl"] : []),
-        ...(args?.gl ? ["gl"] : []),
-      ],
+      requestedHl: hl || null,
+      requestedGl: gl || null,
+      sentBody: body,
+      dropped: [],
     });
 
     let resp;
@@ -320,7 +338,7 @@ export const TOOLS = {
             "X-API-KEY": SERPER_API_KEY,
             "Content-Type": "application/json",
           },
-          body: JSON.stringify({ q, num: k }),
+          body: JSON.stringify(body),
         },
         { signal: ctx?.signal }
       );

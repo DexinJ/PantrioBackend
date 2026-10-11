@@ -823,6 +823,60 @@ export function buildDishQueries(
 }
 
 // ---------------------------------------------------------------------------
+// Ingredient queries (inventory engine)
+// ---------------------------------------------------------------------------
+
+// Templates are applied to the ingredient exactly as the user wrote it, so the
+// query stays in that ingredient's own language.
+const INGREDIENT_QUERY_TEMPLATES = Object.freeze({
+  en: [
+    (term) => `${term} recipe`,
+    (term) => `how to make ${term}`,
+    (term) => `${term} easy recipe`,
+  ],
+  zh: [
+    (term) => `${term} 怎么做`,
+    (term) => `${term} 做法`,
+    (term) => `${term} 食谱`,
+  ],
+});
+
+/**
+ * Best-effort language of a single term, from its script. A Latin ingredient in
+ * a Chinese app stays English so it is not searched with a Chinese template it
+ * cannot match.
+ */
+export function detectTermLanguage(term, fallback = "en") {
+  const text = String(term ?? "");
+  if (/[\u3040-\u30ff]/.test(text)) return "ja";
+  if (/[\uac00-\ud7af]/.test(text)) return "ko";
+  if (/[\u3400-\u4dbf\u4e00-\u9fff]/.test(text)) return "zh";
+  if (/[\u0400-\u04ff]/.test(text)) return "ru";
+  if (/[\u0600-\u06ff]/.test(text)) return "ar";
+  if (/[A-Za-z]/.test(text)) return "en";
+  return normalizeRecipeLanguage(fallback);
+}
+
+/**
+ * One ingredient → its native "how do I cook this" queries. The first entry is
+ * the primary query; the rest only widen a thin result set. Constraints (meal
+ * type, energy, skill, method, servings, caps) are never part of the query.
+ */
+export function buildIngredientQueries(term, language) {
+  const clean = String(term ?? "").replace(/\s+/g, " ").trim().slice(0, 120);
+  if (!clean) return [];
+  const resolved = detectTermLanguage(clean, language);
+  const templates =
+    INGREDIENT_QUERY_TEMPLATES[resolved] ?? INGREDIENT_QUERY_TEMPLATES.en;
+  const output = [];
+  for (const template of templates) {
+    const query = template(clean).replace(/\s+/g, " ").trim().slice(0, 300);
+    if (query && !output.includes(query)) output.push(query);
+  }
+  return output;
+}
+
+// ---------------------------------------------------------------------------
 // Constraints (safety parity with the existing engine)
 // ---------------------------------------------------------------------------
 

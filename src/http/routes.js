@@ -574,6 +574,7 @@ export function createRecipeRecommendationHandler({
         estimationEnabled: byo ? false : estimationEnabled,
         ideate: byo ? null : ideate,
         ideationEnabled: byo ? false : ideationEnabled,
+        ideationSource: byo ? "client_hints" : "server",
         translate: byo ? null : translateRecipes,
         translationEnabled: byo ? false : recipeTranslationEnabled(),
         summarize: byo ? null : summarizeRecipeMethods,
