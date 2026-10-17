@@ -201,6 +201,16 @@ async function purgeLocalAccountData(db, deletion, { nowFn }) {
       [uid]
     );
     await db.run(
+      `DELETE FROM usage_periods
+        WHERE owner_type = 'user' AND owner_key = ?`,
+      [uid]
+    );
+    await db.run(
+      `DELETE FROM usage_actions
+        WHERE owner_type = 'user' AND owner_key = ?`,
+      [uid]
+    );
+    await db.run(
       `DELETE FROM conversations
         WHERE owner_type = 'user' AND owner_key = ?`,
       [uid]

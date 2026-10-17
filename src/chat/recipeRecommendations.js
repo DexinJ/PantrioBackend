@@ -66,7 +66,9 @@ const GENERIC_QUERIES = Object.freeze({
 // entitlement-specific search budget. These limits are server safety rails
 // (latency/load) only; entitlement now controls just the result-count cap.
 const SAFETY_LIMITS = Object.freeze({
-  maxSearchQueries: 8,
+  // Four queries is the measure of a broad recipe turn. The idea plan fills
+  // them first, so this is a recall/cost trade rather than a timeout change.
+  maxSearchQueries: 4,
   searchResultsPerQuery: 12,
   maxPages: 32,
   fetchConcurrency: 8,

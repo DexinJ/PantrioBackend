@@ -203,21 +203,27 @@ Products and server-side capabilities are controlled by validated
     "name": "Pantrio Starter",
     "productIds": ["com.chilltech.pantrio.starter.monthly"],
     "dailyTokenLimit": 50000,
-    "defaultModel": "gpt-5.6-luna",
-    "allowedModels": ["gpt-5.6-luna"],
+    "monthlyTokenLimit": 1000000,
+    "recipesPerDay": 3,
+    "recipesPerMonth": null,
+    "defaultModel": "gpt-6-luna",
+    "allowedModels": ["gpt-6-luna"],
     "maxCompletionTokens": 1000,
     "maxPromptTokens": 25000
   },
   {
     "id": "pro",
-    "name": "Pantrio Pro",
+    "name": "Pantrio Plus",
     "productIds": [
       "com.chilltech.pantrio.subscription.monthly",
       "com.chilltech.pantrio.subscription.yearly"
     ],
-    "dailyTokenLimit": null,
-    "defaultModel": "gpt-5.6-terra",
-    "allowedModels": ["gpt-5.6-terra", "gpt-5.6-luna", "gpt-4o", "gpt-4o-mini"],
+    "dailyTokenLimit": 500000,
+    "monthlyTokenLimit": 10000000,
+    "recipesPerDay": 10,
+    "recipesPerMonth": 200,
+    "defaultModel": "gpt-6-luna",
+    "allowedModels": ["gpt-6-luna"],
     "maxCompletionTokens": 4000,
     "maxPromptTokens": 50000
   }
@@ -226,18 +232,27 @@ Products and server-side capabilities are controlled by validated
 
 Product IDs must be unique across plans. The default model must be present in
 the plan's allowed models, and every model must be supported by this server.
+The `pro` id and existing product IDs are kept for purchase compatibility; the
+paid tier is displayed and sold as Pantrio Plus.
 `defaultModel` and `allowedModels` govern interactive WebSocket chat. Internal
-memory summarization intentionally remains on the fixed safe
-`gpt-4o-mini` model while still honoring the plan's prompt, completion, and
-daily-token caps.
+helper work (memory summarization and the recipe pipeline) runs on the same
+`gpt-6-luna` model while still honoring the plan's prompt, completion, and
+daily-token caps. GPT-6 rejects `temperature`, `top_p`, and `max_tokens`, so
+those call sites send only `max_completion_tokens`.
 Invalid configuration stops startup. `dailyTokenLimit: null` means no daily
-quota; a positive integer creates a quota-limited paid tier. If a user has
+quota. When a plan has both, the month governs and the day is a burst guard;
+when the month is spent the daily limit becomes a grace floor rather than a
+hard stop. `recipesPerDay` and `recipesPerMonth` count recommendation turns,
+not Serper queries, and may be omitted (null means unlimited). If a user has
 multiple simultaneous active plans, the last matching plan in the catalog has
 priority, so list plans from lowest to highest entitlement. Keep retired
 product IDs configured while their transaction chains may still send
-notifications. When the variable is omitted, the current monthly/yearly Pro
-catalog is used. The built-in free plan remains 20,000 daily tokens,
-`gpt-5.6-luna`, and 4,000 completion tokens per round.
+notifications. When the variable is omitted, the current monthly/yearly Plus
+catalog is used. The free plan and the paid plan run the same model
+(`gpt-6-luna`); tiers differ by quota and features, not by model. The built-in
+free plan is 100,000 daily tokens, 4 recipe recommendations per day, and 4,000
+completion tokens per round. `QUOTA_ENFORCEMENT=false` keeps metering but never
+refuses a request, which is the launch rollback switch.
 
 ## Client subscription telemetry
 
@@ -279,28 +294,36 @@ revocation. Local non-production environments may temporarily set
 
 ## Non-subscriber token quota
 
-Authenticated users without verified subscription access receive 20,000 total
-tokens per Los Angeles calendar day and at most 4,000 completion tokens per
-text-model round. Usage is keyed by Firebase UID. Chat tool-continuation rounds,
-summarization, and transcription usage reported by OpenAI all count toward the
-daily total. WebSocket chat requires a valid Firebase ID token; client-selected
+Authenticated users without verified subscription access receive 100,000 total
+tokens per Los Angeles calendar day, 4 recipe recommendations per day, and at
+most 4,000 completion tokens per text-model round. Usage is keyed by Firebase
+UID. Chat tool-continuation rounds and summarization usage reported by OpenAI
+both count toward the daily total.
+WebSocket chat requires a valid Firebase ID token; client-selected
 guest or trial IDs are not accepted as quota identities.
 
 WebSocket chat requests from non-subscribers are always executed with
-`gpt-5.6-luna`, even if the client requests another model. Verified subscribers
+`gpt-6-luna`, even if the client requests another model. Verified subscribers
 receive the daily limit, default/allowed models, completion cap, and prompt cap
 configured for their specific plan.
 
 Text/tool requests reserve `ceil(serialized UTF-8 bytes / 3)` tokens plus the
 existing per-message and response overheads. Image messages use a separate
-vision reservation so base64 camera data is not counted as text. Transcription
-has no provider-side token cap, so non-subscriber audio must fit a reservation
-of `ceil(file bytes / 64) + 256` tokens before it is uploaded. Provider-reported
-usage is authoritative when successful reservations are reconciled.
+vision reservation so base64 camera data is not counted as text.
+Provider-reported usage is authoritative when successful reservations are
+reconciled.
 
 Authenticated clients should bootstrap with `GET /api/session` and treat its
 entitlement, quota, and effective-model fields as authoritative. Subscription
 sync and `/summarize` requests require a Firebase Bearer token.
+
+The session bootstrap does not create a missing profile. A Firebase account that
+has not accepted the Terms gets
+`403 { "code": "TERMS_ACCEPTANCE_REQUIRED", "termsVersion": "..." }`; only
+`POST /api/users` creates the row, and it records `terms_accepted_at` and
+`terms_version` when it does. Existing accounts are returned untouched and are
+never asked again, and a deletion tombstone is still reported as a deletion
+rather than as a missing acceptance.
 
 The session response is shaped as:
 
@@ -315,16 +338,38 @@ The session response is shaped as:
   },
   "quota": {
     "applies": true,
-    "limit": 20000,
+    "limit": 100000,
     "used": 0,
     "reserved": 0,
-    "remaining": 20000,
+    "remaining": 100000,
     "timezone": "America/Los_Angeles",
-    "resetsAt": "2026-08-09T07:00:00.000Z"
+    "resetsAt": "2026-08-09T07:00:00.000Z",
+    "window": "day",
+    "grace": false,
+    "windows": [
+      {
+        "kind": "day",
+        "unit": "tokens",
+        "limit": 100000,
+        "used": 0,
+        "remaining": 100000,
+        "resetsAt": "2026-08-09T07:00:00.000Z",
+        "timezone": "America/Los_Angeles"
+      },
+      {
+        "kind": "day",
+        "unit": "recipe_recommendation",
+        "limit": 4,
+        "used": 0,
+        "remaining": 4,
+        "resetsAt": "2026-08-09T07:00:00.000Z",
+        "timezone": "America/Los_Angeles"
+      }
+    ]
   },
   "model": {
     "requested": null,
-    "effective": "gpt-5.6-luna",
+    "effective": "gpt-6-luna",
     "restricted": true
   },
   "apple": {
@@ -334,7 +379,7 @@ The session response is shaped as:
       {
         "productId": "com.chilltech.pantrio.subscription.monthly",
         "planId": "pro",
-        "displayName": "Pantrio Pro"
+        "displayName": "Pantrio Plus"
       }
     ]
   }
@@ -346,8 +391,7 @@ Quota and rate failures use terminal `{ "type": "error", "code", "message",
 and nested `quota` fields.
 <!-- WebSocket payloads are capped at 8 MiB. -->
 Starts accept at most 50 bounded-complexity messages, and tool continuations
-stop after six rounds. Audio uploads are capped at 2 MiB; the mobile client
-records at most 60 seconds at 32 kbps.
+stop after six rounds.
 
 ## AI request logging
 

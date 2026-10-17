@@ -1,10 +1,16 @@
 import {
   ALLOWED_MODELS_AUTHED,
+  FREE_RECIPES_PER_DAY,
   NON_SUBSCRIBER_CHAT_MODEL,
   NON_SUBSCRIBER_MAX_COMPLETION_TOKENS,
+  NON_SUBSCRIBER_MAX_PROMPT_TOKENS,
   NON_SUBSCRIBER_TOKENS_PER_DAY,
+  SUBSCRIBER_RECIPES_PER_DAY,
+  SUBSCRIBER_RECIPES_PER_MONTH,
   SUBSCRIBER_MAX_COMPLETION_TOKENS,
   SUBSCRIBER_MAX_PROMPT_TOKENS,
+  SUBSCRIBER_TOKENS_PER_DAY,
+  SUBSCRIBER_TOKENS_PER_MONTH,
 } from "../config/policy.js";
 import { CHAT_MODEL_PAID_DEFAULT } from "../config/models.js";
 
@@ -16,23 +22,32 @@ export const FREE_PLAN = Object.freeze({
   name: "Free",
   productIds: Object.freeze([]),
   dailyTokenLimit: NON_SUBSCRIBER_TOKENS_PER_DAY,
+  monthlyTokenLimit: null,
+  recipesPerDay: FREE_RECIPES_PER_DAY,
+  recipesPerMonth: null,
   defaultModel: NON_SUBSCRIBER_CHAT_MODEL,
   allowedModels: Object.freeze([NON_SUBSCRIBER_CHAT_MODEL]),
   maxCompletionTokens: NON_SUBSCRIBER_MAX_COMPLETION_TOKENS,
-  maxPromptTokens: NON_SUBSCRIBER_TOKENS_PER_DAY,
+  maxPromptTokens: NON_SUBSCRIBER_MAX_PROMPT_TOKENS,
 });
 
 const DEFAULT_PAID_PLANS = Object.freeze([
   Object.freeze({
     id: "pro",
-    name: "Pantrio Pro",
+    name: "Pantrio Plus",
     productIds: Object.freeze([
       "com.chilltech.pantrio.subscription.monthly",
       "com.chilltech.pantrio.subscription.yearly",
     ]),
-    dailyTokenLimit: null,
+    dailyTokenLimit: SUBSCRIBER_TOKENS_PER_DAY,
+    monthlyTokenLimit: SUBSCRIBER_TOKENS_PER_MONTH,
+    recipesPerDay: SUBSCRIBER_RECIPES_PER_DAY,
+    recipesPerMonth: SUBSCRIBER_RECIPES_PER_MONTH,
     defaultModel: CHAT_MODEL_PAID_DEFAULT,
-    allowedModels: Object.freeze([...ALLOWED_MODELS_AUTHED]),
+    // Every tier runs the same model; the paid plan sells quota and features.
+    // Keeping this list to one entry also stops a modified client from
+    // selecting a more expensive legacy model on the server's key.
+    allowedModels: Object.freeze([CHAT_MODEL_PAID_DEFAULT]),
     maxCompletionTokens: SUBSCRIBER_MAX_COMPLETION_TOKENS,
     maxPromptTokens: SUBSCRIBER_MAX_PROMPT_TOKENS,
   }),
@@ -120,6 +135,23 @@ function normalizePlan(rawPlan, index) {
     dailyTokenLimit: requirePositiveInteger(
       rawPlan.dailyTokenLimit,
       `plans[${index}].dailyTokenLimit`,
+      { nullable: true }
+    ),
+    monthlyTokenLimit: requirePositiveInteger(
+      rawPlan.monthlyTokenLimit ?? null,
+      `plans[${index}].monthlyTokenLimit`,
+      { nullable: true }
+    ),
+    // Omitted recipe limits stay null so an older catalog override keeps
+    // working instead of failing startup or silently imposing a new cap.
+    recipesPerDay: requirePositiveInteger(
+      rawPlan.recipesPerDay ?? null,
+      `plans[${index}].recipesPerDay`,
+      { nullable: true }
+    ),
+    recipesPerMonth: requirePositiveInteger(
+      rawPlan.recipesPerMonth ?? null,
+      `plans[${index}].recipesPerMonth`,
       { nullable: true }
     ),
     defaultModel,

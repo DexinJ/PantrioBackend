@@ -16,10 +16,11 @@ export const ALLOWED_MODELS_AUTHED = new Set(CHAT_MODELS_ALLOWED);
     NON_SUBSCRIBER_CHAT_MODEL,
   ]);
 
-  // Models that support explicit prompt-cache breakpoints (GPT-5.6 generation).
-  // Earlier models (gpt-4o / gpt-4o-mini) are implicit-cache only and must not
-  // receive the breakpoint marker or prompt_cache_options.
+  // Models that support explicit prompt-cache breakpoints (GPT-5.6 and GPT-6
+  // generations). Earlier models (gpt-4o / gpt-4o-mini) are implicit-cache
+  // only and must not receive the breakpoint marker or prompt_cache_options.
   export const EXPLICIT_CACHE_BREAKPOINT_MODELS = new Set([
+    "gpt-6-luna",
     "gpt-5.6-luna",
     "gpt-5.6-terra",
   ]);
@@ -34,8 +35,11 @@ export const ALLOWED_MODELS_AUTHED = new Set(CHAT_MODELS_ALLOWED);
   //
   // gpt-6-astra is deliberately excluded: it requires the Responses API for
   // tool calling and returns HTTP 400 for "none" effort. Earlier models
-  // (gpt-4o / gpt-4o-mini) reject the field entirely.
+  // (gpt-4o / gpt-4o-mini) reject the field entirely. gpt-6-luna is included:
+  // it accepts "none" with tools on Chat Completions, which keeps the
+  // CHAT_RESPONSES_API=false fallback usable.
   export const CHAT_REASONING_EFFORT_MODELS = new Set([
+    "gpt-6-luna",
     "gpt-5.6-terra",
     "gpt-5.6-luna",
   ]);
@@ -54,7 +58,11 @@ export const ALLOWED_MODELS_AUTHED = new Set(CHAT_MODELS_ALLOWED);
   // GPT-5.6 generation (verified against the live API on 2026-09-27 — it
   // returns 400 unless effort is forced to "none"). The Responses API has no
   // such restriction, so these models route there.
+  // gpt-6-luna is routed here for the same reasons as the GPT-5.6 models:
+  // the Responses path can run reasoning and function tools together, and it
+  // is the endpoint this chat pipeline has been validated against.
   export const RESPONSES_API_MODELS = new Set([
+    "gpt-6-luna",
     "gpt-5.6-terra",
     "gpt-5.6-luna",
   ]);
@@ -311,20 +319,38 @@ export const ALLOWED_MODELS_AUTHED = new Set(CHAT_MODELS_ALLOWED);
   // The switch itself lives with the module that owns the prompt
   // (chat/recipeMethodSummary.js) so there is exactly one source of truth.
   
-  // Trial token budgets (SQLite-backed daily quota)
-  // TEMP: effectively unlimited for testing. Restore a product value (e.g.
-  // 20_000) before shipping. See plan below for making this configurable.
-  export const TRIAL_TOKENS_PER_DAY = 1_000_000_000;
+  // Token budgets (SQLite-backed). Free is a daily drip so the allowance
+  // becomes a return-visit habit; paid is a monthly allowance with a high daily
+  // ceiling that exists only to stop abuse.
+  export const TRIAL_TOKENS_PER_DAY = 100_000;
   export const TRIAL_MAX_COMPLETION_TOKENS = 4_000;  // per request cap
 
   // The existing trial budget is now the shared daily budget for every
   // user whose stored subscription is not entitled. Keep the trial names
   // above for protocol/backward compatibility.
   export const NON_SUBSCRIBER_TOKENS_PER_DAY = TRIAL_TOKENS_PER_DAY;
+  // A free request may not spend its whole daily budget on the prompt alone,
+  // and must stay below the paid ceiling (50k). Before this, the free limit
+  // inherited the 1e9 test value and was larger than the paid one.
+  export const NON_SUBSCRIBER_MAX_PROMPT_TOKENS = 25_000;
   export const NON_SUBSCRIBER_MAX_COMPLETION_TOKENS =
     TRIAL_MAX_COMPLETION_TOKENS;
   export const SUBSCRIBER_MAX_COMPLETION_TOKENS = 4_000;
   export const SUBSCRIBER_MAX_PROMPT_TOKENS = 50_000;
+  export const SUBSCRIBER_TOKENS_PER_DAY = 500_000;
+  export const SUBSCRIBER_TOKENS_PER_MONTH = 10_000_000;
+
+  // Recipe recommendations are counted per turn, not per Serper query. One
+  // turn runs ~6 queries, so this is the unit that actually bounds cost.
+  export const FREE_RECIPES_PER_DAY = 4;
+  export const SUBSCRIBER_RECIPES_PER_DAY = 10;
+  export const SUBSCRIBER_RECIPES_PER_MONTH = 200;
+
+  // Launch switch: leaving enforcement off keeps metering but never refuses a
+  // request, so a bad cap can be defused by configuration instead of a deploy.
+  export const QUOTA_ENFORCEMENT_ENABLED = !/^(0|false|no)$/i.test(
+    String(process.env.QUOTA_ENFORCEMENT || "").trim()
+  );
   // When a free request is admitted as the last request of the day, cap its
   // completion allowance so the overshoot past the daily limit stays bounded.
   export const LAST_REQUEST_COMPLETION_TOKENS = 2_000;

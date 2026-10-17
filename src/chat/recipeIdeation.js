@@ -187,7 +187,7 @@ export async function generateRecipeIdeas(inputs, { signal } = {}) {
           },
         ],
         max_completion_tokens: MAX_IDEATION_OUTPUT_TOKENS,
-        temperature: 0.8,
+        reasoning_effort: "none",
       }),
       signal: linked.signal,
     });

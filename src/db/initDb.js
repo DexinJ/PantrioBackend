@@ -3,7 +3,7 @@ import fs from "fs";
 import { getDb } from "./db.js";
 
 const SCHEMA_URL = new URL("./schema.sql", import.meta.url);
-export const DATABASE_SCHEMA_VERSION = 2;
+export const DATABASE_SCHEMA_VERSION = 3;
 
 const USER_SUBSCRIPTION_COLUMN_MIGRATIONS = [
   {
@@ -55,6 +55,17 @@ const ACCOUNT_DELETION_COLUMN_MIGRATIONS = [
   },
 ];
 
+const USER_TERMS_COLUMN_MIGRATIONS = [
+  {
+    name: "terms_accepted_at",
+    sql: "ALTER TABLE users ADD COLUMN terms_accepted_at INTEGER DEFAULT NULL",
+  },
+  {
+    name: "terms_version",
+    sql: "ALTER TABLE users ADD COLUMN terms_version TEXT DEFAULT NULL",
+  },
+];
+
 // async function migrateUserSubscriptionColumns(db) {
 export async function migrateUserSubscriptionColumns(db) {
   const columns = await db.all("PRAGMA table_info(users)");
@@ -76,6 +87,17 @@ export async function migrateUserSubscriptionColumns(db) {
   await db.exec(
     "CREATE UNIQUE INDEX IF NOT EXISTS idx_users_apple_app_account_token_normalized ON users(lower(apple_app_account_token))"
   );
+}
+
+async function migrateUserTermsColumns(db) {
+  const columns = await db.all("PRAGMA table_info(users)");
+  if (columns.length === 0) return;
+  const existingColumnNames = new Set(columns.map((column) => column.name));
+  for (const migration of USER_TERMS_COLUMN_MIGRATIONS) {
+    if (!existingColumnNames.has(migration.name)) {
+      await db.exec(migration.sql);
+    }
+  }
 }
 
 async function migrateAccountDeletionColumns(db) {
@@ -145,11 +167,13 @@ export async function applyDatabaseSchema(db, schema) {
     // EXISTS does not alter an older table definition.
     await migrateUserSubscriptionColumns(db);
     await migrateAccountDeletionColumns(db);
+    await migrateUserTermsColumns(db);
     await db.exec(schemaDdlOnly(schema));
     // Fresh databases did not have tables during the pre-schema migration;
     // this second pass also keeps migration-owned indexes authoritative.
     await migrateUserSubscriptionColumns(db);
     await migrateAccountDeletionColumns(db);
+    await migrateUserTermsColumns(db);
     await db.exec(`PRAGMA user_version = ${DATABASE_SCHEMA_VERSION}`);
     await db.exec("COMMIT");
   } catch (error) {

@@ -13,8 +13,6 @@ const TEXT_BYTES_PER_RESERVED_TOKEN = 3;
 const TOKENS_PER_MESSAGE = 8;
 const RESPONSE_PRIMER_TOKENS = 16;
 const IMAGE_INPUT_TOKEN_RESERVATION = 4_096;
-const AUDIO_BYTES_PER_RESERVED_TOKEN = 64;
-const AUDIO_TOKEN_RESERVATION_OVERHEAD = 256;
 
 function requireNonNegativeInteger(value, name) {
   if (!Number.isInteger(value) || value < 0) {
@@ -133,20 +131,6 @@ export function estimateTokensFromMessages(messages) {
     counters.images * IMAGE_INPUT_TOKEN_RESERVATION +
     messages.length * TOKENS_PER_MESSAGE +
     RESPONSE_PRIMER_TOKENS
-  );
-}
-
-/**
- * Reserves transcription capacity before the provider call. Audio endpoints do
- * not expose a max-token request option, so free-user uploads must fit this
- * deliberately conservative byte-based bound instead.
- */
-export function estimateAudioTokensFromBytes(fileBytes) {
-  const normalizedFileBytes = requirePositiveInteger(fileBytes, "fileBytes");
-
-  return (
-    Math.ceil(normalizedFileBytes / AUDIO_BYTES_PER_RESERVED_TOKEN) +
-    AUDIO_TOKEN_RESERVATION_OVERHEAD
   );
 }
 

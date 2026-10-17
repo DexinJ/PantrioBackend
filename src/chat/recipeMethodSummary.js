@@ -84,7 +84,7 @@ function createJsonChatClient({
               { role: "user", content: user },
             ],
             max_completion_tokens: MAX_OUTPUT_TOKENS,
-            temperature: 0.2,
+            reasoning_effort: "none",
           }),
           signal: controller.signal,
         }

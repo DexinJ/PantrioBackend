@@ -36,7 +36,6 @@ export function isByoProvider(value) {
  * silently served by pantrio, which is what "make it unavailable" means here.
  */
 export const BYO_UNSUPPORTED_FEATURES = Object.freeze([
-  "transcription",
   "summarization",
 ]);
 

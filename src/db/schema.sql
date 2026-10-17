@@ -15,6 +15,10 @@ CREATE TABLE IF NOT EXISTS users (
   subscription_will_auto_renew INTEGER NOT NULL DEFAULT 0 CHECK(subscription_will_auto_renew IN (0, 1)),
   subscription_is_partial INTEGER NOT NULL DEFAULT 0 CHECK(subscription_is_partial IN (0, 1)),
   subscription_updated_at INTEGER NOT NULL DEFAULT 0,
+  -- Recorded once, when the row is first created. Existing rows stay NULL and
+  -- are never checked again.
+  terms_accepted_at INTEGER DEFAULT NULL,
+  terms_version TEXT DEFAULT NULL,
   updated_at INTEGER NOT NULL
 );
 
@@ -165,6 +169,35 @@ CREATE TABLE IF NOT EXISTS usage_daily (
   UNIQUE(owner_type, owner_key, day_key)
 );
 
+-- Longer-window token totals (currently months). Kept separate from
+-- usage_daily so a monthly reservation stays a single atomic upsert: summing
+-- daily rows first would reintroduce the read-before-write race that
+-- reserveUsage() closes.
+CREATE TABLE IF NOT EXISTS usage_periods (
+  owner_type TEXT NOT NULL,
+  owner_key TEXT NOT NULL,
+  window_kind TEXT NOT NULL CHECK (window_kind IN ('month')),
+  window_key TEXT NOT NULL,                -- 'YYYY-MM'
+  tokens_used INTEGER NOT NULL DEFAULT 0 CHECK (tokens_used >= 0),
+  requests INTEGER NOT NULL DEFAULT 0,
+  updated_at INTEGER NOT NULL,
+  PRIMARY KEY (owner_type, owner_key, window_kind, window_key)
+);
+
+-- Counted actions (recipe recommendations). Separate from tokens because the
+-- units differ: one recommendation turn costs ~6 Serper queries regardless of
+-- how many model rounds it runs.
+CREATE TABLE IF NOT EXISTS usage_actions (
+  owner_type TEXT NOT NULL,
+  owner_key TEXT NOT NULL,
+  window_kind TEXT NOT NULL CHECK (window_kind IN ('day', 'month')),
+  window_key TEXT NOT NULL,
+  action TEXT NOT NULL CHECK (action IN ('recipe_recommendation')),
+  count INTEGER NOT NULL DEFAULT 0 CHECK (count >= 0),
+  updated_at INTEGER NOT NULL,
+  PRIMARY KEY (owner_type, owner_key, window_kind, window_key, action)
+);
+
 -- Serper (web search) usage. Recorded so quota policy can be decided from real
 -- numbers later; nothing enforces it today and no request is ever rejected
 -- because of these counters. Every search is shared infrastructure: BYO
@@ -230,6 +263,26 @@ END;
 
 CREATE TRIGGER IF NOT EXISTS prevent_deleted_user_usage_insert
 BEFORE INSERT ON usage_daily
+WHEN NEW.owner_type = 'user' AND EXISTS (
+  SELECT 1 FROM account_deletions
+   WHERE firebase_uid = NEW.owner_key
+)
+BEGIN
+  SELECT RAISE(ABORT, 'ACCOUNT_DELETION_BLOCKED');
+END;
+
+CREATE TRIGGER IF NOT EXISTS prevent_deleted_user_usage_period_insert
+BEFORE INSERT ON usage_periods
+WHEN NEW.owner_type = 'user' AND EXISTS (
+  SELECT 1 FROM account_deletions
+   WHERE firebase_uid = NEW.owner_key
+)
+BEGIN
+  SELECT RAISE(ABORT, 'ACCOUNT_DELETION_BLOCKED');
+END;
+
+CREATE TRIGGER IF NOT EXISTS prevent_deleted_user_usage_action_insert
+BEFORE INSERT ON usage_actions
 WHEN NEW.owner_type = 'user' AND EXISTS (
   SELECT 1 FROM account_deletions
    WHERE firebase_uid = NEW.owner_key

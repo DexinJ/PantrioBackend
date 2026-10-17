@@ -34,27 +34,24 @@ import {
   getAccountDeletion,
   publicAccountDeletion,
 } from "../accountDeletion/accountDeletionStore.js";
-// import { parseOwner, getUsageRow, addUsage } from "../usage/usageStore.js";
-import {
-  getUsageRow,
-  parseOwner,
-  reconcileUsageReservation,
-  reserveUsage,
-} from "../usage/usageStore.js";
+import { parseOwner } from "../usage/usageStore.js";
 // import { computeTrialMaxTokens, remainingTrialTokens } from "../usage/trialBudget.js";
 // The trial-only helper above is retained as a comment for migration history.
 import {
-  computeRemainingTokens,
   DAILY_TOKEN_LIMIT_REACHED_MESSAGE,
   estimateTokensFromMessages,
 } from "../usage/tokenBudget.js";
+import {
+  addTokenWindowUsage,
+  loadTokenWindow,
+  quotaSnapshotForWindow,
+  reconcileTokenWindow,
+  reserveTokenWindow,
+} from "../usage/quotaWindows.js";
+import { QUOTA_ENFORCEMENT_ENABLED } from "../config/policy.js";
 import { getUserSubscription } from "../subscriptions/subscriptionStore.js";
 import { resolveSubscriptionAccess } from "../subscriptions/entitlementPolicy.js";
-import {
-  createQuotaSnapshot,
-  getQuotaSnapshot,
-  quotaLegacyFields,
-} from "../usage/quotaSnapshot.js";
+import { quotaLegacyFields } from "../usage/quotaSnapshot.js";
 
 import { streamOpenAIOnce } from "../chat/openaiStream.js";
 import { streamResponsesOnce } from "../chat/responsesStream.js";
@@ -684,7 +681,6 @@ export function attachChatGateway(
         isAuthed,
         quotaApplies,
         plan,
-        dailyLimit,
       } = state;
 
       let maxTokensForThisRound = plan.maxCompletionTokens;
@@ -747,94 +743,88 @@ export function attachChatGateway(
         ]);
       }
 
+      let quotaWindow = null;
       if (quotaApplies) {
-        const usage = await getUsageRow(db, ownerType, ownerKey);
-        const remainingTokens = computeRemainingTokens(
-          usage.tokens_used,
-          dailyLimit
-        );
+        quotaWindow = (await loadTokenWindow(db, ownerType, ownerKey, plan))
+          .window;
 
-        // Hard daily stop. Once the day is spent, no further requests start.
-        if (remainingTokens <= 0) {
-          const quota = createQuotaSnapshot({
-            applies: true,
-            tokensUsed: usage.tokens_used,
-            dailyLimit,
-          });
-          sendQuotaError(ws, {
-            requestId,
-            code: "QUOTA_EXHAUSTED",
-            message: DAILY_TOKEN_LIMIT_REACHED_MESSAGE,
-            quota,
-          });
-          deleteActiveRequest(requestId);
-          return;
+        // The governing window is spent. With enforcement on this is a hard
+        // stop; with it off we keep metering but never refuse, so a bad cap can
+        // be defused by configuration instead of a deploy.
+        if (quotaWindow.applies && quotaWindow.remaining <= 0) {
+          if (QUOTA_ENFORCEMENT_ENABLED) {
+            sendQuotaError(ws, {
+              requestId,
+              code: "QUOTA_EXHAUSTED",
+              message: quotaWindow.grace
+                ? "Your monthly allowance is used up. The free daily allowance resets at midnight."
+                : DAILY_TOKEN_LIMIT_REACHED_MESSAGE,
+              quota: quotaSnapshotForWindow(quotaWindow),
+            });
+            deleteActiveRequest(requestId);
+            return;
+          }
         }
 
-        // Admission happens once, on the first round. A request is served to
-        // completion as long as the day is not already spent; later tool rounds
-        // are never killed by a fresh quota read. The reservation below clamps
-        // to the remaining budget (the atomic guard stays the race-proof daily
-        // stop), and reconciliation with provider usage lands the final total.
-        // That means the last request of the day may end slightly over the
-        // limit; the next request then sees remainingTokens === 0 and stops.
+        // Admission happens once, on the first round. The reservation clamps to
+        // what is left, and the atomic guard stays race-proof. Later tool
+        // rounds are metered but never refused, so a long loop is not killed by
+        // a fresh quota read partway through.
         if ((state.round || 0) === 0) {
           const maxCompletionTokens = Math.min(
             plan.maxCompletionTokens,
             LAST_REQUEST_COMPLETION_TOKENS
           );
+          const grantable = Math.max(1, quotaWindow.remaining || 0);
           const reserveTokens = Math.max(
             1,
-            Math.min(
-              remainingTokens,
-              estPromptTokens + maxCompletionTokens
-            )
+            Math.min(grantable, estPromptTokens + maxCompletionTokens)
           );
-          quotaReservation = await reserveUsage(
+          quotaReservation = await reserveTokenWindow(
             db,
             ownerType,
             ownerKey,
-            reserveTokens,
-            dailyLimit
+            quotaWindow,
+            reserveTokens
           );
 
           if (!quotaReservation) {
-            const latestUsage = await getUsageRow(db, ownerType, ownerKey);
-            const quota = createQuotaSnapshot({
-              applies: true,
-              tokensUsed: latestUsage.tokens_used,
-              dailyLimit,
-            });
-            sendQuotaError(ws, {
+            if (QUOTA_ENFORCEMENT_ENABLED) {
+              const latest = await loadTokenWindow(
+                db,
+                ownerType,
+                ownerKey,
+                plan
+              );
+              sendQuotaError(ws, {
+                requestId,
+                code: "QUOTA_EXHAUSTED",
+                message:
+                  "Not enough token budget remains for this request.",
+                quota: quotaSnapshotForWindow(latest.window),
+              });
+              deleteActiveRequest(requestId);
+              return;
+            }
+          } else {
+            maxTokensForThisRound = maxCompletionTokens;
+            const refreshed = await loadTokenWindow(
+              db,
+              ownerType,
+              ownerKey,
+              plan
+            );
+            const quota = quotaSnapshotForWindow(refreshed.window);
+            send(ws, {
+              type: isAuthed ? "quota_budget" : "trial_budget",
               requestId,
-              code: "QUOTA_EXHAUSTED",
-              message:
-                "Not enough daily token budget remains for this request.",
               quota,
+              ...quotaLegacyFields(quota),
+              estPromptTokens,
+              maxCompletionTokens: maxTokensForThisRound,
             });
-            deleteActiveRequest(requestId);
-            return;
           }
-
-          maxTokensForThisRound = maxCompletionTokens;
-          const quota = await getQuotaSnapshot(
-            db,
-            ownerType,
-            ownerKey,
-            true,
-            { dailyLimit }
-          );
-          send(ws, {
-            type: isAuthed ? "quota_budget" : "trial_budget",
-            requestId,
-            quota,
-            ...quotaLegacyFields(quota),
-            estPromptTokens,
-            maxCompletionTokens: maxTokensForThisRound,
-          });
         } else {
-          // Already-admitted request: keep serving with the plan's completion
-          // allowance; the round-0 reservation already accounted for the day.
           maxTokensForThisRound = plan.maxCompletionTokens;
         }
       }
@@ -942,10 +932,11 @@ export function attachChatGateway(
         }
       } catch (error) {
         if (quotaReservation) {
-          await reconcileUsageReservation(
+          await reconcileTokenWindow(
             db,
             ownerType,
             ownerKey,
+            quotaWindow,
             quotaReservation,
             0,
             0
@@ -957,21 +948,22 @@ export function attachChatGateway(
       if (!one.ok) {
         let quota = null;
         if (quotaReservation) {
-          await reconcileUsageReservation(
+          await reconcileTokenWindow(
             db,
             ownerType,
             ownerKey,
+            quotaWindow,
             quotaReservation,
             0,
             0
           );
-          quota = await getQuotaSnapshot(
+          const latest = await loadTokenWindow(
             db,
             ownerType,
             ownerKey,
-            true,
-            { dailyLimit }
+            plan
           );
+          quota = quotaSnapshotForWindow(latest.window);
         }
         sendQuotaError(ws, {
           requestId,
@@ -994,10 +986,11 @@ export function attachChatGateway(
         });
         if (!one.textProduced) {
           if (quotaReservation) {
-            await reconcileUsageReservation(
+            await reconcileTokenWindow(
               db,
               ownerType,
               ownerKey,
+              quotaWindow,
               quotaReservation,
               0,
               0
@@ -1070,29 +1063,38 @@ export function attachChatGateway(
       }
       */
 
-      if (quotaReservation) {
+      if (quotaApplies) {
         const actualTokens = Number.isFinite(one?.usage?.total_tokens)
           ? Math.max(0, Math.trunc(one.usage.total_tokens))
           : null;
-        await reconcileUsageReservation(
-          db,
-          ownerType,
-          ownerKey,
-          quotaReservation,
-          actualTokens,
-          1
-        );
 
-        const quota = await getQuotaSnapshot(
-          db,
-          ownerType,
-          ownerKey,
-          true,
-          { dailyLimit }
-        );
+        if (quotaReservation) {
+          await reconcileTokenWindow(
+            db,
+            ownerType,
+            ownerKey,
+            quotaWindow,
+            quotaReservation,
+            actualTokens,
+            1
+          );
+        } else if (actualTokens !== null) {
+          // Rounds after round 0 carry no reservation of their own. Without
+          // this, a nine-round recipe turn would only be charged for round 0.
+          await addTokenWindowUsage(
+            db,
+            ownerType,
+            ownerKey,
+            quotaWindow,
+            actualTokens,
+            0
+          );
+        }
+
+        const refreshed = await loadTokenWindow(db, ownerType, ownerKey, plan);
+        const quota = quotaSnapshotForWindow(refreshed.window);
 
         send(ws, {
-          // type: "trial_budget_update",
           type: isAuthed ? "quota_budget_update" : "trial_budget_update",
           requestId,
           quota,
@@ -1254,6 +1256,7 @@ export function attachChatGateway(
                 db: state.db,
                 ownerType: state.ownerType,
                 ownerKey: state.ownerKey,
+                plan: state.plan,
                 recipeContext: state.recipeContext,
                 recipeMaxResultCount: state.isSubscribed
                   ? SUBSCRIBER_MAX_RESULT_COUNT
@@ -1601,18 +1604,18 @@ export function attachChatGateway(
       const { active: isSubscribed, plan } = resolveSubscriptionAccess(
         subscription
       );
-      const dailyLimit = plan.dailyTokenLimit;
-      const quotaApplies = dailyLimit !== null;
+      const quotaApplies =
+        plan.dailyTokenLimit !== null || plan.monthlyTokenLimit !== null;
 
       const rl = rateLimitStart(`user:${userId}`, START_LIMIT_AUTHED);
       if (!rl.ok) {
-        const quota = await getQuotaSnapshot(
+        const latest = await loadTokenWindow(
           db,
           ownerType,
           ownerKey,
-          quotaApplies,
-          { dailyLimit: dailyLimit ?? undefined }
+          plan
         );
+        const quota = quotaSnapshotForWindow(latest.window);
         sendQuotaError(ws, {
           requestId,
           code: "RATE_LIMITED",
@@ -1818,7 +1821,6 @@ export function attachChatGateway(
         isSubscribed,
         quotaApplies,
         plan,
-        dailyLimit,
         round: 0,
         usage: {
           promptTokens: 0,

@@ -16,6 +16,10 @@ import {
   translateRecipes,
 } from "./recipeDishSearch.js";
 import { withMissingItems } from "./recipeMissingItems.js";
+import {
+  RecipeQuotaExceededError,
+  withRecipeQuota,
+} from "./recipeQuota.js";
 import { recordSerperUsage, withSerperMetering } from "../usage/serperUsageStore.js";
 import {
   MASS_ADD_SHOPPING_ITEMS_TOOL_NAME,
@@ -257,10 +261,35 @@ export function createRecommendRecipesTool({
     // A named dish goes through the dish pipeline; everything else keeps using
     // the inventory engine unchanged.
     const startedAt = Date.now();
-    const result =
-      isDishQuery
-        ? await searchRecipesWithDish(args, recipeContext, dependencies)
-        : await recommendRecipesFn(args, recipeContext, dependencies);
+    let result;
+    try {
+      result = await withRecipeQuota(
+        {
+          db: ctx?.db,
+          ownerType: ctx?.ownerType,
+          ownerKey: ctx?.ownerKey,
+          plan: ctx?.plan,
+        },
+        () =>
+          isDishQuery
+            ? searchRecipesWithDish(args, recipeContext, dependencies)
+            : recommendRecipesFn(args, recipeContext, dependencies)
+      );
+    } catch (error) {
+      if (error instanceof RecipeQuotaExceededError) {
+        // A tool result rather than a thrown error: the gateway would turn a
+        // throw into a generic failure the model cannot explain to the user.
+        return {
+          error: "RECIPE_QUOTA_EXCEEDED",
+          message: error.message,
+          window: error.window,
+          resetsAt: error.resetsAt,
+          grace: error.grace === true,
+          recipes: [],
+        };
+      }
+      throw error;
+    }
     logRecipeToolMeta({ args, result, startedAt, trace });
     // The card ships addable items alongside the publisher's lines, so the
     // shopping-list button needs no parser and no model round trip.

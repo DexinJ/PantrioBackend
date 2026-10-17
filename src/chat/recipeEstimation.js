@@ -89,8 +89,8 @@ async function callOpenAiCompletions(messages, { model, signal, timeoutMs }) {
       body: JSON.stringify({
         model,
         messages,
-        temperature: 0,
-        max_tokens: MAX_ESTIMATION_OUTPUT_TOKENS,
+        max_completion_tokens: MAX_ESTIMATION_OUTPUT_TOKENS,
+        reasoning_effort: "none",
         response_format: { type: "json_object" },
       }),
       signal: linked.controller.signal,

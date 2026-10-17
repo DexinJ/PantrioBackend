@@ -64,7 +64,7 @@ export const MAX_DISH_RESULT_COUNT = 4;
 export const DEFAULT_DISH_RESULT_COUNT = 4;
 
 export const DEFAULT_DISH_LIMITS = Object.freeze({
-  maxSearchQueries: 8,
+  maxSearchQueries: 5,
   searchResultsPerQuery: 12,
   maxPages: 30,
   fetchConcurrency: 8,
@@ -146,7 +146,10 @@ export const DEFAULT_DENIED_HOST_PATTERNS = Object.freeze([
  * is in place because they do not turn into extra page fetches.
  */
 export function defaultDishQueryBudget(language) {
-  return normalizeRecipeLanguage(language) === "en" ? 6 : 8;
+  // English already produces at most four unique queries (three templates plus
+  // the calories query). Non-English keeps five so the English fallback that
+  // surfaces reliable structured data is not truncated away.
+  return normalizeRecipeLanguage(language) === "en" ? 4 : 5;
 }
 
 export function hostnameOf(value) {
@@ -808,8 +811,6 @@ const DISH_QUERY_TEMPLATES = Object.freeze({
     (dish) => `${dish} 做法`,
     (dish) => `${dish} 食谱`,
     (dish) => `${dish} 家常做法`,
-    (dish) => `${dish} 简易做法`,
-    (dish) => `${dish} 怎么做`,
   ],
 });
 
@@ -1262,7 +1263,7 @@ function createJsonChatClient({
             { role: "user", content: user },
           ],
           max_completion_tokens: outputTokens,
-          temperature: 0,
+          reasoning_effort: "none",
         }),
         signal: controller.signal,
       });
@@ -2105,8 +2106,12 @@ export async function searchRecipesByDish(
     if (providedAliases.length > 0) aliasExpansion = "provided";
 
     // Alias queries are reserved out of the budget so they always run, even
-    // when the localized templates already fill it.
-    const reserved = aliasRequest ? 2 : 0;
+    // when the localized templates already fill it. The reservation is capped
+    // at a third of the budget: with four queries, spending two on aliases
+    // leaves only two exact-dish searches.
+    const reserved = aliasRequest
+      ? Math.min(2, Math.max(1, Math.floor(limits.maxSearchQueries / 3)))
+      : 0;
     const primaryQueries = buildDishQueries(dish, normalizedLanguage, {
       maxQueries: Math.max(1, limits.maxSearchQueries - reserved),
     });

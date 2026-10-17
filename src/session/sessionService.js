@@ -1,12 +1,19 @@
 import { createHash, randomUUID } from "node:crypto";
 
+import { TermsAcceptanceRequiredError } from "../legal/termsPolicy.js";
 import { resolveChatModel } from "../chat/modelPolicy.js";
 import { getUserSubscription } from "../subscriptions/subscriptionStore.js";
 import {
   resolveSubscriptionAccess,
   subscriptionToEntitlement,
 } from "../subscriptions/entitlementPolicy.js";
-import { getQuotaSnapshot } from "../usage/quotaSnapshot.js";
+import { getPeriodUsage, getUsageRow } from "../usage/usageStore.js";
+import { monthKeyLA } from "../usage/periodKeys.js";
+import {
+  quotaSnapshotForWindow,
+  resolveTokenWindow,
+} from "../usage/quotaWindows.js";
+import { getRecipeQuotaWindows } from "../chat/recipeQuota.js";
 import { getSerperUsageSnapshot } from "../usage/serperUsageStore.js";
 import { getAppleSessionConfiguration } from "../subscriptions/appleConfig.js";
 import {
@@ -51,6 +58,15 @@ export async function ensureUserProfile(
     [decoded.uid]
   );
   if (existingProfile?.apple_app_account_token) return existingProfile;
+
+  // Creating a row is POST /api/users' job, and that route is the only place
+  // the Terms acceptance is recorded. Every other caller - the session
+  // bootstrap, the Apple link route, both subscription routes - must refuse to
+  // provision someone who has not accepted. The deletion check above stays
+  // first so a tombstone is never reported as an acceptance problem.
+  if (!existingProfile) {
+    throw new TermsAcceptanceRequiredError();
+  }
 
   for (let attempt = 0; attempt < 3; attempt += 1) {
     const accountToken = String(accountTokenFactory()).toLowerCase();
@@ -98,13 +114,41 @@ export async function buildSession(
   const user = { uid: profile.uid, username: profile.username };
   const subscription = await getUserSubscription(db, decoded.uid);
   const { active: isSubscribed, plan } = resolveSubscriptionAccess(subscription);
-  const quota = await getQuotaSnapshot(
+  const dailyUsage = await getUsageRow(db, "user", decoded.uid);
+  const monthUsage = plan.monthlyTokenLimit
+    ? await getPeriodUsage(db, "user", decoded.uid, "month", monthKeyLA(now))
+    : { tokens_used: 0 };
+  const tokenWindow = resolveTokenWindow({
+    plan,
+    dailyUsed: dailyUsage.tokens_used,
+    monthUsed: monthUsage.tokens_used,
+    now,
+  });
+  const quota = quotaSnapshotForWindow(tokenWindow);
+  const recipeWindows = await getRecipeQuotaWindows(
     db,
     "user",
     decoded.uid,
-    plan.dailyTokenLimit !== null,
-    { now, dailyLimit: plan.dailyTokenLimit ?? undefined }
+    plan,
+    now
   );
+  quota.windows = [
+    ...(tokenWindow.applies
+      ? [
+          {
+            kind: tokenWindow.kind,
+            unit: "tokens",
+            limit: tokenWindow.limit,
+            used: tokenWindow.used,
+            remaining: tokenWindow.remaining,
+            resetsAt: tokenWindow.resetsAt,
+            timezone: tokenWindow.timezone,
+          },
+        ]
+      : []),
+    ...recipeWindows,
+  ];
+  if (recipeWindows.length > 0) quota.applies = true;
   const modelResolution = resolveChatModel({
     requestedModel: null,
     isSubscribed,

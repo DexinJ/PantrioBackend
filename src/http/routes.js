@@ -1,7 +1,6 @@
 // src/http/routes.js
 import express from "express";
-import fetch, { Blob, FormData } from "node-fetch";
-import multer from "multer";
+import fetch from "node-fetch";
 
 import {
   verifyFirebaseToken,
@@ -18,17 +17,26 @@ import {
   publicAccountDeletion,
 } from "../accountDeletion/accountDeletionStore.js";
 import { OPENAI_API_KEY } from "../config/env.js";
-import {
-  MODEL_SUMMARIZE,
-  MODEL_TRANSCRIPTION,
-} from "../config/models.js";
+import { MODEL_SUMMARIZE } from "../config/models.js";
 import { getDb } from "../db/db.js";
+import {
+  CURRENT_TERMS_VERSION,
+  TermsAcceptanceRequiredError,
+  isTermsAccepted,
+} from "../legal/termsPolicy.js";
 import {
   BYO_CLIENT_HELPERS,
   MAX_CHAT_MESSAGES,
   MAX_CHAT_PAYLOAD_DEPTH,
   MAX_CHAT_PAYLOAD_NODES,
+  QUOTA_ENFORCEMENT_ENABLED,
 } from "../config/policy.js";
+import {
+  loadTokenWindow,
+  quotaSnapshotForWindow,
+  reconcileTokenWindow,
+  reserveTokenWindow,
+} from "../usage/quotaWindows.js";
 import {
   RecipeRecommendationError,
   FREE_MAX_RESULT_COUNT,
@@ -97,6 +105,11 @@ import {
   saveUserSubscription,
 } from "../subscriptions/subscriptionStore.js";
 import { resolveSubscriptionAccess } from "../subscriptions/entitlementPolicy.js";
+import { FREE_PLAN } from "../subscriptions/planCatalog.js";
+import {
+  RecipeQuotaExceededError,
+  withRecipeQuota,
+} from "../chat/recipeQuota.js";
 import {
   buildSession,
   ensureUserProfile,
@@ -109,15 +122,7 @@ import {
 } from "../subscriptions/appleSubscriptionService.js";
 import { AppleSubscriptionOwnershipError } from "../subscriptions/appleSubscriptionStore.js";
 import {
-  // addUsage, // Replaced by reservation reconciliation for quota-limited calls.
-  getUsageRow,
-  reconcileUsageReservation,
-  reserveUsage,
-} from "../usage/usageStore.js";
-import {
-  computeRemainingTokens,
   computeTokenBudget,
-  estimateAudioTokensFromBytes,
   estimateTokensFromMessages,
 } from "../usage/tokenBudget.js";
 import {
@@ -130,15 +135,12 @@ import { createConcurrencyGuard } from "../utils/concurrencyGuard.js";
 import { acquireKeyedLock } from "../utils/keyedLock.js";
 import { inspectReadiness } from "../operations/readiness.js";
 
-const MAX_AUDIO_FILE_SIZE = 2 * 1024 * 1024;
-const TRANSCRIPTION_RATE_LIMIT = { windowMs: 60_000, max: 6 };
 const SUMMARY_RATE_LIMIT = { windowMs: 60_000, max: 10 };
 const RECIPE_RECOMMENDATION_RATE_LIMIT = { windowMs: 60_000, max: 6 };
 const APPLE_VERIFICATION_RATE_LIMIT = { windowMs: 60_000, max: 10 };
 const APPLE_AUTH_LINK_RATE_LIMIT = { windowMs: 60_000, max: 5 };
 const MAX_CONCURRENT_APPLE_WEBHOOKS = 8;
 const MAX_CONCURRENT_APPLE_VERIFICATIONS = 4;
-const MAX_CONCURRENT_TRANSCRIPTIONS = 4;
 const MAX_CONCURRENT_SUMMARIES = 8;
 const MAX_CONCURRENT_RECIPE_RECOMMENDATIONS = 4;
 const OPENAI_REST_TIMEOUT_MS = 90_000;
@@ -154,12 +156,6 @@ const limitConcurrentAppleVerifications = createConcurrencyGuard({
   code: "APPLE_VERIFICATION_BUSY",
   message: "Apple subscription verification is temporarily busy.",
 });
-const limitConcurrentTranscriptions = createConcurrencyGuard({
-  maxConcurrent: MAX_CONCURRENT_TRANSCRIPTIONS,
-  retryAfterSeconds: 5,
-  code: "TRANSCRIPTION_BUSY",
-  message: "The transcription service is temporarily busy.",
-});
 const limitConcurrentSummaries = createConcurrencyGuard({
   maxConcurrent: MAX_CONCURRENT_SUMMARIES,
   retryAfterSeconds: 5,
@@ -171,43 +167,6 @@ const limitConcurrentRecipeRecommendations = createConcurrencyGuard({
   retryAfterSeconds: 5,
   code: "RECIPE_RECOMMENDATION_BUSY",
   message: "Recipe recommendations are temporarily busy.",
-});
-
-const ALLOWED_AUDIO_TYPES = new Set([
-  "audio/m4a",
-  "audio/x-m4a",
-  "audio/mp4",
-  "audio/mpeg",
-  "audio/mp3",
-  "audio/wav",
-  "audio/x-wav",
-  "audio/webm",
-  "audio/ogg",
-  "audio/aac",
-]);
-
-const uploadAudio = multer({
-  storage: multer.memoryStorage(),
-  limits: {
-    fileSize: MAX_AUDIO_FILE_SIZE,
-    files: 1,
-    fields: 0,
-  },
-  fileFilter: (_req, file, callback) => {
-    if (!file?.mimetype) {
-      callback(new Error("Uploaded audio file has no MIME type."));
-      return;
-    }
-
-    if (!ALLOWED_AUDIO_TYPES.has(file.mimetype)) {
-      callback(
-        new Error(`Unsupported audio file type: ${file.mimetype}`)
-      );
-      return;
-    }
-
-    callback(null, true);
-  },
 });
 
 function getBearerToken(req) {
@@ -237,6 +196,16 @@ function sendAccountDeletionState(res, deletion) {
         ? "This account has been deleted."
         : "Account deletion is in progress.",
     ...publicAccountDeletion(deletion),
+  });
+}
+
+// Mirrors sendAccountDeletionRaceResponse: the one place that turns this typed
+// error into the response the client knows how to route.
+function sendTermsAcceptanceRequired(res, error) {
+  return res.status(403).json({
+    code: "TERMS_ACCEPTANCE_REQUIRED",
+    error: "Terms acceptance is required.",
+    termsVersion: error?.termsVersion || CURRENT_TERMS_VERSION,
   });
 }
 
@@ -458,8 +427,8 @@ export function createRecipeRecommendationHandler({
               db,
               req?.authenticatedUser?.uid
             );
-            const { active } = resolveSubscriptionAccess(subscription);
-            return { active };
+            const { active, plan } = resolveSubscriptionAccess(subscription);
+            return { active, plan };
           } catch {
             return { active: false };
           }
@@ -498,7 +467,8 @@ export function createRecipeRecommendationHandler({
     const startedAt = Date.now();
     try {
       const safeRecipeContext = sanitizeRecipeContextFn(recipeContext);
-      const { active } = await resolveEntitlement(req);
+      const { active, plan: entitlementPlan } = await resolveEntitlement(req);
+      const quotaPlan = active && entitlementPlan ? entitlementPlan : FREE_PLAN;
       const language = safeRecipeContext.language;
       const dishQuery =
         typeof overrides?.dishQuery === "string" && overrides.dishQuery.trim();
@@ -603,9 +573,22 @@ export function createRecipeRecommendationHandler({
         dependencies.ideate = async () => ({ ok: true, ideas: hints.ideas });
         dependencies.ideationEnabled = hints.ideas.length > 0;
       }
-      const rawResult = dishQuery
-        ? await searchRecipesWithDishFn(overrides, safeRecipeContext, dependencies)
-        : await recommendRecipesFn(overrides, safeRecipeContext, dependencies);
+      const rawResult = await withRecipeQuota(
+        {
+          db,
+          ownerType: "user",
+          ownerKey: req.authenticatedUser.uid,
+          plan: quotaPlan,
+        },
+        () =>
+          dishQuery
+            ? searchRecipesWithDishFn(
+                overrides,
+                safeRecipeContext,
+                dependencies
+              )
+            : recommendRecipesFn(overrides, safeRecipeContext, dependencies)
+      );
       // `helperMethodSource` is an internal side-channel carrying the publisher
       // steps the BYO client needs to summarize. It is split off here so it can
       // never reach the response. Everything else is returned untouched: on the
@@ -664,6 +647,16 @@ export function createRecipeRecommendationHandler({
       );
     } catch (error) {
       if (abortScope.signal.aborted || res.headersSent) return;
+      if (error instanceof RecipeQuotaExceededError) {
+        return res.status(429).json({
+          code: "RECIPE_QUOTA_EXCEEDED",
+          error: error.message,
+          window: error.window,
+          grace: error.grace === true,
+          limit: error.limit,
+          resetsAt: error.resetsAt,
+        });
+      }
       logErrorMetadata("[POST /api/recipes/recommend]", error);
       const timedOut =
         error instanceof RecipeRecommendationError && error.code === "TIMEOUT";
@@ -679,52 +672,6 @@ export function createRecipeRecommendationHandler({
       abortScope.cleanup();
     }
   };
-}
-
-function handleAudioUpload(req, res, next) {
-  uploadAudio.single("file")(req, res, (error) => {
-    if (!error) {
-      next();
-      return;
-    }
-
-    if (error instanceof multer.MulterError) {
-      if (error.code === "LIMIT_FILE_SIZE") {
-        res.status(413).json({
-          error: "Audio recording is too large. Maximum size is 2 MB.",
-        });
-        return;
-      }
-
-      res.status(400).json({
-        error: error.message || "Audio upload failed.",
-      });
-      return;
-    }
-
-    res.status(400).json({
-      error: error?.message || "Invalid audio upload.",
-    });
-  });
-}
-
-// This endpoint authenticates with an explicit Firebase Bearer token and does
-// not use cookies, so browser clients can safely call it from another origin.
-export function allowTranscriptionCors(req, res, next) {
-  res.setHeader("Access-Control-Allow-Origin", "*");
-  res.setHeader("Access-Control-Allow-Methods", "POST, OPTIONS");
-  res.setHeader(
-    "Access-Control-Allow-Headers",
-    "Authorization, Content-Type"
-  );
-  res.setHeader("Access-Control-Max-Age", "600");
-
-  if (req.method === "OPTIONS") {
-    res.status(204).end();
-    return;
-  }
-
-  next();
 }
 
 export function attachRoutes(app) {
@@ -860,6 +807,9 @@ export function attachRoutes(app) {
       db = await getDb();
       return res.json(await buildSession(db, decoded));
     } catch (error) {
+      if (error instanceof TermsAcceptanceRequiredError) {
+        return sendTermsAcceptanceRequired(res, error);
+      }
       if (
         await sendAccountDeletionRaceResponse(res, {
           uid: decoded?.uid,
@@ -904,6 +854,9 @@ export function attachRoutes(app) {
         });
         return res.json({ ok: true, linked: true });
       } catch (error) {
+        if (error instanceof TermsAcceptanceRequiredError) {
+          return sendTermsAcceptanceRequired(res, error);
+        }
         if (
           await sendAccountDeletionRaceResponse(res, {
             uid: req.authenticatedUser?.uid,
@@ -955,6 +908,9 @@ export function attachRoutes(app) {
           session: await buildSession(db, decoded, { profile }),
         });
       } catch (error) {
+        if (error instanceof TermsAcceptanceRequiredError) {
+          return sendTermsAcceptanceRequired(res, error);
+        }
         if (
           await sendAccountDeletionRaceResponse(res, {
             uid: req.authenticatedUser?.uid,
@@ -994,6 +950,9 @@ export function attachRoutes(app) {
         });
         return res.json({ session: await buildSession(db, decoded, { profile }) });
       } catch (error) {
+        if (error instanceof TermsAcceptanceRequiredError) {
+          return sendTermsAcceptanceRequired(res, error);
+        }
         if (
           await sendAccountDeletionRaceResponse(res, {
             uid: req.authenticatedUser?.uid,
@@ -1077,23 +1036,42 @@ export function attachRoutes(app) {
 
       db = await getDb();
 
+      // Acceptance is required only to create the row, and a deletion tombstone
+      // must win over the requirement: that account is gone, not unprovisioned.
+      const existingProfile = await db.get(
+        "SELECT uid FROM users WHERE uid = ?",
+        [uid]
+      );
+      if (!existingProfile) {
+        const deletion = await getAccountDeletion(db, uid);
+        if (deletion) return sendAccountDeletionState(res, deletion);
+
+        if (!isTermsAccepted(req.body)) {
+          return sendTermsAcceptanceRequired(res, null);
+        }
+      }
+
       await db.run(
         `INSERT INTO users (
           uid,
           username,
           created_at,
-          updated_at
+          updated_at,
+          terms_accepted_at,
+          terms_version
         )
         VALUES (
           ?,
           ?,
           strftime('%s', 'now'),
-          strftime('%s', 'now')
+          strftime('%s', 'now'),
+          strftime('%s', 'now'),
+          ?
         )
         ON CONFLICT(uid) DO UPDATE SET
           username = excluded.username,
           updated_at = strftime('%s', 'now')`,
-        [uid, username]
+        [uid, username, CURRENT_TERMS_VERSION]
       );
 
       const subscription = normalizedSubscription
@@ -1328,321 +1306,6 @@ export function attachRoutes(app) {
   attachAccountDeletionRoutes(app);
 
   // --------------------
-  // Transcribe recorded audio
-  // POST /api/transcriptions
-  //
-  // Authorization:
-  //   Bearer <Firebase ID token>
-  //
-  // multipart/form-data:
-  //   file: audio recording
-  // --------------------
-  app.options("/api/transcriptions", allowTranscriptionCors);
-  app.post(
-    "/api/transcriptions",
-    allowTranscriptionCors,
-    authenticateRequest,
-    rateLimitAuthenticatedRequest(
-      "transcription",
-      TRANSCRIPTION_RATE_LIMIT
-    ),
-    limitConcurrentTranscriptions,
-    handleAudioUpload,
-    async (req, res) => {
-      let quotaReservationContext = null;
-
-      try {
-        if (isByoProvider(req.body?.provider)) {
-          return res.status(400).json(byoUnsupportedBody("Transcription"));
-        }
-        const decoded = req.authenticatedUser;
-
-        const uploadedFile = req.file;
-
-        if (!uploadedFile) {
-          return res.status(400).json({
-            error: "No audio file was uploaded.",
-          });
-        }
-
-        if (!uploadedFile.buffer?.length) {
-          return res.status(400).json({
-            error: "Uploaded audio file is empty.",
-          });
-        }
-
-        const db = await getDb();
-        const subscription = await getUserSubscription(db, decoded.uid);
-        const { plan } = resolveSubscriptionAccess(subscription);
-        const dailyLimit = plan.dailyTokenLimit;
-        const quotaApplies = dailyLimit !== null;
-        let quotaReservation = null;
-
-        if (quotaApplies) {
-          const usage = await getUsageRow(db, "user", decoded.uid);
-          const remainingTokens = computeRemainingTokens(
-            usage.tokens_used,
-            dailyLimit
-          );
-          const quota = createQuotaSnapshot({
-            applies: true,
-            tokensUsed: usage.tokens_used,
-            dailyLimit,
-          });
-          const estimatedAudioTokens = estimateAudioTokensFromBytes(
-            uploadedFile.buffer.length
-          );
-
-          if (remainingTokens <= 0) {
-            return res.status(429).json({
-              code: "QUOTA_EXHAUSTED",
-              error:
-                "Daily token limit reached. Please try again after the quota resets.",
-              quota: quotaResponse(quota),
-            });
-          }
-
-          if (estimatedAudioTokens > remainingTokens) {
-            return res.status(429).json({
-              code: "REQUEST_TOO_LARGE",
-              error:
-                "This recording is too large for the remaining daily token budget.",
-              quota: {
-                ...quotaResponse(quota),
-                estimatedTokens: estimatedAudioTokens,
-              },
-            });
-          }
-
-          // Audio Transcriptions has no request parameter that can cap total
-          // tokens, so reserve a conservative file-size bound before calling it.
-          /* Previous full-remaining-budget reservation:
-          quotaReservation = await reserveUsage(
-            db,
-            "user",
-            decoded.uid,
-            remainingTokens,
-            NON_SUBSCRIBER_TOKENS_PER_DAY
-          );
-          */
-          quotaReservation = await reserveUsage(
-            db,
-            "user",
-            decoded.uid,
-            estimatedAudioTokens,
-            dailyLimit
-          );
-
-          if (!quotaReservation) {
-            const latestUsage = await getUsageRow(db, "user", decoded.uid);
-            const latestQuota = createQuotaSnapshot({
-              applies: true,
-              tokensUsed: latestUsage.tokens_used,
-              dailyLimit,
-            });
-            return res.status(429).json({
-              code: "QUOTA_EXHAUSTED",
-              error: "The daily token allowance is currently in use.",
-              quota: quotaResponse(latestQuota),
-            });
-          }
-
-          quotaReservationContext = {
-            db,
-            uid: decoded.uid,
-            reservation: quotaReservation,
-            dailyLimit,
-          };
-        }
-
-        const formData = new FormData();
-
-        const audioBlob = new Blob(
-          [uploadedFile.buffer],
-          {
-            type:
-              uploadedFile.mimetype ||
-              "audio/m4a",
-          }
-        );
-
-        formData.append(
-          "file",
-          audioBlob,
-          uploadedFile.originalname ||
-            "recording.m4a"
-        );
-
-        formData.append(
-          "model",
-          MODEL_TRANSCRIPTION
-        );
-
-        const upstreamController = new AbortController();
-        const upstreamTimeout = setTimeout(
-          () => upstreamController.abort(),
-          OPENAI_REST_TIMEOUT_MS
-        );
-        let openAIResponse;
-        let responseText;
-
-        try {
-          openAIResponse = await fetch(
-            "https://api.openai.com/v1/audio/transcriptions",
-            {
-              method: "POST",
-              headers: {
-                Authorization: `Bearer ${OPENAI_API_KEY}`,
-              },
-              body: formData,
-              signal: upstreamController.signal,
-            }
-          );
-          responseText = await openAIResponse.text();
-        } catch (error) {
-          if (upstreamController.signal.aborted) {
-            const timeoutError = new Error(
-              "The transcription service timed out."
-            );
-            timeoutError.code = "UPSTREAM_TIMEOUT";
-            throw timeoutError;
-          }
-          throw error;
-        } finally {
-          clearTimeout(upstreamTimeout);
-        }
-
-        let data;
-
-        try {
-          data = JSON.parse(responseText);
-        } catch {
-          data = {
-            error: {
-              message:
-                responseText ||
-                "OpenAI returned an invalid response.",
-            },
-          };
-        }
-
-        if (!openAIResponse.ok) {
-          console.error("[POST /api/transcriptions] OpenAI error", {
-            status: openAIResponse.status,
-          });
-
-          if (quotaReservation) {
-            await reconcileUsageReservation(
-              db,
-              "user",
-              decoded.uid,
-              quotaReservation,
-              0,
-              0
-            );
-            quotaReservationContext = null;
-          }
-
-          return res
-            .status(openAIResponse.status)
-            .json({
-              code: "UPSTREAM_ERROR",
-              error: "The transcription service failed.",
-            });
-        }
-
-        /* Previous post-hoc transcription usage write. A full remaining-budget
-           reservation now prevents parallel requests from bypassing the limit.
-        if (quotaApplies) {
-          const usedTokens = Number.isFinite(data?.usage?.total_tokens)
-            ? Math.max(0, Math.trunc(data.usage.total_tokens))
-            : 0;
-          await addUsage(db, "user", decoded.uid, usedTokens, 1);
-        }
-        */
-        let reconciledUsage = null;
-        if (quotaReservation) {
-          const usedTokens = Number.isFinite(data?.usage?.total_tokens)
-            ? Math.max(0, Math.trunc(data.usage.total_tokens))
-            : null;
-          reconciledUsage = await reconcileUsageReservation(
-            db,
-            "user",
-            decoded.uid,
-            quotaReservation,
-            usedTokens,
-            1
-          );
-          quotaReservationContext = null;
-        }
-
-        const transcript =
-          typeof data?.text === "string"
-            ? data.text.trim()
-            : "";
-
-        if (!transcript) {
-          return res.status(422).json({
-            error:
-              "No speech was detected in the recording.",
-          });
-        }
-
-        const quota = createQuotaSnapshot({
-          applies: quotaApplies,
-          tokensUsed: reconciledUsage?.tokens_used || 0,
-          dailyLimit: dailyLimit ?? undefined,
-        });
-
-        return res.json({
-          ok: true,
-          text: transcript,
-          quota: quotaResponse(quota),
-        });
-      } catch (error) {
-        let quota = null;
-        if (quotaReservationContext) {
-          const { db, uid, reservation, dailyLimit } = quotaReservationContext;
-          await reconcileUsageReservation(
-            db,
-            "user",
-            uid,
-            reservation,
-            null,
-            1
-          ).catch(() => {});
-          quota = await getQuotaSnapshot(db, "user", uid, true, {
-            dailyLimit,
-          }).catch(() => null);
-        }
-
-        if (
-          await sendAccountDeletionRaceResponse(res, {
-            uid: req.authenticatedUser?.uid,
-            db: quotaReservationContext?.db || null,
-            error,
-            context: "[POST /api/transcriptions deletion race]",
-          })
-        ) {
-          return;
-        }
-        logErrorMetadata("[POST /api/transcriptions]", error);
-
-        const upstreamTimedOut = error?.code === "UPSTREAM_TIMEOUT";
-        return res
-          .status(upstreamTimedOut ? 504 : 500)
-          .json({
-          ...(upstreamTimedOut ? { code: "UPSTREAM_TIMEOUT" } : {}),
-          error: upstreamTimedOut
-            ? "The transcription service timed out."
-            : "Unable to transcribe the recording.",
-          ...(quota ? { quota: quotaResponse(quota) } : {}),
-        });
-      }
-    }
-  );
-
-  // --------------------
   // Summarize chat history
   // --------------------
   app.post(
@@ -1653,6 +1316,7 @@ export function attachRoutes(app) {
     async (req, res) => {
     let quotaReservationContext = null;
     let db = null;
+    let plan = null;
 
     try {
       if (isByoProvider(req.body?.provider)) {
@@ -1699,9 +1363,10 @@ export function attachRoutes(app) {
       ];
       db = await getDb();
       const subscription = await getUserSubscription(db, decoded.uid);
-      const { plan } = resolveSubscriptionAccess(subscription);
-      const dailyLimit = plan.dailyTokenLimit;
-      const quotaApplies = dailyLimit !== null;
+      plan = resolveSubscriptionAccess(subscription).plan;
+      const quotaApplies =
+        plan.dailyTokenLimit !== null || plan.monthlyTokenLimit !== null;
+      let quotaWindow = null;
       let quotaBudget = null;
       let quotaReservation = null;
 
@@ -1715,15 +1380,29 @@ export function attachRoutes(app) {
       }
 
       if (quotaApplies) {
-        const usage = await getUsageRow(db, "user", decoded.uid);
-        const quota = createQuotaSnapshot({
-          applies: true,
-          tokensUsed: usage.tokens_used,
-          dailyLimit,
-        });
+        quotaWindow = (
+          await loadTokenWindow(db, "user", decoded.uid, plan)
+        ).window;
+
+        // A spent window is a refusal when enforcement is on; with it off we
+        // still meter but never block.
+        if (
+          quotaWindow.applies &&
+          quotaWindow.remaining <= 0 &&
+          QUOTA_ENFORCEMENT_ENABLED
+        ) {
+          return res.status(429).json({
+            code: "QUOTA_EXHAUSTED",
+            error: quotaWindow.grace
+              ? "Your monthly allowance is used up. The free daily allowance resets at midnight."
+              : "Daily token limit reached. Please try again after the quota resets.",
+            quota: quotaResponse(quotaSnapshotForWindow(quotaWindow)),
+          });
+        }
+
         quotaBudget = computeTokenBudget({
-          tokensUsed: usage.tokens_used,
-          dailyLimit,
+          tokensUsed: quotaWindow.used,
+          dailyLimit: quotaWindow.limit,
           maxCompletionTokens: plan.maxCompletionTokens,
           estPromptTokens: estimatedSummaryPromptTokens,
         });
@@ -1735,38 +1414,35 @@ export function attachRoutes(app) {
                 ? "QUOTA_EXHAUSTED"
                 : "REQUEST_TOO_LARGE",
             error: quotaBudget.reason,
-            quota: quotaResponse(quota),
+            quota: quotaResponse(quotaSnapshotForWindow(quotaWindow)),
           });
         }
 
-        quotaReservation = await reserveUsage(
+        quotaReservation = await reserveTokenWindow(
           db,
           "user",
           decoded.uid,
-          quotaBudget.estPromptTokens + quotaBudget.maxCompletionTokens,
-          dailyLimit
+          quotaWindow,
+          quotaBudget.estPromptTokens + quotaBudget.maxCompletionTokens
         );
 
-        if (!quotaReservation) {
-          const latestUsage = await getUsageRow(db, "user", decoded.uid);
-          const latestQuota = createQuotaSnapshot({
-            applies: true,
-            tokensUsed: latestUsage.tokens_used,
-            dailyLimit,
-          });
+        if (!quotaReservation && QUOTA_ENFORCEMENT_ENABLED) {
+          const latest = await loadTokenWindow(db, "user", decoded.uid, plan);
           return res.status(429).json({
             code: "QUOTA_EXHAUSTED",
-            error: "Not enough daily token budget remains for this request.",
-            quota: quotaResponse(latestQuota),
+            error: "Not enough token budget remains for this request.",
+            quota: quotaResponse(quotaSnapshotForWindow(latest.window)),
           });
         }
 
-        quotaReservationContext = {
-          db,
-          uid: decoded.uid,
-          reservation: quotaReservation,
-          dailyLimit,
-        };
+        if (quotaReservation) {
+          quotaReservationContext = {
+            db,
+            uid: decoded.uid,
+            reservation: quotaReservation,
+            window: quotaWindow,
+          };
+        }
       }
 
       const upstreamController = new AbortController();
@@ -1795,10 +1471,12 @@ export function attachRoutes(app) {
                 },
                 ...messages,
               ],
-              temperature: 0.2,
               max_completion_tokens:
                 quotaBudget?.maxCompletionTokens ||
                 plan.maxCompletionTokens,
+              // Helpers do not reason; this preserves the previous
+              // non-reasoning model's latency and token profile.
+              reasoning_effort: "none",
             }),
             signal: upstreamController.signal,
           }
@@ -1829,10 +1507,11 @@ export function attachRoutes(app) {
         });
 
         if (quotaReservation) {
-          await reconcileUsageReservation(
+          await reconcileTokenWindow(
             db,
             "user",
             decoded.uid,
+            quotaWindow,
             quotaReservation,
             0,
             0
@@ -1857,15 +1536,15 @@ export function attachRoutes(app) {
         await addUsage(db, "user", decoded.uid, usedTokens, 1);
       }
       */
-      let reconciledUsage = null;
       if (quotaReservation) {
         const usedTokens = Number.isFinite(data?.usage?.total_tokens)
           ? Math.max(0, Math.trunc(data.usage.total_tokens))
           : null;
-        reconciledUsage = await reconcileUsageReservation(
+        await reconcileTokenWindow(
           db,
           "user",
           decoded.uid,
+          quotaWindow,
           quotaReservation,
           usedTokens,
           1
@@ -1875,11 +1554,11 @@ export function attachRoutes(app) {
 
       const summary =
         data?.choices?.[0]?.message?.content ?? "";
-      const quota = createQuotaSnapshot({
-        applies: quotaApplies,
-        tokensUsed: reconciledUsage?.tokens_used || 0,
-        dailyLimit: dailyLimit ?? undefined,
-      });
+      const quota = quotaApplies
+        ? quotaSnapshotForWindow(
+            (await loadTokenWindow(db, "user", decoded.uid, plan)).window
+          )
+        : createQuotaSnapshot({ applies: false });
 
       return res.json({
         summary,
@@ -1888,18 +1567,20 @@ export function attachRoutes(app) {
     } catch (error) {
       let quota = null;
       if (quotaReservationContext) {
-        const { db, uid, reservation, dailyLimit } = quotaReservationContext;
-        await reconcileUsageReservation(
+        const { db, uid, reservation, window } = quotaReservationContext;
+        await reconcileTokenWindow(
           db,
           "user",
           uid,
+          window,
           reservation,
           null,
           1
         ).catch(() => {});
-        quota = await getQuotaSnapshot(db, "user", uid, true, {
-          dailyLimit,
-        }).catch(() => null);
+        quota = quotaSnapshotForWindow(
+          (await loadTokenWindow(db, "user", uid, plan).catch(() => null))
+            ?.window ?? { applies: false }
+        );
       }
 
       if (

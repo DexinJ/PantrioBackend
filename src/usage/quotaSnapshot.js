@@ -1,42 +1,13 @@
 import { NON_SUBSCRIBER_TOKENS_PER_DAY } from "../config/policy.js";
 import { getUsageRow } from "./usageStore.js";
 import { computeRemainingTokens } from "./tokenBudget.js";
+import {
+  QUOTA_TIMEZONE,
+  localParts,
+  timeZoneOffsetMs,
+} from "./periodKeys.js";
 
-export const QUOTA_TIMEZONE = "America/Los_Angeles";
-
-const dateTimeFormatter = new Intl.DateTimeFormat("en-US", {
-  timeZone: QUOTA_TIMEZONE,
-  year: "numeric",
-  month: "2-digit",
-  day: "2-digit",
-  hour: "2-digit",
-  minute: "2-digit",
-  second: "2-digit",
-  hourCycle: "h23",
-});
-
-function localParts(date) {
-  return Object.fromEntries(
-    dateTimeFormatter
-      .formatToParts(date)
-      .filter(({ type }) => type !== "literal")
-      .map(({ type, value }) => [type, Number(value)])
-  );
-}
-
-function timeZoneOffsetMs(date) {
-  const parts = localParts(date);
-  const representedAsUtc = Date.UTC(
-    parts.year,
-    parts.month - 1,
-    parts.day,
-    parts.hour,
-    parts.minute,
-    parts.second
-  );
-
-  return representedAsUtc - Math.trunc(date.getTime() / 1_000) * 1_000;
-}
+export { QUOTA_TIMEZONE };
 
 /** Return the next Los Angeles calendar-day boundary as an ISO timestamp. */
 export function getNextQuotaResetAt(now = new Date()) {
