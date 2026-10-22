@@ -4,7 +4,7 @@
 // row was created. Bump it whenever the published Terms page changes so the
 // stored record keeps pointing at the wording the user actually agreed to.
 
-export const CURRENT_TERMS_VERSION = "2026-09-30";
+export const CURRENT_TERMS_VERSION = "2026-10-21";
 
 export class TermsAcceptanceRequiredError extends Error {
   constructor(
