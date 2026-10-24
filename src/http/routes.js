@@ -33,6 +33,7 @@ import {
 } from "../config/policy.js";
 import {
   loadTokenWindow,
+  planHasTokenQuota,
   quotaSnapshotForWindow,
   reconcileTokenWindow,
   reserveTokenWindow,
@@ -1366,8 +1367,7 @@ export function attachRoutes(app) {
       db = await getDb();
       const subscription = await getUserSubscription(db, decoded.uid);
       plan = resolveSubscriptionAccess(subscription).plan;
-      const quotaApplies =
-        plan.dailyTokenLimit !== null || plan.monthlyTokenLimit !== null;
+      const quotaApplies = planHasTokenQuota(plan);
       let quotaWindow = null;
       let quotaBudget = null;
       let quotaReservation = null;
@@ -1396,8 +1396,8 @@ export function attachRoutes(app) {
           return res.status(429).json({
             code: "QUOTA_EXHAUSTED",
             error: quotaWindow.grace
-              ? "Your monthly allowance is used up. The free daily allowance resets at midnight."
-              : "Daily token limit reached. Please try again after the quota resets.",
+              ? "Your monthly allowance is used up. The daily grace allowance resets at midnight."
+              : "Token allowance reached. Please try again after it resets.",
             quota: quotaResponse(quotaSnapshotForWindow(quotaWindow)),
           });
         }

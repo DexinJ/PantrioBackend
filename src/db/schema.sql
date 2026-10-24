@@ -169,15 +169,14 @@ CREATE TABLE IF NOT EXISTS usage_daily (
   UNIQUE(owner_type, owner_key, day_key)
 );
 
--- Longer-window token totals (currently months). Kept separate from
--- usage_daily so a monthly reservation stays a single atomic upsert: summing
--- daily rows first would reintroduce the read-before-write race that
--- reserveUsage() closes.
+-- Longer-window token totals. Kept separate from usage_daily so a period
+-- reservation stays a single atomic upsert: summing daily rows first would
+-- reintroduce the read-before-write race that reserveUsage() closes.
 CREATE TABLE IF NOT EXISTS usage_periods (
   owner_type TEXT NOT NULL,
   owner_key TEXT NOT NULL,
-  window_kind TEXT NOT NULL CHECK (window_kind IN ('month')),
-  window_key TEXT NOT NULL,                -- 'YYYY-MM'
+  window_kind TEXT NOT NULL CHECK (window_kind IN ('week', 'month')),
+  window_key TEXT NOT NULL,                -- 'YYYY-MM' or Monday 'YYYY-MM-DD'
   tokens_used INTEGER NOT NULL DEFAULT 0 CHECK (tokens_used >= 0),
   requests INTEGER NOT NULL DEFAULT 0,
   updated_at INTEGER NOT NULL,

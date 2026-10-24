@@ -44,6 +44,7 @@ import {
 import {
   addTokenWindowUsage,
   loadTokenWindow,
+  planHasTokenQuota,
   quotaSnapshotForWindow,
   reconcileTokenWindow,
   reserveTokenWindow,
@@ -757,7 +758,7 @@ export function attachChatGateway(
               requestId,
               code: "QUOTA_EXHAUSTED",
               message: quotaWindow.grace
-                ? "Your monthly allowance is used up. The free daily allowance resets at midnight."
+                ? "Your monthly allowance is used up. The daily grace allowance resets at midnight."
                 : DAILY_TOKEN_LIMIT_REACHED_MESSAGE,
               quota: quotaSnapshotForWindow(quotaWindow),
             });
@@ -1604,8 +1605,7 @@ export function attachChatGateway(
       const { active: isSubscribed, plan } = resolveSubscriptionAccess(
         subscription
       );
-      const quotaApplies =
-        plan.dailyTokenLimit !== null || plan.monthlyTokenLimit !== null;
+      const quotaApplies = planHasTokenQuota(plan);
 
       const rl = rateLimitStart(`user:${userId}`, START_LIMIT_AUTHED);
       if (!rl.ok) {

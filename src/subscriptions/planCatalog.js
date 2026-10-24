@@ -1,6 +1,8 @@
 import {
   ALLOWED_MODELS_AUTHED,
   FREE_RECIPES_PER_DAY,
+  FREE_TOKEN_QUOTA_WINDOW,
+  FREE_TOKENS_PER_WEEK,
   NON_SUBSCRIBER_CHAT_MODEL,
   NON_SUBSCRIBER_MAX_COMPLETION_TOKENS,
   NON_SUBSCRIBER_MAX_PROMPT_TOKENS,
@@ -16,11 +18,23 @@ import { CHAT_MODEL_PAID_DEFAULT } from "../config/models.js";
 const PLAN_ID = /^[a-z][a-z0-9_-]{0,31}$/;
 const PRODUCT_ID = /^[A-Za-z0-9][A-Za-z0-9._-]{2,254}$/;
 
+const FREE_TOKEN_LIMITS = Object.freeze(
+  FREE_TOKEN_QUOTA_WINDOW === "week"
+    ? {
+        weeklyTokenLimit: FREE_TOKENS_PER_WEEK,
+        dailyTokenLimit: null,
+      }
+    : {
+        weeklyTokenLimit: null,
+        dailyTokenLimit: NON_SUBSCRIBER_TOKENS_PER_DAY,
+      }
+);
+
 export const FREE_PLAN = Object.freeze({
   id: "free",
   name: "Free",
   productIds: Object.freeze([]),
-  dailyTokenLimit: NON_SUBSCRIBER_TOKENS_PER_DAY,
+  ...FREE_TOKEN_LIMITS,
   monthlyTokenLimit: null,
   recipesPerDay: FREE_RECIPES_PER_DAY,
   recipesPerMonth: null,
@@ -40,6 +54,7 @@ const DEFAULT_PAID_PLANS = Object.freeze([
     ]),
     // The default paid plan is bounded by its monthly allowance. A daily
     // limit remains supported for explicitly configured custom catalogs.
+    weeklyTokenLimit: null,
     dailyTokenLimit: null,
     monthlyTokenLimit: SUBSCRIBER_TOKENS_PER_MONTH,
     recipesPerDay: SUBSCRIBER_RECIPES_PER_DAY,
@@ -133,8 +148,13 @@ function normalizePlan(rawPlan, index) {
     id,
     name,
     productIds: Object.freeze(productIds),
+    weeklyTokenLimit: requirePositiveInteger(
+      rawPlan.weeklyTokenLimit ?? null,
+      `plans[${index}].weeklyTokenLimit`,
+      { nullable: true }
+    ),
     dailyTokenLimit: requirePositiveInteger(
-      rawPlan.dailyTokenLimit,
+      rawPlan.dailyTokenLimit ?? null,
       `plans[${index}].dailyTokenLimit`,
       { nullable: true }
     ),

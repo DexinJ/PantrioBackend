@@ -48,6 +48,52 @@ export function monthKeyLA(date = new Date()) {
   return `${String(parts.year).padStart(4, "0")}-${String(parts.month).padStart(2, "0")}`;
 }
 
+function assertValidDate(value) {
+  if (!(value instanceof Date) || !Number.isFinite(value.getTime())) {
+    throw new TypeError("now must be a valid Date");
+  }
+}
+
+/** Monday's local calendar date, represented as YYYY-MM-DD. */
+export function weekKeyLA(date = new Date()) {
+  assertValidDate(date);
+  const parts = localParts(date);
+  const localDate = new Date(
+    Date.UTC(parts.year, parts.month - 1, parts.day)
+  );
+  const daysSinceMonday = (localDate.getUTCDay() + 6) % 7;
+  localDate.setUTCDate(localDate.getUTCDate() - daysSinceMonday);
+
+  return [
+    String(localDate.getUTCFullYear()).padStart(4, "0"),
+    String(localDate.getUTCMonth() + 1).padStart(2, "0"),
+    String(localDate.getUTCDate()).padStart(2, "0"),
+  ].join("-");
+}
+
+/** The next Monday at 00:00 in the quota timezone, as ISO. */
+export function getNextWeekResetAt(now = new Date()) {
+  assertValidDate(now);
+  const current = localParts(now);
+  const localDate = new Date(
+    Date.UTC(current.year, current.month - 1, current.day)
+  );
+  const weekday = localDate.getUTCDay();
+  const daysUntilNextMonday = (8 - weekday) % 7 || 7;
+  const nextMondayLocal = Date.UTC(
+    current.year,
+    current.month - 1,
+    current.day + daysUntilNextMonday
+  );
+
+  let resetMs = nextMondayLocal;
+  for (let index = 0; index < 2; index += 1) {
+    resetMs = nextMondayLocal - timeZoneOffsetMs(new Date(resetMs));
+  }
+
+  return new Date(resetMs).toISOString();
+}
+
 /** The first instant of the next month in the quota timezone, as ISO. */
 export function getNextMonthResetAt(now = new Date()) {
   if (!(now instanceof Date) || !Number.isFinite(now.getTime())) {

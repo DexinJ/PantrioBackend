@@ -8,7 +8,7 @@ import {
   subscriptionToEntitlement,
 } from "../subscriptions/entitlementPolicy.js";
 import { getPeriodUsage, getUsageRow } from "../usage/usageStore.js";
-import { monthKeyLA } from "../usage/periodKeys.js";
+import { monthKeyLA, weekKeyLA } from "../usage/periodKeys.js";
 import {
   quotaSnapshotForWindow,
   resolveTokenWindow,
@@ -118,10 +118,14 @@ export async function buildSession(
   const monthUsage = plan.monthlyTokenLimit
     ? await getPeriodUsage(db, "user", decoded.uid, "month", monthKeyLA(now))
     : { tokens_used: 0 };
+  const weekUsage = plan.weeklyTokenLimit
+    ? await getPeriodUsage(db, "user", decoded.uid, "week", weekKeyLA(now))
+    : { tokens_used: 0 };
   const tokenWindow = resolveTokenWindow({
     plan,
     dailyUsed: dailyUsage.tokens_used,
     monthUsed: monthUsage.tokens_used,
+    weekUsed: weekUsage.tokens_used,
     now,
   });
   const quota = quotaSnapshotForWindow(tokenWindow);

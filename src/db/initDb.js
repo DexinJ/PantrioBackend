@@ -3,7 +3,7 @@ import fs from "fs";
 import { getDb } from "./db.js";
 
 const SCHEMA_URL = new URL("./schema.sql", import.meta.url);
-export const DATABASE_SCHEMA_VERSION = 3;
+export const DATABASE_SCHEMA_VERSION = 4;
 
 const USER_SUBSCRIPTION_COLUMN_MIGRATIONS = [
   {
@@ -111,6 +111,51 @@ async function migrateAccountDeletionColumns(db) {
   }
 }
 
+async function migrateUsagePeriodWindowKinds(db) {
+  const table = await db.get(
+    `SELECT sql
+       FROM sqlite_master
+      WHERE type = 'table' AND name = 'usage_periods'`
+  );
+
+  if (!table?.sql || /'week'/i.test(table.sql)) return;
+
+  await db.exec(`
+    CREATE TABLE usage_periods_new (
+      owner_type TEXT NOT NULL,
+      owner_key TEXT NOT NULL,
+      window_kind TEXT NOT NULL CHECK (window_kind IN ('week', 'month')),
+      window_key TEXT NOT NULL,
+      tokens_used INTEGER NOT NULL DEFAULT 0 CHECK (tokens_used >= 0),
+      requests INTEGER NOT NULL DEFAULT 0,
+      updated_at INTEGER NOT NULL,
+      PRIMARY KEY (owner_type, owner_key, window_kind, window_key)
+    );
+
+    INSERT INTO usage_periods_new (
+      owner_type,
+      owner_key,
+      window_kind,
+      window_key,
+      tokens_used,
+      requests,
+      updated_at
+    )
+    SELECT
+      owner_type,
+      owner_key,
+      window_kind,
+      window_key,
+      tokens_used,
+      requests,
+      updated_at
+    FROM usage_periods;
+
+    DROP TABLE usage_periods;
+    ALTER TABLE usage_periods_new RENAME TO usage_periods;
+  `);
+}
+
 async function readDatabaseSchemaVersion(db) {
   const versionRow = await db.get("PRAGMA user_version");
   return Number(versionRow?.user_version || 0);
@@ -168,6 +213,7 @@ export async function applyDatabaseSchema(db, schema) {
     await migrateUserSubscriptionColumns(db);
     await migrateAccountDeletionColumns(db);
     await migrateUserTermsColumns(db);
+    await migrateUsagePeriodWindowKinds(db);
     await db.exec(schemaDdlOnly(schema));
     // Fresh databases did not have tables during the pre-schema migration;
     // this second pass also keeps migration-owned indexes authoritative.

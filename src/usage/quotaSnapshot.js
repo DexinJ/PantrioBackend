@@ -92,5 +92,7 @@ export function quotaLegacyFields(quota) {
     usedTokens: quota.used,
     remainingTokens: quota.remaining,
     resetsAt: quota.resetsAt,
+    window: quota.window ?? null,
+    grace: quota.grace === true,
   };
 }

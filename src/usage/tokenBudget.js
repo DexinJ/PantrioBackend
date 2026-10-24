@@ -1,10 +1,10 @@
 // src/usage/tokenBudget.js
 
 export const DAILY_TOKEN_LIMIT_REACHED_MESSAGE =
-  "Daily token limit reached. Please try again after the quota resets.";
+  "Token allowance reached. Please try again after it resets.";
 
 export const REQUEST_EXCEEDS_TOKEN_BUDGET_MESSAGE =
-  "This request is too large for the remaining daily token budget.";
+  "This request is too large for the remaining token allowance.";
 
 // Serialized text/tool payloads are converted to a conservative token estimate
 // using a calibrated UTF-8 byte ratio. Provider-reported usage remains the
@@ -135,7 +135,7 @@ export function estimateTokensFromMessages(messages) {
 }
 
 /**
- * Computes the unused portion of a daily quota without returning negatives.
+ * Computes the unused portion of a token quota without returning negatives.
  */
 export function computeRemainingTokens(tokensUsed, dailyLimit) {
   const normalizedTokensUsed = requireNonNegativeInteger(tokensUsed, "tokensUsed");

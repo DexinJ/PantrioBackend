@@ -2,7 +2,7 @@
 //
 // Chooses which token window governs one request and reserves against it.
 //
-// A plan may carry a daily or monthly limit. A monthly plan may also
+// A plan may carry a daily, weekly, or monthly limit. A monthly plan may also
 // carry an explicit legacy/custom daily burst guard. When the month is spent,
 // every paid plan receives the same bounded daily grace allowance instead of
 // being locked out until renewal.
@@ -15,7 +15,9 @@ import { getNextQuotaResetAt } from "./quotaSnapshot.js";
 import {
   QUOTA_TIMEZONE,
   getNextMonthResetAt,
+  getNextWeekResetAt,
   monthKeyLA,
+  weekKeyLA,
 } from "./periodKeys.js";
 import { computeRemainingTokens } from "./tokenBudget.js";
 import {
@@ -34,8 +36,16 @@ function positiveLimit(value) {
   return Number.isInteger(value) && value > 0 ? value : null;
 }
 
+export function planHasTokenQuota(plan) {
+  return (
+    positiveLimit(plan?.weeklyTokenLimit) !== null ||
+    positiveLimit(plan?.monthlyTokenLimit) !== null ||
+    positiveLimit(plan?.dailyTokenLimit) !== null
+  );
+}
+
 /**
- * Read both windows and decide which one governs. Shared by the WebSocket
+ * Read all token windows and decide which one governs. Shared by the WebSocket
  * gateway and the REST summarize route so the two cannot disagree.
  */
 export async function loadTokenWindow(
@@ -49,14 +59,19 @@ export async function loadTokenWindow(
   const monthly = positiveLimit(plan?.monthlyTokenLimit)
     ? await getPeriodUsage(db, ownerType, ownerKey, "month", monthKeyLA(now))
     : { tokens_used: 0 };
+  const weekly = positiveLimit(plan?.weeklyTokenLimit)
+    ? await getPeriodUsage(db, ownerType, ownerKey, "week", weekKeyLA(now))
+    : { tokens_used: 0 };
 
   return {
     dailyUsed: daily.tokens_used,
     monthUsed: monthly.tokens_used,
+    weekUsed: weekly.tokens_used,
     window: resolveTokenWindow({
       plan,
       dailyUsed: daily.tokens_used,
       monthUsed: monthly.tokens_used,
+      weekUsed: weekly.tokens_used,
       now,
     }),
   };
@@ -90,46 +105,79 @@ function monthWindow(limit, used, { grace, now }) {
   };
 }
 
+function weekWindow(limit, used, { now }) {
+  return {
+    applies: true,
+    kind: "week",
+    grace: false,
+    limit,
+    used,
+    remaining: computeRemainingTokens(used, limit),
+    windowKey: weekKeyLA(now),
+    resetsAt: getNextWeekResetAt(now),
+    timezone: QUOTA_TIMEZONE,
+  };
+}
+
 /**
  * Resolve the window that governs this request.
  *
  * - monthly plan with room and no guard    -> month
  * - monthly plan with room and guard full  -> day burst window
  * - monthly plan spent                     -> day grace window
- * - no monthly plan                        -> daily or no quota
+ * - no monthly plan, weekly limit          -> week
+ * - no monthly or weekly plan              -> legacy daily or no quota
  */
 export function resolveTokenWindow({
   plan,
   dailyUsed = 0,
   monthUsed = 0,
+  weekUsed = 0,
   now = new Date(),
 }) {
   const dailyLimit = positiveLimit(plan?.dailyTokenLimit);
+  const weeklyLimit = positiveLimit(plan?.weeklyTokenLimit);
   const monthlyLimit = positiveLimit(plan?.monthlyTokenLimit);
 
-  if (monthlyLimit === null) {
-    return dailyLimit === null
-      ? { applies: false, kind: null, grace: false, limit: null, used: 0, remaining: null, windowKey: null, resetsAt: getNextQuotaResetAt(now), timezone: QUOTA_TIMEZONE }
-      : dayWindow(dailyLimit, dailyUsed, { grace: false, now });
-  }
+  if (monthlyLimit !== null) {
+    const monthRemaining = computeRemainingTokens(monthUsed, monthlyLimit);
 
-  const monthRemaining = computeRemainingTokens(monthUsed, monthlyLimit);
-
-  if (monthRemaining > 0) {
-    if (dailyLimit !== null && dailyUsed >= dailyLimit) {
-      return dayWindow(dailyLimit, dailyUsed, { grace: false, now });
+    if (monthRemaining > 0) {
+      if (dailyLimit !== null && dailyUsed >= dailyLimit) {
+        return dayWindow(dailyLimit, dailyUsed, { grace: false, now });
+      }
+      return monthWindow(monthlyLimit, monthUsed, { grace: false, now });
     }
-    return monthWindow(monthlyLimit, monthUsed, { grace: false, now });
+
+    // Monthly allowance spent: grant the paid grace floor regardless of
+    // whether the plan has a burst guard. For custom plans whose guard is
+    // lower than the standard grace floor, preserve the tighter value.
+    const graceLimit =
+      dailyLimit === null
+        ? PAID_MONTHLY_GRACE_TOKENS_PER_DAY
+        : Math.min(dailyLimit, PAID_MONTHLY_GRACE_TOKENS_PER_DAY);
+    return dayWindow(graceLimit, dailyUsed, { grace: true, now });
   }
 
-  // Monthly allowance spent: grant the paid grace floor regardless of whether
-  // the plan has a burst guard. For custom plans whose guard is lower than the
-  // standard grace floor, preserve the tighter configured value.
-  const graceLimit =
-    dailyLimit === null
-      ? PAID_MONTHLY_GRACE_TOKENS_PER_DAY
-      : Math.min(dailyLimit, PAID_MONTHLY_GRACE_TOKENS_PER_DAY);
-  return dayWindow(graceLimit, dailyUsed, { grace: true, now });
+  if (weeklyLimit !== null) {
+    return weekWindow(weeklyLimit, weekUsed, { now });
+  }
+
+  if (dailyLimit !== null) {
+    return dayWindow(dailyLimit, dailyUsed, { grace: false, now });
+  }
+
+  return {
+    applies: false,
+    kind: null,
+    grace: false,
+    limit: null,
+    used: 0,
+    remaining: null,
+    windowKey: null,
+    resetsAt: getNextQuotaResetAt(now),
+    timezone: QUOTA_TIMEZONE,
+  };
 }
 
 /** Reserve against the governing window. Returns null when it is full. */
@@ -140,17 +188,21 @@ export async function reserveTokenWindow(
   window,
   reserveTokens
 ) {
-  if (window?.kind === "month") {
+  if (window?.kind === "week" || window?.kind === "month") {
     return reservePeriodUsage(
       db,
       ownerType,
       ownerKey,
+      window.kind,
       window.windowKey,
       reserveTokens,
       window.limit
     );
   }
-  return reserveUsage(db, ownerType, ownerKey, reserveTokens, window.limit);
+  if (window?.kind === "day") {
+    return reserveUsage(db, ownerType, ownerKey, reserveTokens, window.limit);
+  }
+  throw new RangeError("Unsupported token window");
 }
 
 /** Replace a reservation with provider-reported usage for that window. */
@@ -163,7 +215,10 @@ export async function reconcileTokenWindow(
   actualTokens,
   addRequests = 1
 ) {
-  if (reservation?.windowKind === "month") {
+  if (
+    reservation?.windowKind === "week" ||
+    reservation?.windowKind === "month"
+  ) {
     const row = await reconcilePeriodReservation(
       db,
       ownerType,
@@ -172,24 +227,26 @@ export async function reconcileTokenWindow(
       actualTokens,
       addRequests
     );
-    // Mirror the settled amount into today's row so an optional burst guard
-    // and the grace floor see paid usage. This is a positive add, not the month's
-    // adjustment: the month row already holds the reservation, while the daily
-    // row starts empty and should end at the actual total. When the provider
-    // never reported usage, keep the reservation as the estimate.
-    const settledTokens =
-      actualTokens === null ? reservation.tokens : actualTokens;
-    await adjustDailyUsage(db, ownerType, ownerKey, settledTokens, addRequests);
+    if (reservation.windowKind === "month") {
+      // Paid monthly usage drives the optional burst guard and grace floor.
+      // Weekly free usage remains in usage_periods only.
+      const settledTokens =
+        actualTokens === null ? reservation.tokens : actualTokens;
+      await adjustDailyUsage(db, ownerType, ownerKey, settledTokens, addRequests);
+    }
     return row;
   }
-  return reconcileUsageReservation(
-    db,
-    ownerType,
-    ownerKey,
-    reservation,
-    actualTokens,
-    addRequests
-  );
+  if (reservation?.dayKey) {
+    return reconcileUsageReservation(
+      db,
+      ownerType,
+      ownerKey,
+      reservation,
+      actualTokens,
+      addRequests
+    );
+  }
+  throw new RangeError("Unsupported token reservation");
 }
 
 /**
@@ -207,26 +264,31 @@ export async function addTokenWindowUsage(
 ) {
   if (!Number.isInteger(actualTokens) || actualTokens < 0) return null;
 
-  if (window?.kind === "month") {
+  if (window?.kind === "week" || window?.kind === "month") {
     const row = await addPeriodUsage(
       db,
       ownerType,
       ownerKey,
-      "month",
+      window.kind,
       window.windowKey,
       actualTokens,
       addRequests
     );
-    await adjustDailyUsage(db, ownerType, ownerKey, actualTokens, addRequests);
+    if (window.kind === "month") {
+      await adjustDailyUsage(db, ownerType, ownerKey, actualTokens, addRequests);
+    }
     return row;
   }
-  return addUsage(db, ownerType, ownerKey, actualTokens, addRequests);
+  if (window?.kind === "day") {
+    return addUsage(db, ownerType, ownerKey, actualTokens, addRequests);
+  }
+  throw new RangeError("Unsupported token window");
 }
 
 /**
  * Shape a resolved window for the session and error payloads. Mirrors the
  * existing createQuotaSnapshot fields so older clients keep working, and adds
- * the window name so newer ones can say "monthly" or "today".
+ * the window name so newer ones can say "weekly", "monthly", or "today".
  */
 export function quotaSnapshotForWindow(window) {
   if (!window?.applies) {

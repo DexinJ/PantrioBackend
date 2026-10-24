@@ -202,7 +202,8 @@ Products and server-side capabilities are controlled by validated
     "id": "starter",
     "name": "Pantrio Starter",
     "productIds": ["com.chilltech.pantrio.starter.monthly"],
-    "dailyTokenLimit": 50000,
+    "weeklyTokenLimit": 350000,
+    "dailyTokenLimit": null,
     "monthlyTokenLimit": 1000000,
     "recipesPerDay": 3,
     "recipesPerMonth": null,
@@ -219,6 +220,7 @@ Products and server-side capabilities are controlled by validated
       "com.chilltech.pantrio.subscription.yearly"
     ],
     "dailyTokenLimit": null,
+    "weeklyTokenLimit": null,
     "monthlyTokenLimit": 10000000,
     "recipesPerDay": 10,
     "recipesPerMonth": 200,
@@ -237,7 +239,7 @@ paid tier is displayed and sold as Pantrio Plus.
 `defaultModel` and `allowedModels` govern interactive WebSocket chat. Internal
 helper work (memory summarization and the recipe pipeline) runs on the same
 `gpt-6-luna` model while still honoring the plan's prompt, completion, and
-daily-token caps. GPT-6 rejects `temperature`, `top_p`, and `max_tokens`, so
+token-window caps. GPT-6 rejects `temperature`, `top_p`, and `max_tokens`, so
 those call sites send only `max_completion_tokens`.
 Invalid configuration stops startup. The default Plus plan is monthly-only, so
 its `dailyTokenLimit` is `null`. A custom plan may still configure
@@ -251,9 +253,12 @@ product IDs configured while their transaction chains may still send
 notifications. When the variable is omitted, the current monthly/yearly Plus
 catalog is used. The free plan and the paid plan run the same model
 (`gpt-6-luna`); tiers differ by quota and features, not by model. The built-in
-free plan is 100,000 daily tokens, 4 recipe recommendations per day, and 4,000
-completion tokens per round. `QUOTA_ENFORCEMENT=false` keeps metering but never
-refuses a request, which is the launch rollback switch.
+free plan is 700,000 tokens per Monday-start week in
+`America/Los_Angeles`, 4 recipe recommendations per day, and 4,000 completion
+tokens per round. `FREE_TOKEN_QUOTA_WINDOW=day` restores the previous
+100,000-token daily free allowance without reverting the week-aware schema.
+`QUOTA_ENFORCEMENT=false` keeps metering but never refuses a request, which is
+the broader launch rollback switch.
 
 ## Client subscription telemetry
 
@@ -295,18 +300,18 @@ revocation. Local non-production environments may temporarily set
 
 ## Non-subscriber token quota
 
-Authenticated users without verified subscription access receive 100,000 total
-tokens per Los Angeles calendar day, 4 recipe recommendations per day, and at
-most 4,000 completion tokens per text-model round. Usage is keyed by Firebase
-UID. Chat tool-continuation rounds and summarization usage reported by OpenAI
-both count toward the daily total.
+Authenticated users without verified subscription access receive 700,000 total
+tokens per Monday-start week in `America/Los_Angeles`, 4 recipe recommendations
+per day, and at most 4,000 completion tokens per text-model round. Usage is
+keyed by Firebase UID. Chat tool-continuation rounds and summarization usage
+reported by OpenAI both count toward the weekly total.
 WebSocket chat requires a valid Firebase ID token; client-selected
 guest or trial IDs are not accepted as quota identities.
 
 WebSocket chat requests from non-subscribers are always executed with
 `gpt-6-luna`, even if the client requests another model. Verified subscribers
-receive the daily limit, default/allowed models, completion cap, and prompt cap
-configured for their specific plan.
+receive the monthly token limit, default/allowed models, completion cap, and
+prompt cap configured for their specific plan.
 
 Text/tool requests reserve `ceil(serialized UTF-8 bytes / 3)` tokens plus the
 existing per-message and response overheads. Image messages use a separate
@@ -339,22 +344,22 @@ The session response is shaped as:
   },
   "quota": {
     "applies": true,
-    "limit": 100000,
+    "limit": 700000,
     "used": 0,
     "reserved": 0,
-    "remaining": 100000,
+    "remaining": 700000,
     "timezone": "America/Los_Angeles",
     "resetsAt": "2026-08-09T07:00:00.000Z",
-    "window": "day",
+    "window": "week",
     "grace": false,
     "windows": [
       {
-        "kind": "day",
+        "kind": "week",
         "unit": "tokens",
-        "limit": 100000,
+        "limit": 700000,
         "used": 0,
-        "remaining": 100000,
-        "resetsAt": "2026-08-09T07:00:00.000Z",
+        "remaining": 700000,
+        "resetsAt": "2026-08-10T07:00:00.000Z",
         "timezone": "America/Los_Angeles"
       },
       {

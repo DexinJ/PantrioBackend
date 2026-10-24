@@ -168,37 +168,43 @@ export async function getPeriodUsage(
 }
 
 /**
- * Atomically reserves against a monthly token window. Same conditional-upsert
- * shape as reserveUsage(), so concurrent requests cannot all pass a stale read.
+ * Atomically reserves against a weekly or monthly token window. Same
+ * conditional-upsert shape as reserveUsage(), so concurrent requests cannot
+ * all pass a stale read.
  */
 export async function reservePeriodUsage(
   db,
   ownerType,
   ownerKey,
+  windowKind,
   windowKey,
   reserveTokens,
-  monthlyLimit
+  limit
 ) {
+  if (windowKind !== "week" && windowKind !== "month") {
+    throw new RangeError("windowKind must be week or month");
+  }
+
   if (!Number.isInteger(reserveTokens) || reserveTokens <= 0) {
     throw new RangeError("reserveTokens must be a positive integer");
   }
 
-  if (!Number.isInteger(monthlyLimit) || monthlyLimit <= 0) {
-    throw new RangeError("monthlyLimit must be a positive integer");
+  if (!Number.isInteger(limit) || limit <= 0) {
+    throw new RangeError("limit must be a positive integer");
   }
 
   if (typeof windowKey !== "string" || !windowKey) {
     throw new TypeError("windowKey must be a non-empty string");
   }
 
-  if (reserveTokens > monthlyLimit) return false;
+  if (reserveTokens > limit) return false;
 
   const now = Date.now();
   const row = await db.get(
     `
     INSERT INTO usage_periods
       (owner_type, owner_key, window_kind, window_key, tokens_used, requests, updated_at)
-    VALUES (?, ?, 'month', ?, ?, 0, ?)
+    VALUES (?, ?, ?, ?, ?, 0, ?)
     ON CONFLICT(owner_type, owner_key, window_kind, window_key)
     DO UPDATE SET
       tokens_used = usage_periods.tokens_used + excluded.tokens_used,
@@ -206,12 +212,12 @@ export async function reservePeriodUsage(
     WHERE usage_periods.tokens_used + excluded.tokens_used <= ?
     RETURNING tokens_used, requests
     `,
-    [ownerType, ownerKey, windowKey, reserveTokens, now, monthlyLimit]
+    [ownerType, ownerKey, windowKind, windowKey, reserveTokens, now, limit]
   );
 
   return row
     ? {
-        windowKind: "month",
+        windowKind,
         windowKey,
         tokens: reserveTokens,
         tokensUsed: row.tokens_used,
@@ -220,7 +226,7 @@ export async function reservePeriodUsage(
     : null;
 }
 
-/** Adjusts a monthly reservation to provider-reported usage. */
+/** Adjusts a weekly or monthly reservation to provider-reported usage. */
 export async function reconcilePeriodReservation(
   db,
   ownerType,
@@ -230,10 +236,14 @@ export async function reconcilePeriodReservation(
   addRequests = 1
 ) {
   const reservedTokens = reservation?.tokens;
+  const reservedKind = reservation?.windowKind;
   const reservedKey = reservation?.windowKey;
 
   if (!Number.isInteger(reservedTokens) || reservedTokens <= 0) {
     throw new RangeError("reservation.tokens must be a positive integer");
+  }
+  if (reservedKind !== "week" && reservedKind !== "month") {
+    throw new RangeError("reservation.windowKind must be week or month");
   }
   if (typeof reservedKey !== "string" || !reservedKey) {
     throw new TypeError("reservation.windowKey must be a non-empty string");
@@ -254,10 +264,18 @@ export async function reconcilePeriodReservation(
             updated_at = ?
       WHERE owner_type = ?
         AND owner_key = ?
-        AND window_kind = 'month'
+        AND window_kind = ?
         AND window_key = ?
       RETURNING tokens_used, requests`,
-    [adjustment, addRequests, Date.now(), ownerType, ownerKey, reservedKey]
+    [
+      adjustment,
+      addRequests,
+      Date.now(),
+      ownerType,
+      ownerKey,
+      reservedKind,
+      reservedKey,
+    ]
   );
 
   if (!row) {

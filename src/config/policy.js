@@ -319,15 +319,28 @@ export const ALLOWED_MODELS_AUTHED = new Set(CHAT_MODELS_ALLOWED);
   // The switch itself lives with the module that owns the prompt
   // (chat/recipeMethodSummary.js) so there is exactly one source of truth.
   
-  // Token budgets (SQLite-backed). Free is a daily allowance; paid is a
+  // Token budgets (SQLite-backed). Free is a weekly allowance; paid is a
   // monthly allowance. A paid plan may still configure an optional daily
   // burst guard, but the default Plus plan does not.
+  export function parseFreeTokenQuotaWindow(value) {
+    const normalized = String(value || "week").trim().toLowerCase();
+    if (normalized !== "day" && normalized !== "week") {
+      throw new Error(
+        'FREE_TOKEN_QUOTA_WINDOW must be either "day" or "week".'
+      );
+    }
+    return normalized;
+  }
+
+  export const FREE_TOKEN_QUOTA_WINDOW = parseFreeTokenQuotaWindow(
+    process.env.FREE_TOKEN_QUOTA_WINDOW
+  );
+  export const FREE_TOKENS_PER_WEEK = 700_000;
   export const TRIAL_TOKENS_PER_DAY = 100_000;
   export const TRIAL_MAX_COMPLETION_TOKENS = 4_000;  // per request cap
 
-  // The existing trial budget is now the shared daily budget for every
-  // user whose stored subscription is not entitled. Keep the trial names
-  // above for protocol/backward compatibility.
+  // Keep the legacy daily values available for rollback and old snapshot
+  // helpers. FREE_PLAN uses only the selected window at boot.
   export const NON_SUBSCRIBER_TOKENS_PER_DAY = TRIAL_TOKENS_PER_DAY;
   // A free request may not spend its whole daily budget on the prompt alone,
   // and must stay below the paid ceiling (50k). Before this, the free limit
@@ -354,8 +367,8 @@ export const ALLOWED_MODELS_AUTHED = new Set(CHAT_MODELS_ALLOWED);
   export const QUOTA_ENFORCEMENT_ENABLED = !/^(0|false|no)$/i.test(
     String(process.env.QUOTA_ENFORCEMENT || "").trim()
   );
-  // When a free request is admitted as the last request of the day, cap its
-  // completion allowance so the overshoot past the daily limit stays bounded.
+  // When a request is admitted as the last request of a governing window, cap
+  // its completion allowance so overshoot past the limit stays bounded.
   export const LAST_REQUEST_COMPLETION_TOKENS = 2_000;
   export const MAX_CHAT_MESSAGES = 50;
   export const MAX_CHAT_PAYLOAD_DEPTH = 20;
