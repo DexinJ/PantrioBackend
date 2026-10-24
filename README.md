@@ -218,7 +218,7 @@ Products and server-side capabilities are controlled by validated
       "com.chilltech.pantrio.subscription.monthly",
       "com.chilltech.pantrio.subscription.yearly"
     ],
-    "dailyTokenLimit": 500000,
+    "dailyTokenLimit": null,
     "monthlyTokenLimit": 10000000,
     "recipesPerDay": 10,
     "recipesPerMonth": 200,
@@ -239,10 +239,11 @@ helper work (memory summarization and the recipe pipeline) runs on the same
 `gpt-6-luna` model while still honoring the plan's prompt, completion, and
 daily-token caps. GPT-6 rejects `temperature`, `top_p`, and `max_tokens`, so
 those call sites send only `max_completion_tokens`.
-Invalid configuration stops startup. `dailyTokenLimit: null` means no daily
-quota. When a plan has both, the month governs and the day is a burst guard;
-when the month is spent the daily limit becomes a grace floor rather than a
-hard stop. `recipesPerDay` and `recipesPerMonth` count recommendation turns,
+Invalid configuration stops startup. The default Plus plan is monthly-only, so
+its `dailyTokenLimit` is `null`. A custom plan may still configure
+`dailyTokenLimit` as an explicit burst guard. When a monthly allowance is
+spent, paid plans receive a 100,000-token daily grace floor rather than a hard
+stop. `recipesPerDay` and `recipesPerMonth` count recommendation turns,
 not Serper queries, and may be omitted (null means unlimited). If a user has
 multiple simultaneous active plans, the last matching plan in the catalog has
 priority, so list plans from lowest to highest entitlement. Keep retired

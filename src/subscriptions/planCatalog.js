@@ -9,7 +9,6 @@ import {
   SUBSCRIBER_RECIPES_PER_MONTH,
   SUBSCRIBER_MAX_COMPLETION_TOKENS,
   SUBSCRIBER_MAX_PROMPT_TOKENS,
-  SUBSCRIBER_TOKENS_PER_DAY,
   SUBSCRIBER_TOKENS_PER_MONTH,
 } from "../config/policy.js";
 import { CHAT_MODEL_PAID_DEFAULT } from "../config/models.js";
@@ -39,7 +38,9 @@ const DEFAULT_PAID_PLANS = Object.freeze([
       "com.chilltech.pantrio.subscription.monthly",
       "com.chilltech.pantrio.subscription.yearly",
     ]),
-    dailyTokenLimit: SUBSCRIBER_TOKENS_PER_DAY,
+    // The default paid plan is bounded by its monthly allowance. A daily
+    // limit remains supported for explicitly configured custom catalogs.
+    dailyTokenLimit: null,
     monthlyTokenLimit: SUBSCRIBER_TOKENS_PER_MONTH,
     recipesPerDay: SUBSCRIBER_RECIPES_PER_DAY,
     recipesPerMonth: SUBSCRIBER_RECIPES_PER_MONTH,

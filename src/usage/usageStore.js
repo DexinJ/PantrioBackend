@@ -409,8 +409,8 @@ export async function releaseAction(
  * Mirrors a usage delta into today's row without enforcing a limit.
  *
  * A paid request reserves the monthly window, but the daily row is still what
- * the burst guard and the grace floor read. Without this mirror, paid usage is
- * invisible to usage_daily and the 500k daily limit can never trigger.
+ * an optional burst guard and the monthly grace floor read. Without this
+ * mirror, both would see zero paid usage.
  */
 export async function adjustDailyUsage(
   db,

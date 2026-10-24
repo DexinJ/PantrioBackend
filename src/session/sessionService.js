@@ -143,6 +143,7 @@ export async function buildSession(
             remaining: tokenWindow.remaining,
             resetsAt: tokenWindow.resetsAt,
             timezone: tokenWindow.timezone,
+            grace: tokenWindow.grace === true,
           },
         ]
       : []),

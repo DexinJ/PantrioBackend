@@ -319,9 +319,9 @@ export const ALLOWED_MODELS_AUTHED = new Set(CHAT_MODELS_ALLOWED);
   // The switch itself lives with the module that owns the prompt
   // (chat/recipeMethodSummary.js) so there is exactly one source of truth.
   
-  // Token budgets (SQLite-backed). Free is a daily drip so the allowance
-  // becomes a return-visit habit; paid is a monthly allowance with a high daily
-  // ceiling that exists only to stop abuse.
+  // Token budgets (SQLite-backed). Free is a daily allowance; paid is a
+  // monthly allowance. A paid plan may still configure an optional daily
+  // burst guard, but the default Plus plan does not.
   export const TRIAL_TOKENS_PER_DAY = 100_000;
   export const TRIAL_MAX_COMPLETION_TOKENS = 4_000;  // per request cap
 
@@ -337,8 +337,11 @@ export const ALLOWED_MODELS_AUTHED = new Set(CHAT_MODELS_ALLOWED);
     TRIAL_MAX_COMPLETION_TOKENS;
   export const SUBSCRIBER_MAX_COMPLETION_TOKENS = 4_000;
   export const SUBSCRIBER_MAX_PROMPT_TOKENS = 50_000;
-  export const SUBSCRIBER_TOKENS_PER_DAY = 500_000;
   export const SUBSCRIBER_TOKENS_PER_MONTH = 10_000_000;
+
+  // This is not the free plan's normal allowance. It only applies after a
+  // paid monthly token allowance has been exhausted.
+  export const PAID_MONTHLY_GRACE_TOKENS_PER_DAY = 100_000;
 
   // Recipe recommendations are counted per turn, not per Serper query. One
   // turn runs ~6 queries, so this is the unit that actually bounds cost.

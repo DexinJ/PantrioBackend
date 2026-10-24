@@ -127,7 +127,6 @@ import {
 } from "../usage/tokenBudget.js";
 import {
   createQuotaSnapshot,
-  getQuotaSnapshot,
   quotaLegacyFields,
 } from "../usage/quotaSnapshot.js";
 import { rateLimitStart } from "../utils/rateLimit.js";
@@ -331,13 +330,16 @@ function rateLimitAuthenticatedRequest(scope, limit) {
       const db = await getDb();
       const subscription = await getUserSubscription(db, decoded.uid);
       const { plan } = resolveSubscriptionAccess(subscription);
-      const quota = await getQuotaSnapshot(
+      // Use the same resolver as chat admission and the session response.
+      // A monthly-only paid plan still has an applicable quota even though its
+      // optional daily guard is null.
+      const { window } = await loadTokenWindow(
         db,
         "user",
         decoded.uid,
-        plan.dailyTokenLimit !== null,
-        { dailyLimit: plan.dailyTokenLimit ?? undefined }
+        plan
       );
+      const quota = quotaSnapshotForWindow(window);
       res.status(429).json({
         code: "RATE_LIMITED",
         error: `Too many requests. Try again in ${Math.ceil(

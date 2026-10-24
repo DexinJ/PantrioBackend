@@ -2,13 +2,15 @@
 //
 // Chooses which token window governs one request and reserves against it.
 //
-// A plan may carry a daily limit, a monthly limit, or both. When both exist the
-// month governs; the day is a burst guard. When the month is spent the daily
-// limit becomes a grace floor instead of a hard stop, so a paying customer is
-// throttled rather than locked out until renewal.
+// A plan may carry a daily or monthly limit. A monthly plan may also
+// carry an explicit legacy/custom daily burst guard. When the month is spent,
+// every paid plan receives the same bounded daily grace allowance instead of
+// being locked out until renewal.
 
 import { dayKeyLA } from "../db/db.js";
-import { NON_SUBSCRIBER_TOKENS_PER_DAY } from "../config/policy.js";
+import {
+  PAID_MONTHLY_GRACE_TOKENS_PER_DAY,
+} from "../config/policy.js";
 import { getNextQuotaResetAt } from "./quotaSnapshot.js";
 import {
   QUOTA_TIMEZONE,
@@ -91,11 +93,10 @@ function monthWindow(limit, used, { grace, now }) {
 /**
  * Resolve the window that governs this request.
  *
- * - monthly plan with room, daily guard not exceeded -> month
- * - monthly plan with room, daily guard exceeded    -> day (remaining 0)
- * - monthly plan spent                              -> day, grace floor
- * - no monthly plan                                 -> day
- * - no limits at all                                -> { applies: false }
+ * - monthly plan with room and no guard    -> month
+ * - monthly plan with room and guard full  -> day burst window
+ * - monthly plan spent                     -> day grace window
+ * - no monthly plan                        -> daily or no quota
  */
 export function resolveTokenWindow({
   plan,
@@ -121,14 +122,13 @@ export function resolveTokenWindow({
     return monthWindow(monthlyLimit, monthUsed, { grace: false, now });
   }
 
-  // Monthly allowance spent: continue on the free daily allowance.
-  if (dailyLimit === null) {
-    return monthWindow(monthlyLimit, monthUsed, { grace: false, now });
-  }
-
-  // Grace is the FREE daily allowance, not the paid burst limit. Using the
-  // paid 500k here would hand back roughly another month of usage.
-  const graceLimit = Math.min(dailyLimit, NON_SUBSCRIBER_TOKENS_PER_DAY);
+  // Monthly allowance spent: grant the paid grace floor regardless of whether
+  // the plan has a burst guard. For custom plans whose guard is lower than the
+  // standard grace floor, preserve the tighter configured value.
+  const graceLimit =
+    dailyLimit === null
+      ? PAID_MONTHLY_GRACE_TOKENS_PER_DAY
+      : Math.min(dailyLimit, PAID_MONTHLY_GRACE_TOKENS_PER_DAY);
   return dayWindow(graceLimit, dailyUsed, { grace: true, now });
 }
 
@@ -172,8 +172,8 @@ export async function reconcileTokenWindow(
       actualTokens,
       addRequests
     );
-    // Mirror the settled amount into today's row so the burst guard and the
-    // grace floor see paid usage. This is a positive add, not the month's
+    // Mirror the settled amount into today's row so an optional burst guard
+    // and the grace floor see paid usage. This is a positive add, not the month's
     // adjustment: the month row already holds the reservation, while the daily
     // row starts empty and should end at the actual total. When the provider
     // never reported usage, keep the reservation as the estimate.
