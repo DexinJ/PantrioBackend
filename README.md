@@ -173,7 +173,7 @@ cleanup continue. A successful revocation records `revoked` and clears the
 credential. If an older Apple account has no captured token, configuration is
 unusable, or bounded retries are exhausted, deletion completes with
 `appleSignInRevocation: "manual_required"` so the client can direct the person
-to stop using Pantrio in their Apple Account settings. Revocation does not
+to stop using FridgeVista in their Apple Account settings. Revocation does not
 cancel an App Store subscription.
 
 Configure a Sign in with Apple key associated with the native App ID. Do not
@@ -200,7 +200,7 @@ Products and server-side capabilities are controlled by validated
 [
   {
     "id": "starter",
-    "name": "Pantrio Starter",
+    "name": "FridgeVista Starter",
     "productIds": ["com.chilltech.pantrio.starter.monthly"],
     "weeklyTokenLimit": 350000,
     "dailyTokenLimit": null,
@@ -214,7 +214,7 @@ Products and server-side capabilities are controlled by validated
   },
   {
     "id": "pro",
-    "name": "Pantrio Plus",
+    "name": "FridgeVista Plus",
     "productIds": [
       "com.chilltech.pantrio.subscription.monthly",
       "com.chilltech.pantrio.subscription.yearly"
@@ -235,7 +235,7 @@ Products and server-side capabilities are controlled by validated
 Product IDs must be unique across plans. The default model must be present in
 the plan's allowed models, and every model must be supported by this server.
 The `pro` id and existing product IDs are kept for purchase compatibility; the
-paid tier is displayed and sold as Pantrio Plus.
+paid tier is displayed and sold as FridgeVista Plus.
 `defaultModel` and `allowedModels` govern interactive WebSocket chat. Internal
 helper work (memory summarization and the recipe pipeline) runs on the same
 `gpt-6-luna` model while still honoring the plan's prompt, completion, and
@@ -385,7 +385,7 @@ The session response is shaped as:
       {
         "productId": "com.chilltech.pantrio.subscription.monthly",
         "planId": "pro",
-        "displayName": "Pantrio Plus"
+        "displayName": "FridgeVista Plus"
       }
     ]
   }
@@ -401,7 +401,7 @@ stop after six rounds.
 
 ## AI request logging
 
-Set `LOG_AI_REQUESTS=true` to log Pantrio AI traffic as structured JSON lines on
+Set `LOG_AI_REQUESTS=true` to log FridgeVista AI traffic as structured JSON lines on
 stdout. Images are replaced with a short placeholder (data URIs are never
 echoed) and text longer than 4,000 characters is truncated, so enabling this for
 debugging does not copy image bytes into logs.

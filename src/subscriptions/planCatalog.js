@@ -47,7 +47,7 @@ export const FREE_PLAN = Object.freeze({
 const DEFAULT_PAID_PLANS = Object.freeze([
   Object.freeze({
     id: "pro",
-    name: "Pantrio Plus",
+    name: "FridgeVista Plus",
     productIds: Object.freeze([
       "com.chilltech.pantrio.subscription.monthly",
       "com.chilltech.pantrio.subscription.yearly",

@@ -402,7 +402,7 @@ export async function fetchPublicTextPage(
           agent,
           headers: {
             "User-Agent":
-              "Mozilla/5.0 (compatible; PantrioBot/1.0; +https://example.invalid)",
+              "Mozilla/5.0 (compatible; FridgeVistaBot/1.0; +https://example.invalid)",
             Accept: "text/html,application/xhtml+xml,text/plain",
           },
         });
